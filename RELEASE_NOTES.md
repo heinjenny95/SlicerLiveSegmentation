@@ -1,8 +1,15 @@
-# Live Segmentation 0.8.0
+# Live Segmentation 0.8.1
 
-Version 0.8.0 adds the complete collaboration, review, recovery, diagnostics,
+Version 0.8.1 contains the complete collaboration, review, recovery, diagnostics,
 and publication-readiness roadmap selected after the 0.7.0 two-user test. The
 time-series/4D proposal is intentionally deferred.
+
+## 0.8.1 Windows and SMB hotfix
+
+- Shared-folder sequence locking now retries the transient Windows access-denied
+  race that can occur while another client removes the lock directory.
+- The concurrency regression suite now covers this Windows/SMB behavior directly.
+- Presence-expiry timing tests use a cross-platform-safe margin.
 
 ## Google-Docs-like spatial collaboration
 

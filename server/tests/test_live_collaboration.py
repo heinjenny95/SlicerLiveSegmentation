@@ -255,6 +255,32 @@ def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
     ] == list(range(1, 25))
 
 
+def test_sequence_lock_retries_transient_windows_permission_error(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("permission race room", "e" * 64)
+    real_mkdir = Path.mkdir
+    transient_failures = {"remaining": 1}
+
+    def mkdir_with_transient_permission_error(path, *args, **kwargs):
+        if path.name == "sequence.lock" and transient_failures["remaining"]:
+            transient_failures["remaining"] -= 1
+            raise PermissionError(5, "Access is denied", str(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_with_transient_permission_error)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed.flat[0] = 1
+
+    operation = client.push_operation(
+        room["id"],
+        operation_payload("SharedSegment", empty, changed, operation_id="permission-race"),
+    )
+
+    assert operation["sequence"] == 1
+    assert transient_failures["remaining"] == 0
+
+
 def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "alice", presence_ttl_seconds=0.3)
     bob = SharedFolderRoomClient(tmp_path, "bob", presence_ttl_seconds=0.3)

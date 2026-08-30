@@ -604,6 +604,16 @@ class SharedFolderRoomClient:
                     )
                 time.sleep(0.04)
                 continue
+            except PermissionError as exc:
+                # Windows and some SMB clients may report a transient access-denied
+                # error while another process is removing the lock directory.
+                # Treat it like lock contention while the room itself is reachable.
+                if time.monotonic() < deadline and room_path.is_dir():
+                    time.sleep(0.04)
+                    continue
+                raise LiveCollaborationError(
+                    f"Could not lock the shared folder {room_path}: {exc}"
+                ) from exc
             except OSError as exc:
                 raise LiveCollaborationError(
                     f"Could not lock the shared folder {room_path}: {exc}"
