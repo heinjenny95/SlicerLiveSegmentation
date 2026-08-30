@@ -1,0 +1,36 @@
+name: Live Segmentation CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r server/requirements-dev.txt
+      - run: python -m ruff check server LiveSegmentation scripts/build_release.py scripts/slicer_live_segmentation_smoke_test.py
+      - run: python -m compileall -q server LiveSegmentation scripts
+      - run: python -m pytest -q
+
+  release-archive:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/build_release.py --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-segmentation-release
+          path: dist/*
+

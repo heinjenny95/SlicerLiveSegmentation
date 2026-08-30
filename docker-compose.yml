@@ -1,0 +1,18 @@
+services:
+  liveseg-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      LIVESEG_DATA_ROOT: /data
+      LIVESEG_API_KEY: ${LIVESEG_API_KEY:-}
+      LIVESEG_USER_TOKENS_JSON: ${LIVESEG_USER_TOKENS_JSON:-}
+      LIVESEG_REQUIRE_HTTPS: ${LIVESEG_REQUIRE_HTTPS:-false}
+    volumes:
+      - liveseg-data:/data
+    restart: unless-stopped
+
+volumes:
+  liveseg-data:

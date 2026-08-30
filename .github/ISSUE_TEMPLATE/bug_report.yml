@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible Live Segmentation defect using non-sensitive data.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include patient data, credentials, private paths, or room archives.
+  - type: input
+    id: version
+    attributes:
+      label: Live Segmentation version
+      placeholder: 0.8.0
+    validations:
+      required: true
+  - type: input
+    id: slicer
+    attributes:
+      label: 3D Slicer version and operating system
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - Shared/network folder
+        - Collaboration server
+        - Not transport-related
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized diagnostics
+    validations:
+      required: true

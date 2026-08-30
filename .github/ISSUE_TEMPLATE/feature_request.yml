@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an interoperable collaboration improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Collaboration problem
+      description: Describe the user or research workflow that needs improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility considerations
+      description: Note effects on standard Slicer segmentation nodes or existing rooms.

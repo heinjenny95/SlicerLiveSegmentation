@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Live Segmentation in research, please cite this software release."
+title: "Live Segmentation for 3D Slicer"
+type: software
+authors:
+  - given-names: "Jenny"
+    family-names: "Hein"
+version: 0.8.0
+date-released: 2026-08-30
+license: Apache-2.0
+repository-code: "https://github.com/heinjenny95/SlicerLiveSegmentation"
+url: "https://github.com/heinjenny95/SlicerLiveSegmentation"
+keywords:
+  - 3D Slicer
+  - collaborative segmentation
+  - medical imaging
+  - real-time collaboration
