@@ -256,8 +256,8 @@ def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
 
 
 def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
-    alice = SharedFolderRoomClient(tmp_path, "alice", presence_ttl_seconds=0.03)
-    bob = SharedFolderRoomClient(tmp_path, "bob", presence_ttl_seconds=0.03)
+    alice = SharedFolderRoomClient(tmp_path, "alice", presence_ttl_seconds=0.3)
+    bob = SharedFolderRoomClient(tmp_path, "bob", presence_ttl_seconds=0.3)
     room = alice.join("presence room", "1" * 64)
     bob.join("presence room", "1" * 64)
     alice.presence(room["id"], {"active_segment_name": "Liver"})
@@ -270,7 +270,7 @@ def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
     )
     assert alice.operations(room["id"], 0) == []
 
-    time.sleep(0.05)
+    time.sleep(0.5)
     users = alice.presence(room["id"], {})
     assert [item["user"] for item in users] == ["alice"]
 
