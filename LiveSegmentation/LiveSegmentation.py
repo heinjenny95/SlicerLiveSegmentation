@@ -12,7 +12,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.1"
 
 
 class LiveSegmentation(ScriptedLoadableModule):
@@ -433,4 +433,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.9.0")
+        self.assertEqual(PLUGIN_VERSION, "0.9.1")

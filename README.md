@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.9.0.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.9.1.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.9.0`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.9.1`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -111,6 +111,10 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Clean leave/rejoin:** leaving detaches Segment Editor and removes every local
   room replica. Rejoining always rebuilds exactly one clean replica from the
   permanent operation history.
+- **Parallel shared-folder I/O:** independent labels, realtime metadata, and
+  collections of operation, presence, chat, lock, history, and backup files are
+  processed concurrently with bounded worker pools. Ordering remains serialized
+  only where the same label or the global voxel sequence requires it.
 
 ## Optional collaboration server
 
@@ -126,7 +130,7 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 21 automated transport, API, chat-anchor, snapshot/compaction, history,
+- 25 automated transport, API, chat-anchor, snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel

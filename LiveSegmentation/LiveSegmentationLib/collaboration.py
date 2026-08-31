@@ -26,6 +26,7 @@ import urllib.request
 import uuid
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,7 @@ except ImportError:  # regular-Python transport tests import this file directly
 
 LIVE_ENCODING = "zlib-packbits-v1"
 SHARED_FOLDER_SCHEMA_VERSION = 1
+MAX_PARALLEL_IO_WORKERS = 8
 
 
 class LiveCollaborationError(RuntimeError):
@@ -100,6 +102,19 @@ def _read_json_file(path):
             return json.load(source)
     except (OSError, ValueError) as exc:
         raise LiveCollaborationError(f"Could not read shared file {path}: {exc}") from exc
+
+
+def _parallel_map(function, items, max_workers=MAX_PARALLEL_IO_WORKERS):
+    """Run independent blocking I/O concurrently while preserving input order."""
+    items = list(items)
+    if len(items) < 2:
+        return [function(item) for item in items]
+    workers = max(1, min(int(max_workers), len(items)))
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="LiveSegmentation-io",
+    ) as executor:
+        return list(executor.map(function, items))
 
 
 def _atomic_temporary_path(destination):
@@ -843,11 +858,16 @@ class SharedFolderRoomClient:
                     selected.append((sequence, path))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not list shared operations: {exc}") from exc
-        operations = []
-        for sequence, path in sorted(selected)[:limit]:
+        selected = sorted(selected)[:limit]
+
+        def read_operation(item):
+            sequence, path = item
             operation = _read_json_file(path)
             operation["sequence"] = sequence
-            operations.append(operation)
+            return operation
+
+        operations = _parallel_map(read_operation, selected)
+        for operation in operations:
             self._remember_segment_owner(
                 room_path, operation.get("segment_id"), operation.get("author")
             )
@@ -870,14 +890,17 @@ class SharedFolderRoomClient:
             paths = list(presence_path.glob("*.json"))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not list shared presence: {exc}") from exc
-        for path in paths:
+        def read_user(path):
             try:
                 data = _read_json_file(path)
                 if now - float(data.get("last_seen_epoch", 0.0)) <= self.presence_ttl_seconds:
                     data.pop("last_seen_epoch", None)
-                    users.append(data)
+                    return data
             except (LiveCollaborationError, TypeError, ValueError):
-                continue
+                pass
+            return None
+
+        users.extend(item for item in _parallel_map(read_user, paths) if item is not None)
         return sorted(users, key=lambda item: str(item.get("user", "")).casefold())
 
     def presence(self, room_id, details):
@@ -992,12 +1015,15 @@ class SharedFolderRoomClient:
                     selected.append((sequence, path))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not list shared chat messages: {exc}") from exc
-        messages = []
-        for sequence, path in sorted(selected)[: max(1, min(int(limit), 5000))]:
+        selected = sorted(selected)[: max(1, min(int(limit), 5000))]
+
+        def read_message(item):
+            sequence, path = item
             message = _read_json_file(path)
             message["sequence"] = sequence
-            messages.append(message)
-        return messages
+            return message
+
+        return _parallel_map(read_message, selected)
 
     @staticmethod
     def _segment_lock_path(room_path, segment_id):
@@ -1047,8 +1073,8 @@ class SharedFolderRoomClient:
             )
         complete_path = index_path / ".complete"
         try:
-            for path in index_path.glob("*.json"):
-                data = _read_json_file(path)
+            index_records = _parallel_map(_read_json_file, index_path.glob("*.json"))
+            for data in index_records:
                 segment_id = str(data.get("segment_id") or "")
                 owner = str(data.get("owner") or "")
                 if segment_id and owner:
@@ -1069,8 +1095,10 @@ class SharedFolderRoomClient:
                     selected.append((sequence, path))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not inspect segment ownership: {exc}") from exc
-        for _, path in sorted(selected):
-            operation = _read_json_file(path)
+        migration_records = _parallel_map(
+            lambda item: _read_json_file(item[1]), sorted(selected)
+        )
+        for operation in migration_records:
             segment_id = str(operation.get("segment_id") or "")
             if segment_id and segment_id not in creators:
                 owner = str(operation.get("author") or "")
@@ -1087,27 +1115,28 @@ class SharedFolderRoomClient:
     def segment_locks(self, room_id):
         room_path = self._require_room(room_id)
         creators = self._segment_creators(room_path)
-        result = []
-        for segment_id, owner in creators.items():
+
+        def read_lock(item):
+            segment_id, owner = item
             lock_path = self._segment_lock_path(room_path, segment_id)
             lock_data = _read_json_file(lock_path) if lock_path.is_file() else {}
             expires_epoch = float(lock_data.get("expires_epoch", 0.0) or 0.0)
             locked = bool(lock_data.get("locked", False))
             if locked and expires_epoch and time.time() >= expires_epoch:
                 locked = False
-            result.append(
-                {
-                    "segment_id": segment_id,
-                    "owner": str(lock_data.get("owner") or owner),
-                    "locked": locked,
-                    "updated_at": lock_data.get("updated_at"),
-                    **(
-                        {"expires_at": lock_data.get("expires_at")}
-                        if locked and lock_data.get("expires_at")
-                        else {}
-                    ),
-                }
-            )
+            return {
+                "segment_id": segment_id,
+                "owner": str(lock_data.get("owner") or owner),
+                "locked": locked,
+                "updated_at": lock_data.get("updated_at"),
+                **(
+                    {"expires_at": lock_data.get("expires_at")}
+                    if locked and lock_data.get("expires_at")
+                    else {}
+                ),
+            }
+
+        result = _parallel_map(read_lock, creators.items())
         return sorted(result, key=lambda item: item["segment_id"].casefold())
 
     def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0):
@@ -1184,14 +1213,13 @@ class SharedFolderRoomClient:
 
     def audit_events(self, room_id, limit=500):
         room_path = self._require_room(room_id)
-        records = []
         try:
             paths = sorted(room_path.joinpath("audit").glob("*.json"), reverse=True)
         except OSError as exc:
             raise LiveCollaborationError(f"Could not list audit events: {exc}") from exc
-        for path in paths[: max(1, min(int(limit), 5000))]:
-            records.append(_read_json_file(path))
-        return records
+        return _parallel_map(
+            _read_json_file, paths[: max(1, min(int(limit), 5000))]
+        )
 
     @staticmethod
     def _role_path(room_path, user_name):
@@ -1213,8 +1241,10 @@ class SharedFolderRoomClient:
         room_path = self._require_room(room_id)
         metadata = _read_json_file(room_path / "room.json")
         roles = {str(metadata.get("created_by")): "admin"}
-        for path in room_path.joinpath("roles").glob("*.json"):
-            record = _read_json_file(path)
+        records = _parallel_map(
+            _read_json_file, room_path.joinpath("roles").glob("*.json")
+        )
+        for record in records:
             user = str(record.get("user") or "")
             role = str(record.get("role") or "editor")
             if user and role in ROOM_ROLES and user not in roles:
@@ -1253,9 +1283,9 @@ class SharedFolderRoomClient:
 
     def review_states(self, room_id):
         room_path = self._require_room(room_id)
-        result = []
-        for path in room_path.joinpath("reviews").glob("*.json"):
-            result.append(_read_json_file(path))
+        result = _parallel_map(
+            _read_json_file, room_path.joinpath("reviews").glob("*.json")
+        )
         return sorted(result, key=lambda item: str(item.get("segment_id", "")).casefold())
 
     def set_review_state(self, room_id, segment_id, state, note=""):
@@ -1317,8 +1347,10 @@ class SharedFolderRoomClient:
     def segment_access_requests(self, room_id, segment_id=None):
         room_path = self._require_room(room_id)
         result = []
-        for path in room_path.joinpath("access-requests").glob("*.json"):
-            record = _read_json_file(path)
+        records = _parallel_map(
+            _read_json_file, room_path.joinpath("access-requests").glob("*.json")
+        )
+        for record in records:
             if segment_id is None or str(record.get("segment_id")) == str(segment_id):
                 result.append(record)
         return sorted(result, key=lambda item: str(item.get("created_at", "")))
@@ -1375,22 +1407,34 @@ class SharedFolderRoomClient:
             archive_paths = list(room_path.joinpath("operation-archives").glob("*.zip"))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not inspect room history: {exc}") from exc
-        for path in active_paths:
+        def read_active(path):
             sequence = self._operation_sequence(path)
-            if sequence is not None:
-                records[sequence] = _read_json_file(path)
-        for archive in archive_paths:
+            return (sequence, _read_json_file(path)) if sequence is not None else None
+
+        for item in _parallel_map(read_active, active_paths):
+            if item is not None:
+                records[item[0]] = item[1]
+
+        def read_archive(archive):
+            archived = []
             try:
                 with zipfile.ZipFile(archive, "r") as bundle:
                     for name in bundle.namelist():
                         sequence = self._operation_sequence(Path(name))
-                        if sequence is None or sequence in records:
+                        if sequence is None:
                             continue
-                        records[sequence] = json.loads(bundle.read(name).decode("utf-8"))
+                        archived.append(
+                            (sequence, json.loads(bundle.read(name).decode("utf-8")))
+                        )
             except (OSError, ValueError, zipfile.BadZipFile) as exc:
                 raise LiveCollaborationError(
                     f"Could not read history archive {archive.name}: {exc}"
                 ) from exc
+            return archived
+
+        for archived in _parallel_map(read_archive, archive_paths):
+            for sequence, operation in archived:
+                records.setdefault(sequence, operation)
         for sequence, operation in records.items():
             operation["sequence"] = int(sequence)
         return [records[key] for key in sorted(records)]
@@ -1517,9 +1561,9 @@ class SharedFolderRoomClient:
 
     def snapshot_manifests(self, room_id):
         room_path = self._require_room(room_id)
-        result = []
-        for path in room_path.joinpath("snapshots").glob("*.json"):
-            result.append(_read_json_file(path))
+        result = _parallel_map(
+            _read_json_file, room_path.joinpath("snapshots").glob("*.json")
+        )
         return sorted(result, key=lambda item: int(item.get("last_sequence", 0)))
 
     def state_at_sequence(self, room_id, sequence):
@@ -1535,9 +1579,14 @@ class SharedFolderRoomClient:
     def room_conflicts(self, room_id, unresolved_only=False):
         room_path = self._require_room(room_id)
         result = []
-        for path in room_path.joinpath("conflicts").glob("*.json"):
+        paths = list(room_path.joinpath("conflicts").glob("*.json"))
+
+        def read_conflict(path):
             record = _read_json_file(path)
             record["_path"] = str(path)
+            return record
+
+        for record in _parallel_map(read_conflict, paths):
             if not unresolved_only or record.get("resolution") == "unresolved":
                 result.append(record)
         return sorted(result, key=lambda item: int(item.get("sequence", 0)), reverse=True)
@@ -1581,21 +1630,24 @@ class SharedFolderRoomClient:
 
     def list_project_backups(self, room_id):
         room_path = self._require_room(room_id)
-        result = []
-        for path in room_path.joinpath("backups").glob("*.mrb"):
+
+        def read_backup(path):
             meta_path = path.with_suffix(path.suffix + ".json")
             meta = _read_json_file(meta_path) if meta_path.is_file() else {}
-            result.append(
-                {
-                    "name": path.name,
-                    "path": str(path),
-                    "size_bytes": path.stat().st_size,
-                    "modified_epoch": path.stat().st_mtime,
-                    "pinned": bool(meta.get("pinned", False)),
-                    "sha256": meta.get("sha256"),
-                    "created_by": meta.get("created_by"),
-                }
-            )
+            stat = path.stat()
+            return {
+                "name": path.name,
+                "path": str(path),
+                "size_bytes": stat.st_size,
+                "modified_epoch": stat.st_mtime,
+                "pinned": bool(meta.get("pinned", False)),
+                "sha256": meta.get("sha256"),
+                "created_by": meta.get("created_by"),
+            }
+
+        result = _parallel_map(
+            read_backup, room_path.joinpath("backups").glob("*.mrb")
+        )
         return sorted(result, key=lambda item: item["modified_epoch"], reverse=True)
 
     def set_backup_pinned(self, room_id, backup_name, pinned):
@@ -3414,18 +3466,47 @@ class LiveCollaborationController:
             rejected_segments = []
             conflicts_detected = []
             command_errors = []
+
+            grouped_operations = {}
             for operation in outgoing:
-                try:
-                    pushed = client.push_operation(room_id, operation)
-                    outgoing_ids.append(operation["client_operation_id"])
-                    conflicts_detected.extend((pushed or {}).get("conflicts") or [])
-                except Exception as exc:
-                    message = str(exc)
-                    if "locked by" not in message:
-                        raise
-                    outgoing_ids.append(operation["client_operation_id"])
-                    rejected_segments.append(operation["segment_id"])
-                    command_errors.append(message)
+                grouped_operations.setdefault(str(operation.get("segment_id") or ""), []).append(
+                    operation
+                )
+
+            def push_segment_group(group):
+                result = {
+                    "outgoing_ids": [],
+                    "rejected_segments": [],
+                    "conflicts_detected": [],
+                    "command_errors": [],
+                }
+                # Preserve edit order inside one label, while independent labels
+                # are free to make progress in parallel.
+                for operation in group:
+                    try:
+                        pushed = client.push_operation(room_id, operation)
+                        result["outgoing_ids"].append(operation["client_operation_id"])
+                        result["conflicts_detected"].extend(
+                            (pushed or {}).get("conflicts") or []
+                        )
+                    except Exception as exc:
+                        message = str(exc)
+                        if "locked by" not in message:
+                            raise
+                        result["outgoing_ids"].append(operation["client_operation_id"])
+                        result["rejected_segments"].append(operation["segment_id"])
+                        result["command_errors"].append(message)
+                return result
+
+            for group_result in _parallel_map(
+                push_segment_group,
+                grouped_operations.values(),
+                max_workers=4,
+            ):
+                outgoing_ids.extend(group_result["outgoing_ids"])
+                rejected_segments.extend(group_result["rejected_segments"])
+                conflicts_detected.extend(group_result["conflicts_detected"])
+                command_errors.extend(group_result["command_errors"])
             snapshot = None
             if snapshot_operations:
                 snapshot = client.publish_room_snapshot(
@@ -3467,48 +3548,98 @@ class LiveCollaborationController:
     ):
         started = time.monotonic()
         try:
-            chat_ids = []
-            lock_segment_ids = []
-            command_errors = []
-            for message in chat_outgoing:
-                try:
-                    client.send_chat(
-                        room_id,
-                        message["text"],
-                        message["client_message_id"],
-                        message.get("anchor"),
-                    )
-                    chat_ids.append(message["client_message_id"])
-                except Exception as exc:
-                    message_text = str(exc)
-                    if not any(
-                        marker in message_text
-                        for marker in ("4000 characters", "Enter a chat message")
-                    ):
-                        raise
-                    chat_ids.append(message["client_message_id"])
-                    command_errors.append(message_text)
-            for segment_id, change in lock_changes.items():
-                try:
-                    client.set_segment_lock(
-                        room_id,
-                        segment_id,
-                        bool(change.get("locked")) if isinstance(change, dict) else bool(change),
-                        int(change.get("expires_minutes", 0)) if isinstance(change, dict) else 0,
-                    )
-                    lock_segment_ids.append(segment_id)
-                except Exception as exc:
-                    message = str(exc)
-                    if not any(
-                        marker in message
-                        for marker in ("Only ", "must synchronize once")
-                    ):
-                        raise
-                    lock_segment_ids.append(segment_id)
-                    command_errors.append(message)
-            users = client.presence(room_id, presence) if presence is not None else None
-            messages = client.chat_messages(room_id, after_chat_sequence)
-            locks = client.segment_locks(room_id)
+            def send_chat_batch(_unused):
+                completed = []
+                errors = []
+                for message in chat_outgoing:
+                    try:
+                        client.send_chat(
+                            room_id,
+                            message["text"],
+                            message["client_message_id"],
+                            message.get("anchor"),
+                        )
+                        completed.append(message["client_message_id"])
+                    except Exception as exc:
+                        message_text = str(exc)
+                        if not any(
+                            marker in message_text
+                            for marker in ("4000 characters", "Enter a chat message")
+                        ):
+                            raise
+                        completed.append(message["client_message_id"])
+                        errors.append(message_text)
+                return completed, errors
+
+            def apply_lock_batch(_unused):
+                def apply_one(item):
+                    segment_id, change = item
+                    try:
+                        client.set_segment_lock(
+                            room_id,
+                            segment_id,
+                            bool(change.get("locked"))
+                            if isinstance(change, dict)
+                            else bool(change),
+                            int(change.get("expires_minutes", 0))
+                            if isinstance(change, dict)
+                            else 0,
+                        )
+                        return segment_id, None
+                    except Exception as exc:
+                        message = str(exc)
+                        if not any(
+                            marker in message
+                            for marker in ("Only ", "must synchronize once")
+                        ):
+                            raise
+                        return segment_id, message
+
+                completed = []
+                errors = []
+                for segment_id, error in _parallel_map(
+                    apply_one,
+                    lock_changes.items(),
+                    max_workers=4,
+                ):
+                    completed.append(segment_id)
+                    if error:
+                        errors.append(error)
+                return completed, errors
+
+            outbound_tasks = []
+            if chat_outgoing:
+                outbound_tasks.append(("chat", send_chat_batch))
+            if lock_changes:
+                outbound_tasks.append(("locks", apply_lock_batch))
+            if presence is not None:
+                outbound_tasks.append(
+                    ("presence", lambda _unused: client.presence(room_id, presence))
+                )
+
+            outbound_results = dict(
+                _parallel_map(
+                    lambda task: (task[0], task[1](None)),
+                    outbound_tasks,
+                    max_workers=3,
+                )
+            )
+            chat_ids, chat_errors = outbound_results.get("chat", ([], []))
+            lock_segment_ids, lock_errors = outbound_results.get("locks", ([], []))
+            command_errors = [*chat_errors, *lock_errors]
+            users = outbound_results.get("presence")
+
+            live_reads = _parallel_map(
+                lambda task: (task[0], task[1]()),
+                [
+                    ("messages", lambda: client.chat_messages(room_id, after_chat_sequence)),
+                    ("locks", lambda: client.segment_locks(room_id)),
+                ],
+                max_workers=2,
+            )
+            live_results = dict(live_reads)
+            messages = live_results["messages"]
+            locks = live_results["locks"]
             self._worker_results.put(
                 {
                     "lane": "realtime",
@@ -3618,17 +3749,29 @@ class LiveCollaborationController:
                     command_errors.append(str(exc))
             advanced = None
             if fetch_advanced:
-                advanced = {
-                    "history": client.room_history(room_id, 500),
-                    "conflicts": client.room_conflicts(room_id, False),
-                    "roles": client.room_roles(room_id),
-                    "reviews": client.review_states(room_id),
-                    "access_requests": client.segment_access_requests(room_id),
-                    "material_template": client.get_material_template(room_id),
-                    "audit": client.audit_events(room_id, 100),
-                }
+                advanced_fetches = [
+                    ("history", lambda: client.room_history(room_id, 500)),
+                    ("conflicts", lambda: client.room_conflicts(room_id, False)),
+                    ("roles", lambda: client.room_roles(room_id)),
+                    ("reviews", lambda: client.review_states(room_id)),
+                    (
+                        "access_requests",
+                        lambda: client.segment_access_requests(room_id),
+                    ),
+                    ("material_template", lambda: client.get_material_template(room_id)),
+                    ("audit", lambda: client.audit_events(room_id, 100)),
+                ]
                 if hasattr(client, "snapshot_manifests"):
-                    advanced["snapshots"] = client.snapshot_manifests(room_id)
+                    advanced_fetches.append(
+                        ("snapshots", lambda: client.snapshot_manifests(room_id))
+                    )
+                advanced = dict(
+                    _parallel_map(
+                        lambda task: (task[0], task[1]()),
+                        advanced_fetches,
+                        max_workers=8,
+                    )
+                )
             backup = (
                 client.reserve_project_backup(room_id, backup_interval_seconds)
                 if backup_check

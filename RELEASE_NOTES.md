@@ -1,4 +1,34 @@
-# Live Segmentation 0.9.0
+# Live Segmentation 0.9.1
+
+Version 0.9.1 adds bounded parallel processing for independent work on shared
+folders and the optional collaboration server, while preserving deterministic
+ordering wherever edits can affect the same label.
+
+## Parallel collaboration pipeline
+
+- Outgoing voxel edits are grouped by label. Each label keeps its local edit
+  order, while different labels may synchronize concurrently.
+- Presence updates, permanent chat publication, and label-lock changes execute
+  as independent realtime tasks instead of waiting for one another.
+- Lock changes for different labels run concurrently.
+- Incoming operation, presence, chat, label-owner, lock, audit, role, review,
+  access-request, snapshot, conflict, history-archive, and backup metadata files
+  are read through a bounded pool of up to eight I/O workers.
+- The advanced history/review/diagnostics refresh fetches its independent data
+  sets concurrently.
+- Global voxel ordering and edits inside the same label remain serialized to
+  preserve deterministic convergence and avoid corrupting shared state.
+
+## Verification
+
+- 25 automated tests pass. The new regression test proves that independent
+  operation files are read concurrently while their returned sequence order is
+  preserved.
+- Ruff and Python compilation pass.
+
+---
+
+# Previous release: Live Segmentation 0.9.0
 
 Version 0.9.0 replaces the monolithic shared-folder polling loop with independent
 realtime, edit, and maintenance lanes after a two-user network-share trial.

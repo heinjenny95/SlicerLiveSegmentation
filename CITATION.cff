@@ -5,7 +5,7 @@ type: software
 authors:
   - given-names: "Jenny"
     family-names: "Hein"
-version: 0.9.0
+version: 0.9.1
 date-released: 2026-08-31
 license: Apache-2.0
 repository-code: "https://github.com/heinjenny95/SlicerLiveSegmentation"

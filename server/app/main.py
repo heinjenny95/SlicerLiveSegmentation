@@ -97,7 +97,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Live Segmentation Server",
-        version="0.9.0",
+        version="0.9.1",
         description="Optional relay for the Live Segmentation 3D Slicer extension.",
         lifespan=lifespan,
     )

@@ -169,7 +169,7 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 24,
+            "automated_tests": 25,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"

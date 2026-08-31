@@ -30,6 +30,21 @@
    same Segmentation node.
 3. Apply one edit and verify that it appears in the other Slicer instance.
 
+## Parallel shared-folder load
+
+1. Create at least four labels and distribute them between the two users.
+2. Paint different labels simultaneously while sending chat messages and
+   changing a lock on another label.
+3. Verify edits inside each label retain their local order while edits to
+   different labels, chat, presence, and locks continue without waiting for one
+   another.
+4. Join a third disposable client after at least 25 operations. Verify the
+   operation files are loaded in sequence order and the reconstructed masks are
+   identical to both active clients.
+5. Open history, conflicts, reviews, roles, and snapshots together with
+   **Refresh advanced data**. Verify the independent datasets load without
+   pausing live edits or chat.
+
 ## Conflicts and protection
 
 1. Edit two non-overlapping areas simultaneously and verify both remain.

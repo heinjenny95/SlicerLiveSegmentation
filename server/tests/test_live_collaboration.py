@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -253,6 +254,49 @@ def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
     assert [
         item["sequence"] for item in clients[0].operations(room["id"], 0)
     ] == list(range(1, 25))
+
+
+def test_shared_folder_reads_independent_operation_files_in_parallel(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("parallel operation reads", "9" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    for index in range(8):
+        changed = empty.copy()
+        changed.flat[index] = 1
+        client.push_operation(
+            room["id"],
+            operation_payload(
+                f"Segment-{index}",
+                empty,
+                changed,
+                operation_id=f"parallel-read-{index}",
+            ),
+        )
+
+    original_read = collaboration_module._read_json_file
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def delayed_operation_read(path):
+        nonlocal active, peak_active
+        if Path(path).parent.name != "operations":
+            return original_read(path)
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            time.sleep(0.03)
+            return original_read(path)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(collaboration_module, "_read_json_file", delayed_operation_read)
+    operations = client.operations(room["id"], 0)
+
+    assert [operation["sequence"] for operation in operations] == list(range(1, 9))
+    assert peak_active >= 2
 
 
 def test_sequence_lock_retries_transient_windows_permission_error(tmp_path, monkeypatch):
