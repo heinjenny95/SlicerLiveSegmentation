@@ -1,4 +1,50 @@
-# Live Segmentation 0.8.1
+# Live Segmentation 0.9.0
+
+Version 0.9.0 replaces the monolithic shared-folder polling loop with independent
+realtime, edit, and maintenance lanes after a two-user network-share trial.
+
+## Realtime collaboration engine
+
+- Presence, permanent chat, and label locks no longer wait for voxel operations,
+  version-history scans, project backups, diagnostics, or snapshots.
+- Shared-folder chat uses its own short sequence lock; label locks and backup
+  reservations no longer contend for the voxel-operation sequence lock.
+- Own chat messages render immediately and are reconciled with their permanent
+  room record without a duplicate line.
+- Presence heartbeat expiry now tolerates slow SMB/network shares while an
+  explicit leave still disappears immediately.
+- A compact label-owner index eliminates repeated full operation-history scans
+  during lock polling.
+- Voxel sequence allocation uses a compact counter, and expensive overlap/conflict
+  analysis runs after releasing the publishing lock.
+- Ephemeral high-frequency JSON records avoid synchronous disk flushes that are
+  disproportionately slow on SMB shares; atomic publication remains intact.
+
+## Clear controls and working backups
+
+- **Sync now** refreshes only live edits, participants, chat, locks, and health;
+  history and backup lists retain their own explicit refresh actions.
+- **Label to manage** makes lock, ownership, access, and review selection visible
+  and also activates that label in Slicer's Segment Editor.
+- Automatic backup enablement, interval, and retention remain editable while a
+  shared-folder room is active, and **Back up now** creates an immediate MRB.
+- Maintenance failures no longer report a successful live edit or chat action as
+  a room disconnect.
+
+## Verification
+
+- 24 automated shared-folder/server protocol tests pass, including a regression
+  that holds the voxel sequence lock while chat, presence, and a label lock
+  complete in under 0.5 seconds.
+- Ruff and Python compilation pass.
+- Real Slicer 5.12.3 UI smoke tests pass optimistic chat, explicit label selection,
+  editable backups, lock round-trips, and manual live sync.
+- Two simultaneous Slicer 5.12.3 processes exchanged bidirectional edits and
+  converged on the same 35-voxel label.
+
+---
+
+# Previous release: Live Segmentation 0.8.1
 
 Version 0.8.1 contains the complete collaboration, review, recovery, diagnostics,
 and publication-readiness roadmap selected after the 0.7.0 two-user test. The

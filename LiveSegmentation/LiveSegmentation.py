@@ -12,7 +12,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-PLUGIN_VERSION = "0.8.1"
+PLUGIN_VERSION = "0.9.0"
 
 
 class LiveSegmentation(ScriptedLoadableModule):
@@ -369,6 +369,20 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             selected_segment_id = segment_ids[0] if segment_ids else None
         return segmentation_node, selected_segment_id
 
+    def select_segment_in_editor(self, segment_id):
+        """Make an explicitly managed live label active in Slicer's Segment Editor."""
+        segmentation_node = self.get_segmentation_node()
+        editor = self._standard_segment_editor_widget()
+        if segmentation_node is None or editor is None:
+            return False
+        try:
+            if editor.segmentationNode() != segmentation_node:
+                editor.setSegmentationNode(segmentation_node)
+            editor.setSelectedSegmentID(str(segment_id))
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def segment_mask_in_reference_geometry(
         segmentation_node, segment_id, reference_volume_node, fallback_shape
@@ -419,4 +433,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.8.1")
+        self.assertEqual(PLUGIN_VERSION, "0.9.0")

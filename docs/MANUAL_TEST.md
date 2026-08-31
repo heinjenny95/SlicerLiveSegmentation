@@ -38,19 +38,27 @@
 3. Attempt to join the room with a different source volume and verify rejection.
 4. Lock A's selected label and verify B cannot keep or publish an edit to it.
 5. Unlock the label and verify B can edit it again.
+6. Use **Label to manage** to switch labels. Confirm the lock status and Segment
+   Editor selection follow the visible choice.
 
 ## Connection, chat, backups, and lifecycle
 
 1. Interrupt shared-folder or server access and verify the green online state is
    replaced by a red connection error and a visible dialog.
-2. Restore access and click **Refresh now**. Verify the room remains joined and
+2. Restore access and click **Sync now**. Verify the room remains joined and
    returns to green without using Slicer's developer **Reload** action.
-3. Exchange chat messages, leave and rejoin, and verify the full chat remains.
-4. In shared-folder mode verify versioned `.mrb` bundles appear under the room's
-   `backups` directory and older bundles remain.
-5. Leave the room and verify the shared-segmentation selector, Segment Editor
+3. Send a chat message and verify it appears immediately for its sender and in
+   the other instance without pressing **Sync now**. Leave and rejoin and verify
+   the full chat remains.
+4. Verify both participants appear online within two seconds in both instances.
+5. While both users paint, send chat and lock/unlock a label. Verify none of
+   these actions disconnects either participant or waits for the voxel sync.
+6. In shared-folder mode change backup enablement, interval, and retention while
+   connected. Use **Back up now** and verify a versioned `.mrb` appears under the
+   room's `backups` directory while older bundles remain.
+7. Leave the room and verify the shared-segmentation selector, Segment Editor
    label table, and room node are cleared.
-6. Rejoin repeatedly and verify exactly one room segmentation is present.
+8. Rejoin repeatedly and verify exactly one room segmentation is present.
 
 ## Advanced collaboration
 

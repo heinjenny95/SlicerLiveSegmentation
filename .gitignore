@@ -20,3 +20,7 @@ server/.env
 live-roi-smoke.json
 two-user-*.json
 .shared-*.json
+.installed-*.json
+.realtime-*.json
+.shared-installed-*/
+.shared-realtime-*/

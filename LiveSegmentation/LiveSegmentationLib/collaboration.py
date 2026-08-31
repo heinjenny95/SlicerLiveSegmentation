@@ -109,7 +109,7 @@ def _atomic_temporary_path(destination):
     return destination.with_name(f".tmp-{token}")
 
 
-def _write_json_atomic(path, payload):
+def _write_json_atomic(path, payload, durable=True):
     """Publish one complete JSON document using a same-directory rename."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,8 @@ def _write_json_atomic(path, payload):
             json.dump(payload, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             output.write("\n")
             output.flush()
-            os.fsync(output.fileno())
+            if durable:
+                os.fsync(output.fileno())
         os.replace(temporary, destination)
     except OSError as exc:
         raise LiveCollaborationError(
@@ -143,8 +144,12 @@ def _write_presence_json(path, payload):
     only atomic publication.
     """
     destination = Path(path)
+    if not destination.parent.is_dir():
+        raise LiveCollaborationError(
+            f"Presence folder is unavailable: {destination.parent}"
+        )
     try:
-        return _write_json_atomic(destination, payload)
+        return _write_json_atomic(destination, payload, durable=False)
     except LiveCollaborationError as atomic_error:
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +163,6 @@ def _write_presence_json(path, payload):
                 )
                 output.write("\n")
                 output.flush()
-                os.fsync(output.fileno())
         except OSError as direct_error:
             raise LiveCollaborationError(
                 "Could not update presence in the shared folder "
@@ -509,8 +513,8 @@ class LiveRoomClient:
             "server_url": self.server_url,
         }
 
-    def reserve_project_backup(self, room_id, interval_seconds):
-        del room_id, interval_seconds
+    def reserve_project_backup(self, room_id, interval_seconds, force=False):
+        del room_id, interval_seconds, force
         return None
 
 
@@ -523,7 +527,7 @@ class SharedFolderRoomClient:
         user_name,
         lock_timeout_seconds=10.0,
         stale_lock_seconds=60.0,
-        presence_ttl_seconds=10.0,
+        presence_ttl_seconds=30.0,
     ):
         self.shared_folder = normalize_shared_folder(shared_folder)
         self.user_name = str(user_name or "").strip()
@@ -535,6 +539,7 @@ class SharedFolderRoomClient:
         self.rooms_root = self.shared_folder / "LiveSegmentation" / "rooms"
         self._room_id = None
         self._room_path = None
+        self._segment_owners_cache = {}
 
     @staticmethod
     def _room_key(room_name):
@@ -561,6 +566,13 @@ class SharedFolderRoomClient:
         return self._room_path
 
     def _latest_sequence(self, room_path):
+        state_path = room_path / "sequence-state.json"
+        if state_path.is_file():
+            try:
+                state = _read_json_file(state_path)
+                return max(0, int(state.get("latest_sequence", 0)))
+            except (LiveCollaborationError, TypeError, ValueError):
+                pass
         latest = 0
         operations_path = room_path / "operations"
         try:
@@ -576,10 +588,13 @@ class SharedFolderRoomClient:
         return latest
 
     @contextmanager
-    def _sequence_lock(self, room_path):
-        lock_path = room_path / "sequence.lock"
+    def _named_lock(self, room_path, lock_name, timeout_seconds=None):
+        lock_name = _safe_file_component(lock_name, fallback="room-lock", max_length=40)
+        lock_path = room_path / f"{lock_name}.lock"
         token = uuid.uuid4().hex
-        deadline = time.monotonic() + self.lock_timeout_seconds
+        deadline = time.monotonic() + float(
+            self.lock_timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
         while True:
             try:
                 lock_path.mkdir()
@@ -589,7 +604,7 @@ class SharedFolderRoomClient:
                 except OSError:
                     age = 0.0
                 if age > self.stale_lock_seconds:
-                    stale_path = room_path / f"sequence.lock.stale-{uuid.uuid4().hex}"
+                    stale_path = room_path / f"{lock_name}.lock.stale-{uuid.uuid4().hex}"
                     try:
                         os.replace(lock_path, stale_path)
                         owner_path = stale_path / "owner.json"
@@ -644,6 +659,9 @@ class SharedFolderRoomClient:
             except (OSError, LiveCollaborationError):
                 pass
 
+    def _sequence_lock(self, room_path):
+        return self._named_lock(room_path, "sequence")
+
     def join(self, room_name, signature):
         room_key = self._room_key(room_name)
         room_path = self.rooms_root / room_key
@@ -653,6 +671,7 @@ class SharedFolderRoomClient:
             (room_path / "presence").mkdir(exist_ok=True)
             (room_path / "chat").mkdir(exist_ok=True)
             (room_path / "locks").mkdir(exist_ok=True)
+            (room_path / "segment-index").mkdir(exist_ok=True)
             (room_path / "backups").mkdir(exist_ok=True)
             (room_path / "snapshots").mkdir(exist_ok=True)
             (room_path / "operation-archives").mkdir(exist_ok=True)
@@ -692,6 +711,7 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError("Unsupported shared-room format")
         self._room_id = room_key
         self._room_path = room_path
+        self._segment_owners_cache = {}
         self._append_audit(room_path, "room.join", {"created": created})
         return {
             "id": room_key,
@@ -730,30 +750,6 @@ class SharedFolderRoomClient:
                         f"Label is locked by {lock_state.get('owner') or 'another user'}"
                     )
             base_sequence = int(operation.get("base_sequence", 0) or 0)
-            if base_sequence > 0 and operation.get("operation_kind") != "snapshot":
-                for previous in self._all_operation_records(room_path):
-                    if int(previous.get("sequence", 0)) <= base_sequence:
-                        continue
-                    if previous.get("author") == self.user_name:
-                        continue
-                    if previous.get("system_snapshot"):
-                        continue
-                    try:
-                        overlap = operation_overlap_count(
-                            previous, operation, decode_mask_delta
-                        )
-                    except Exception:
-                        overlap = 0
-                    if overlap:
-                        conflicts.append(
-                            {
-                                "id": str(uuid.uuid4()),
-                                "segment_id": segment_id,
-                                "other_author": previous.get("author"),
-                                "other_sequence": int(previous.get("sequence", 0)),
-                                "overlap_voxels": overlap,
-                            }
-                        )
             sequence = self._latest_sequence(room_path) + 1
             stored = {
                 **operation,
@@ -768,20 +764,53 @@ class SharedFolderRoomClient:
             except Exception:
                 pass
             destination = operations_path / f"{sequence:020d}--{operation_hash}.json"
+            _write_json_atomic(
+                room_path / "sequence-state.json",
+                {"latest_sequence": sequence, "updated_at": _utc_iso()},
+                durable=False,
+            )
             _write_json_atomic(destination, stored)
-            for conflict in conflicts:
-                conflict.update(
-                    {
-                        "sequence": sequence,
-                        "author": self.user_name,
-                        "created_at": _utc_iso(),
-                        "resolution": "unresolved",
-                    }
-                )
-                _write_json_atomic(
-                    room_path / "conflicts" / f"{sequence:020d}--{conflict['id']}.json",
-                    conflict,
-                )
+            self._remember_segment_owner(
+                room_path, stored.get("segment_id"), stored.get("author")
+            )
+        # Conflict analysis can involve decoding many historical deltas. It is
+        # intentionally outside the sequence lock, so another collaborator can
+        # publish the next edit while this diagnostic work finishes.
+        if base_sequence > 0 and operation.get("operation_kind") != "snapshot":
+            for previous in self._all_operation_records(room_path):
+                previous_sequence = int(previous.get("sequence", 0))
+                if previous_sequence <= base_sequence or previous_sequence >= sequence:
+                    continue
+                if previous.get("author") == self.user_name or previous.get("system_snapshot"):
+                    continue
+                try:
+                    overlap = operation_overlap_count(previous, operation, decode_mask_delta)
+                except Exception:
+                    overlap = 0
+                if overlap:
+                    conflicts.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "segment_id": segment_id,
+                            "other_author": previous.get("author"),
+                            "other_sequence": previous_sequence,
+                            "overlap_voxels": overlap,
+                        }
+                    )
+        for conflict in conflicts:
+            conflict.update(
+                {
+                    "sequence": sequence,
+                    "author": self.user_name,
+                    "created_at": _utc_iso(),
+                    "resolution": "unresolved",
+                }
+            )
+            _write_json_atomic(
+                room_path / "conflicts" / f"{sequence:020d}--{conflict['id']}.json",
+                conflict,
+                durable=False,
+            )
         self._append_audit(
             room_path,
             "segmentation.operation",
@@ -802,8 +831,13 @@ class SharedFolderRoomClient:
         after_sequence = int(after_sequence)
         limit = max(1, min(int(limit), 5000))
         selected = []
+        operations_path = room_path / "operations"
+        if not operations_path.is_dir():
+            raise LiveCollaborationError(
+                f"Shared operations folder is unavailable: {operations_path}"
+            )
         try:
-            for path in room_path.joinpath("operations").glob("*.json"):
+            for path in operations_path.glob("*.json"):
                 sequence = self._operation_sequence(path)
                 if sequence is not None and sequence > after_sequence:
                     selected.append((sequence, path))
@@ -814,6 +848,9 @@ class SharedFolderRoomClient:
             operation = _read_json_file(path)
             operation["sequence"] = sequence
             operations.append(operation)
+            self._remember_segment_owner(
+                room_path, operation.get("segment_id"), operation.get("author")
+            )
         return operations
 
     def _presence_path(self, room_path):
@@ -824,8 +861,13 @@ class SharedFolderRoomClient:
     def _read_presence(self, room_path):
         now = time.time()
         users = []
+        presence_path = room_path / "presence"
+        if not presence_path.is_dir():
+            raise LiveCollaborationError(
+                f"Shared presence folder is unavailable: {presence_path}"
+            )
         try:
-            paths = list(room_path.joinpath("presence").glob("*.json"))
+            paths = list(presence_path.glob("*.json"))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not list shared presence: {exc}") from exc
         for path in paths:
@@ -875,6 +917,7 @@ class SharedFolderRoomClient:
             pass
         self._room_id = None
         self._room_path = None
+        self._segment_owners_cache = {}
         return {"left": True}
 
     def _latest_message_sequence(self, room_path):
@@ -903,7 +946,9 @@ class SharedFolderRoomClient:
             f"{self.user_name}\0{message_id}".encode()
         ).hexdigest()[:20]
         chat_path = room_path / "chat"
-        with self._sequence_lock(room_path):
+        # Chat has its own short critical section. It must never wait for a large
+        # segmentation operation or block one in return.
+        with self._named_lock(room_path, "chat-sequence", timeout_seconds=3.0):
             existing = sorted(chat_path.glob(f"*--{message_hash}.json"))
             if existing:
                 message = _read_json_file(existing[0])
@@ -920,7 +965,9 @@ class SharedFolderRoomClient:
             if isinstance(anchor, dict) and anchor:
                 message["anchor"] = anchor
             _write_json_atomic(
-                chat_path / f"{sequence:020d}--{message_hash}.json", message
+                chat_path / f"{sequence:020d}--{message_hash}.json",
+                message,
+                durable=False,
             )
         self._append_audit(
             room_path,
@@ -933,8 +980,13 @@ class SharedFolderRoomClient:
         room_path = self._require_room(room_id)
         after_sequence = int(after_sequence)
         selected = []
+        chat_path = room_path / "chat"
+        if not chat_path.is_dir():
+            raise LiveCollaborationError(
+                f"Shared chat folder is unavailable: {chat_path}"
+            )
         try:
-            for path in room_path.joinpath("chat").glob("*.json"):
+            for path in chat_path.glob("*.json"):
                 sequence = self._message_sequence(path)
                 if sequence is not None and sequence > after_sequence:
                     selected.append((sequence, path))
@@ -953,11 +1005,65 @@ class SharedFolderRoomClient:
         digest = hashlib.sha256(str(segment_id).encode("utf-8")).hexdigest()[:12]
         return room_path / "locks" / f"{readable}--{digest}.json"
 
+    @staticmethod
+    def _segment_owner_path(room_path, segment_id):
+        readable = _safe_file_component(segment_id, fallback="segment", max_length=28)
+        digest = hashlib.sha256(str(segment_id).encode("utf-8")).hexdigest()[:12]
+        return room_path / "segment-index" / f"{readable}--{digest}.json"
+
+    def _remember_segment_owner(self, room_path, segment_id, owner):
+        segment_id = str(segment_id or "").strip()
+        owner = str(owner or "").strip()
+        if not segment_id or not owner or segment_id in self._segment_owners_cache:
+            return
+        path = self._segment_owner_path(room_path, segment_id)
+        if path.is_file():
+            try:
+                existing = _read_json_file(path)
+                existing_owner = str(existing.get("owner") or "").strip()
+                if existing_owner:
+                    self._segment_owners_cache[segment_id] = existing_owner
+                    return
+            except LiveCollaborationError:
+                pass
+        _write_json_atomic(
+            path,
+            {
+                "segment_id": segment_id,
+                "owner": owner,
+                "indexed_at": _utc_iso(),
+            },
+            durable=False,
+        )
+        self._segment_owners_cache[segment_id] = owner
+
     def _segment_creators(self, room_path):
-        creators = {}
+        creators = dict(self._segment_owners_cache)
+        index_path = room_path / "segment-index"
+        operations_path = room_path / "operations"
+        if not index_path.is_dir() or not operations_path.is_dir():
+            raise LiveCollaborationError(
+                f"Shared label metadata is unavailable in {room_path}"
+            )
+        complete_path = index_path / ".complete"
+        try:
+            for path in index_path.glob("*.json"):
+                data = _read_json_file(path)
+                segment_id = str(data.get("segment_id") or "")
+                owner = str(data.get("owner") or "")
+                if segment_id and owner:
+                    creators.setdefault(segment_id, owner)
+        except OSError as exc:
+            raise LiveCollaborationError(f"Could not inspect segment ownership: {exc}") from exc
+        if complete_path.is_file():
+            self._segment_owners_cache = creators
+            return creators
+
+        # One-time migration for rooms created before the compact owner index
+        # existed. Subsequent lock polling reads only one tiny file per label.
         selected = []
         try:
-            for path in room_path.joinpath("operations").glob("*.json"):
+            for path in operations_path.glob("*.json"):
                 sequence = self._operation_sequence(path)
                 if sequence is not None:
                     selected.append((sequence, path))
@@ -967,7 +1073,15 @@ class SharedFolderRoomClient:
             operation = _read_json_file(path)
             segment_id = str(operation.get("segment_id") or "")
             if segment_id and segment_id not in creators:
-                creators[segment_id] = str(operation.get("author") or "")
+                owner = str(operation.get("author") or "")
+                if owner:
+                    creators[segment_id] = owner
+                    self._remember_segment_owner(room_path, segment_id, owner)
+        try:
+            complete_path.touch(exist_ok=True)
+        except OSError:
+            pass
+        self._segment_owners_cache = creators
         return creators
 
     def segment_locks(self, room_id):
@@ -1001,40 +1115,41 @@ class SharedFolderRoomClient:
         segment_id = str(segment_id or "").strip()
         if not segment_id:
             raise LiveCollaborationError("Select a label first")
-        with self._sequence_lock(room_path):
-            owner = self._segment_creators(room_path).get(segment_id)
-            existing_lock_path = self._segment_lock_path(room_path, segment_id)
-            if existing_lock_path.is_file():
-                owner = str(_read_json_file(existing_lock_path).get("owner") or owner)
-            if not owner:
-                raise LiveCollaborationError(
-                    "The label must synchronize once before it can be locked"
-                )
-            role = self._role_for(room_path, self.user_name)
-            if owner != self.user_name and role != "admin":
-                raise LiveCollaborationError(
-                    f"Only {owner}, who created this label, can change its lock"
-                )
-            expires_minutes = max(0, int(expires_minutes or 0))
-            expires_epoch = (
-                time.time() + expires_minutes * 60.0
-                if bool(locked) and expires_minutes
-                else 0.0
+        owner = self._segment_creators(room_path).get(segment_id)
+        existing_lock_path = self._segment_lock_path(room_path, segment_id)
+        if existing_lock_path.is_file():
+            owner = str(_read_json_file(existing_lock_path).get("owner") or owner)
+        if not owner:
+            raise LiveCollaborationError(
+                "The label must synchronize once before it can be locked"
             )
-            state = {
-                "segment_id": segment_id,
-                "owner": owner,
-                "locked": bool(locked),
-                "updated_by": self.user_name,
-                "updated_at": _utc_iso(),
-                "expires_epoch": expires_epoch,
-                "expires_at": (
-                    datetime.fromtimestamp(expires_epoch, timezone.utc).isoformat()
-                    if expires_epoch
-                    else None
-                ),
-            }
-            _write_json_atomic(self._segment_lock_path(room_path, segment_id), state)
+        role = self._role_for(room_path, self.user_name)
+        if owner != self.user_name and role != "admin":
+            raise LiveCollaborationError(
+                f"Only {owner}, who created this label, can change its lock"
+            )
+        expires_minutes = max(0, int(expires_minutes or 0))
+        expires_epoch = (
+            time.time() + expires_minutes * 60.0
+            if bool(locked) and expires_minutes
+            else 0.0
+        )
+        state = {
+            "segment_id": segment_id,
+            "owner": owner,
+            "locked": bool(locked),
+            "updated_by": self.user_name,
+            "updated_at": _utc_iso(),
+            "expires_epoch": expires_epoch,
+            "expires_at": (
+                datetime.fromtimestamp(expires_epoch, timezone.utc).isoformat()
+                if expires_epoch
+                else None
+            ),
+        }
+        _write_json_atomic(
+            self._segment_lock_path(room_path, segment_id), state, durable=False
+        )
         self._append_audit(
             room_path,
             "label.lock",
@@ -1055,10 +1170,16 @@ class SharedFolderRoomClient:
             "created_at": _utc_iso(),
             "details": details or {},
         }
-        _write_json_atomic(
-            room_path / "audit" / f"{stamp:020d}--{record['id'][:12]}.json",
-            record,
-        )
+        try:
+            _write_json_atomic(
+                room_path / "audit" / f"{stamp:020d}--{record['id'][:12]}.json",
+                record,
+                durable=False,
+            )
+        except LiveCollaborationError:
+            # Audit is valuable, but it must never make a successful live edit,
+            # chat message, or lock update look as though the room disconnected.
+            return None
         return record
 
     def audit_events(self, room_id, limit=500):
@@ -1334,7 +1455,15 @@ class SharedFolderRoomClient:
                     / f"{sequence:020d}--{operation_hash}.json"
                 )
                 _write_json_atomic(destination, stored)
+                self._remember_segment_owner(
+                    room_path, stored.get("segment_id"), stored.get("author")
+                )
                 created.append(stored)
+            _write_json_atomic(
+                room_path / "sequence-state.json",
+                {"latest_sequence": sequence, "updated_at": _utc_iso()},
+                durable=False,
+            )
             manifest = {
                 "id": group_id,
                 "created_at": _utc_iso(),
@@ -1544,14 +1673,14 @@ class SharedFolderRoomClient:
             "room_path": str(room_path),
         }
 
-    def reserve_project_backup(self, room_id, interval_seconds):
+    def reserve_project_backup(self, room_id, interval_seconds, force=False):
         room_path = self._require_room(room_id)
         now = time.time()
         state_path = room_path / "backup-state.json"
-        with self._sequence_lock(room_path):
+        with self._named_lock(room_path, "backup", timeout_seconds=3.0):
             state = _read_json_file(state_path) if state_path.is_file() else {}
             last_backup = float(state.get("last_backup_epoch", 0.0) or 0.0)
-            if now - last_backup < max(60.0, float(interval_seconds)):
+            if not force and now - last_backup < max(60.0, float(interval_seconds)):
                 return None
             token = uuid.uuid4().hex
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1601,21 +1730,32 @@ class LiveCollaborationController:
         self._observed_segmentation = None
         self._observer_tags = []
         self._applying_remote = False
+        # Independent lanes keep slow project maintenance from blocking live
+        # edits, presence, chat, or label locks.
         self._worker = None
+        self._realtime_worker = None
+        self._maintenance_worker = None
         self._worker_results = queue.Queue()
         self._last_presence_send = 0.0
         self._last_metadata_fetch = 0.0
+        self._last_sync_poll = 0.0
         self._last_health_check = 0.0
         self._last_backup_check = 0.0
         self._last_error = None
         self._session_token = 0
         self.connection_healthy = False
         self._connection_error_popup_shown = False
-        self._force_refresh = False
+        self._connection_error_dialog = None
+        self._force_sync_refresh = False
+        self._force_realtime_refresh = False
+        self._force_health_check = False
+        self._force_advanced_refresh = False
         self._last_sync_duration = None
         self.last_chat_sequence = 0
         self.pending_chat = []
         self.displayed_chat_sequences = set()
+        self.displayed_chat_ids = set()
+        self.optimistic_chat_ids = set()
         self.segment_owners = {}
         self.segment_locks_state = {}
         self.pending_lock_changes = {}
@@ -1693,9 +1833,10 @@ class LiveCollaborationController:
         self.join_button.clicked.connect(self.toggle_connection)
         connection_actions = qt.QHBoxLayout()
         connection_actions.addWidget(self.join_button, 1)
-        self.refresh_button = qt.QPushButton("Refresh now")
+        self.refresh_button = qt.QPushButton("Sync now")
         self.refresh_button.setToolTip(
-            "Immediately check the connection, participants, chat, locks, and new edits"
+            "Immediately request new edits, participants, chat, and label locks. "
+            "This does not rescan the version history or backups."
         )
         self.refresh_button.enabled = False
         self.refresh_button.clicked.connect(self.refresh_now)
@@ -1723,6 +1864,16 @@ class LiveCollaborationController:
         presence_actions.addWidget(self.follow_checkbox)
         presence_actions.addWidget(self.jump_to_user_button)
         layout.addLayout(presence_actions)
+
+        label_management_layout = qt.QFormLayout()
+        self.label_combo = qt.QComboBox()
+        self.label_combo.enabled = False
+        self.label_combo.setToolTip(
+            "Choose the label whose lock, owner, and review state you want to manage"
+        )
+        self.label_combo.currentIndexChanged.connect(self._on_label_combo_changed)
+        label_management_layout.addRow("Label to manage", self.label_combo)
+        layout.addLayout(label_management_layout)
 
         self.lock_status_label = qt.QLabel("Select a label after joining to manage its lock")
         self.lock_status_label.setWordWrap(True)
@@ -1846,11 +1997,16 @@ class LiveCollaborationController:
             settings.value(self.SETTINGS_PREFIX + "backupRetention", 50)
         )
         backup_form.addRow("Keep unpinned", self.backup_retention_spin)
+        self.backup_enabled_checkbox.toggled.connect(self._on_backup_settings_changed)
+        self.backup_interval_spin.valueChanged.connect(self._on_backup_settings_changed)
+        self.backup_retention_spin.valueChanged.connect(self._on_backup_settings_changed)
         self.backup_tree = qt.QTreeWidget()
         self.backup_tree.setHeaderLabels(["Backup", "Size", "Pinned", "Checksum"])
         self.backup_tree.setMaximumHeight(135)
         backup_form.addRow(self.backup_tree)
         backup_buttons = qt.QHBoxLayout()
+        self.backup_now_button = qt.QPushButton("Back up now")
+        self.backup_now_button.clicked.connect(self.create_backup_now)
         self.refresh_backups_button = qt.QPushButton("Refresh backups")
         self.refresh_backups_button.clicked.connect(self.refresh_backup_list)
         self.pin_backup_button = qt.QPushButton("Pin / unpin")
@@ -1860,6 +2016,7 @@ class LiveCollaborationController:
         self.restore_backup_button = qt.QPushButton("Restore")
         self.restore_backup_button.clicked.connect(self.restore_selected_backup)
         for button in (
+            self.backup_now_button,
             self.refresh_backups_button,
             self.pin_backup_button,
             self.verify_backup_button,
@@ -1988,7 +2145,7 @@ class LiveCollaborationController:
         self.owner.layout.addWidget(self.group)
 
         self.timer = qt.QTimer()
-        self.timer.setInterval(300)
+        self.timer.setInterval(150)
         self.timer.timeout.connect(self.on_timer)
 
     @staticmethod
@@ -2014,6 +2171,8 @@ class LiveCollaborationController:
         self.shared_folder_widget.setVisible(shared)
         self.server_settings.setVisible(not shared)
         self.backup_group.setVisible(shared)
+        if hasattr(self, "backup_enabled_checkbox"):
+            self._on_backup_settings_changed()
 
     def choose_shared_folder(self, checked=False):
         del checked
@@ -2037,6 +2196,7 @@ class LiveCollaborationController:
             self.join()
 
     def _show_error(self, message, popup=False):
+        import qt
         import slicer
 
         self._last_error = str(message)
@@ -2058,15 +2218,25 @@ class LiveCollaborationController:
                     f"{message}\n\n"
                     "Check the server or shared folder connection and try again."
                 )
-            slicer.util.errorDisplay(detail)
+            if self._connection_error_dialog is None:
+                dialog = qt.QMessageBox(slicer.util.mainWindow())
+                dialog.setWindowTitle("Live Segmentation connection problem")
+                dialog.setIcon(qt.QMessageBox.Critical)
+                dialog.setStandardButtons(qt.QMessageBox.Ok)
+                dialog.setModal(False)
+                self._connection_error_dialog = dialog
+            self._connection_error_dialog.setText(detail)
+            self._connection_error_dialog.show()
 
     def refresh_now(self, checked=False):
         del checked
         if not self.connected:
             self._show_error("Join a live room before refreshing", popup=True)
             return
-        self._force_refresh = True
-        self.status_label.setText("● Refreshing room…")
+        self._force_sync_refresh = True
+        self._force_realtime_refresh = True
+        self._force_health_check = True
+        self.status_label.setText("● Syncing live state…")
         self.status_label.setStyleSheet("color: #b26a00;")
         self.on_timer()
 
@@ -2083,8 +2253,20 @@ class LiveCollaborationController:
         if anchor_enabled:
             message["anchor"] = self._current_location()
         self.pending_chat.append(message)
+        self.optimistic_chat_ids.add(message["client_message_id"])
+        marker = " 📍" if message.get("anchor") else ""
+        self.chat_history.appendPlainText(
+            f"[{datetime.now().strftime('%H:%M')}] {self.user_name}: {text}{marker}"
+        )
+        self.displayed_chat_ids.add(
+            f"{self.user_name}\0{message['client_message_id']}"
+        )
+        scroll_bar = self.chat_history.verticalScrollBar()
+        maximum = scroll_bar.maximum
+        maximum = maximum() if callable(maximum) else maximum
+        scroll_bar.setValue(maximum)
         self.chat_input.clear()
-        self._force_refresh = True
+        self._force_realtime_refresh = True
         self.on_timer()
 
     def toggle_selected_segment_lock(self, checked=False):
@@ -2092,7 +2274,7 @@ class LiveCollaborationController:
         if not self.connected:
             self._show_error("Join a live room before changing a label lock", popup=True)
             return
-        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        segment_id = self._selected_segment_id()
         if not segment_id:
             self._show_error("Select a label first", popup=True)
             return
@@ -2112,14 +2294,100 @@ class LiveCollaborationController:
             "expires_minutes": int(expiry),
         }
         self._update_lock_controls()
-        self._force_refresh = True
+        self._force_realtime_refresh = True
         self.on_timer()
 
     def _queue_action(self, action, **payload):
         record = {"id": str(uuid.uuid4()), "action": str(action), **payload}
         self.pending_actions.append(record)
-        self._force_refresh = True
         return record
+
+    def _selected_segment_id(self):
+        if hasattr(self, "label_combo"):
+            value = self._combo_current_data(self.label_combo)
+            if value:
+                return str(value)
+        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        return str(segment_id) if segment_id else None
+
+    def _refresh_label_combo(self):
+        if not hasattr(self, "label_combo"):
+            return
+        current = self._selected_segment_id()
+        node = self._segmentation_node()
+        entries = []
+        if node is not None:
+            for segment_id in node.GetSegmentation().GetSegmentIDs():
+                segment = node.GetSegmentation().GetSegment(segment_id)
+                entries.append(
+                    (str(segment_id), str(segment.GetName() if segment is not None else segment_id))
+                )
+        combo_count = self.label_combo.count
+        combo_count = combo_count() if callable(combo_count) else combo_count
+        existing = [
+            str(self.label_combo.itemData(index))
+            for index in range(int(combo_count))
+        ]
+        if existing == [segment_id for segment_id, _ in entries]:
+            return
+        self.label_combo.blockSignals(True)
+        self.label_combo.clear()
+        selected_index = 0
+        for index, (segment_id, name) in enumerate(entries):
+            self.label_combo.addItem(name, segment_id)
+            if segment_id == current:
+                selected_index = index
+        if entries:
+            self.label_combo.setCurrentIndex(selected_index)
+        self.label_combo.blockSignals(False)
+        self.label_combo.enabled = bool(self.connected and entries)
+
+    def _on_label_combo_changed(self, index=None):
+        del index
+        segment_id = self._selected_segment_id()
+        if segment_id and hasattr(self.owner, "select_segment_in_editor"):
+            self.owner.select_segment_in_editor(segment_id)
+        self._update_lock_controls()
+
+    def _on_backup_settings_changed(self, value=None):
+        del value
+        import qt
+
+        enabled = self.backup_enabled_checkbox.checked
+        enabled = enabled() if callable(enabled) else enabled
+        interval = self.backup_interval_spin.value
+        interval = interval() if callable(interval) else interval
+        retention = self.backup_retention_spin.value
+        retention = retention() if callable(retention) else retention
+        shared = self._transport_mode() == "shared-folder"
+        self.backup_interval_spin.enabled = bool(shared and enabled)
+        self.backup_retention_spin.enabled = bool(shared and enabled)
+        settings = qt.QSettings()
+        settings.setValue(self.SETTINGS_PREFIX + "automaticBackups", bool(enabled))
+        settings.setValue(
+            self.SETTINGS_PREFIX + "backupIntervalMinutes",
+            int(interval),
+        )
+        settings.setValue(
+            self.SETTINGS_PREFIX + "backupRetention",
+            int(retention),
+        )
+        if not enabled:
+            self.backup_status_label.setText("Automatic project backups are off.")
+        else:
+            self.backup_status_label.setText(
+                f"A complete .mrb project is saved every {int(interval)} "
+                f"min; the newest {int(retention)} unpinned backups are kept."
+            )
+
+    def create_backup_now(self, checked=False):
+        del checked
+        if not self.connected or not isinstance(self.client, SharedFolderRoomClient):
+            self._show_error("Join a shared-folder room before creating a backup", popup=True)
+            return
+        self.backup_status_label.setText("Creating a complete project backup…")
+        self._queue_action("backup_now")
+        self.on_timer()
 
     def _combo_current_text(self, combo):
         value = combo.currentText
@@ -2195,13 +2463,13 @@ class LiveCollaborationController:
 
     def request_selected_segment_access(self, checked=False):
         del checked
-        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        segment_id = self._selected_segment_id()
         if segment_id:
             self._queue_action("request_access", segment_id=segment_id, message="")
 
     def transfer_selected_segment_owner(self, checked=False):
         del checked
-        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        segment_id = self._selected_segment_id()
         target = self._combo_current_text(self.collaborator_combo)
         if segment_id and target:
             self._queue_action(
@@ -2210,7 +2478,7 @@ class LiveCollaborationController:
 
     def set_selected_segment_review_state(self, checked=False):
         del checked
-        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        segment_id = self._selected_segment_id()
         if not segment_id:
             self._show_error("Select a label first", popup=True)
             return
@@ -2231,8 +2499,7 @@ class LiveCollaborationController:
 
     def refresh_advanced_state(self, checked=False):
         del checked
-        self._force_refresh = True
-        self._last_advanced_fetch = 0.0
+        self._force_advanced_refresh = True
         self.on_timer()
 
     def filter_history_tree(self, value=None):
@@ -2549,6 +2816,8 @@ class LiveCollaborationController:
             self.last_chat_sequence = 0
             self.pending_chat.clear()
             self.displayed_chat_sequences.clear()
+            self.displayed_chat_ids.clear()
+            self.optimistic_chat_ids.clear()
             self.chat_history.clear()
             self.segment_owners.clear()
             self.segment_locks_state.clear()
@@ -2569,11 +2838,18 @@ class LiveCollaborationController:
             self._snapshot_label = ""
             self._restoring_sequence = None
             self._worker_results = queue.Queue()
+            self._worker = None
+            self._realtime_worker = None
+            self._maintenance_worker = None
             self._last_presence_send = 0.0
             self._last_metadata_fetch = 0.0
+            self._last_sync_poll = 0.0
             self._last_health_check = 0.0
             self._last_backup_check = 0.0
-            self._force_refresh = True
+            self._force_sync_refresh = True
+            self._force_realtime_refresh = True
+            self._force_health_check = True
+            self._force_advanced_refresh = True
             self._connection_error_popup_shown = False
             self.connection_healthy = True
             self.connected = True
@@ -2613,15 +2889,16 @@ class LiveCollaborationController:
             self.shared_folder_button.enabled = False
             self.server_edit.enabled = False
             self.api_key_edit.enabled = False
-            self.backup_enabled_checkbox.enabled = False
-            self.backup_interval_spin.enabled = False
-            self.backup_retention_spin.enabled = False
+            shared_folder_room = isinstance(client, SharedFolderRoomClient)
+            self.backup_enabled_checkbox.enabled = shared_folder_room
+            self._on_backup_settings_changed()
             self.owner.set_live_inputs_enabled(False)
             self.owner.set_live_session_active(True)
             self.join_button.setText("Leave live room")
             self.refresh_button.enabled = True
             self.chat_input.enabled = True
             self.chat_send_button.enabled = True
+            self.label_combo.enabled = True
             self.lock_expiry_spin.enabled = True
             self.refresh_history_button.enabled = True
             self.restore_revision_button.enabled = True
@@ -2630,14 +2907,16 @@ class LiveCollaborationController:
             self.export_invite_button.enabled = True
             self.publish_template_button.enabled = True
             self.apply_template_button.enabled = True
-            if isinstance(client, SharedFolderRoomClient):
+            if shared_folder_room:
                 for button in (
+                    self.backup_now_button,
                     self.refresh_backups_button,
                     self.pin_backup_button,
                     self.verify_backup_button,
                     self.restore_backup_button,
                 ):
                     button.enabled = True
+            self._refresh_label_combo()
             self.status_label.setText(self._live_status_text())
             self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
             self._update_presence(room.get("presence") or [])
@@ -2692,6 +2971,8 @@ class LiveCollaborationController:
         self._known_segment_ids.clear()
         self.pending_chat.clear()
         self.displayed_chat_sequences.clear()
+        self.displayed_chat_ids.clear()
+        self.optimistic_chat_ids.clear()
         self.last_chat_sequence = 0
         self.segment_owners.clear()
         self.segment_locks_state.clear()
@@ -2712,7 +2993,10 @@ class LiveCollaborationController:
         self._snapshot_label = ""
         self._restoring_sequence = None
         self._worker_results = queue.Queue()
-        self._force_refresh = False
+        self._force_sync_refresh = False
+        self._force_realtime_refresh = False
+        self._force_health_check = False
+        self._force_advanced_refresh = False
         self._connection_error_popup_shown = False
         try:
             self.owner.clear_live_segmentation(segmentation_node_id)
@@ -2726,8 +3010,7 @@ class LiveCollaborationController:
         self.server_edit.enabled = True
         self.api_key_edit.enabled = True
         self.backup_enabled_checkbox.enabled = True
-        self.backup_interval_spin.enabled = True
-        self.backup_retention_spin.enabled = True
+        self._on_backup_settings_changed()
         self.owner.set_live_inputs_enabled(True)
         self.owner.set_live_session_active(False)
         self._update_transport_fields()
@@ -2739,6 +3022,8 @@ class LiveCollaborationController:
         self.chat_input.clear()
         self.chat_location_combo.clear()
         self.collaborator_combo.clear()
+        self.label_combo.clear()
+        self.label_combo.enabled = False
         self.history_tree.clear()
         self.conflict_tree.clear()
         self.backup_tree.clear()
@@ -2756,6 +3041,7 @@ class LiveCollaborationController:
             self.refresh_history_button,
             self.restore_revision_button,
             self.create_snapshot_button,
+            self.backup_now_button,
             self.refresh_backups_button,
             self.pin_backup_button,
             self.verify_backup_button,
@@ -2825,6 +3111,7 @@ class LiveCollaborationController:
         # separately installed module without coupling to that module's UI.
         for segment_id in current_ids:
             self.dirty_segments.add((node.GetID(), segment_id))
+        self._refresh_label_combo()
         self._update_lock_controls()
 
     def _initialize_baselines_and_seed(self, seed=False):
@@ -2993,89 +3280,123 @@ class LiveCollaborationController:
         if not self.connected:
             return
         self._drain_worker_results()
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._prepare_outgoing()
-        outgoing = list(self.outgoing)
-        chat_outgoing = list(self.pending_chat)
-        lock_changes = dict(self.pending_lock_changes)
-        actions = list(self.pending_actions)
-        after_sequence = int(self.last_sequence)
         now = time.time()
-        presence = None
-        if now - self._last_presence_send >= 1.0:
-            presence = self._active_presence()
-            self._last_presence_send = now
 
-        fetch_metadata = self._force_refresh or now - self._last_metadata_fetch >= 1.0
-        fetch_advanced = self._force_refresh or now - self._last_advanced_fetch >= 5.0
-        health_check = self._force_refresh or now - self._last_health_check >= 2.0
-        backup_check = False
-        backup_interval_seconds = 300.0
-        backup_value = self.backup_interval_spin.value
-        backup_value = backup_value() if callable(backup_value) else backup_value
+        sync_idle = self._worker is None or not self._worker.is_alive()
+        if sync_idle and (
+            self._force_sync_refresh or now - self._last_sync_poll >= 0.25
+        ):
+            self._prepare_outgoing()
+            outgoing = list(self.outgoing)
+            snapshot_operations = []
+            snapshot_label = ""
+            should_snapshot = (
+                self.initial_sync_complete
+                and not outgoing
+                and not self.dirty_segments
+                and (
+                    self._snapshot_requested
+                    or self.last_sequence - self._last_snapshot_sequence >= 100
+                )
+            )
+            if should_snapshot:
+                snapshot_operations = self._snapshot_operations()
+                snapshot_label = self._snapshot_label
+                self._snapshot_requested = False
+                self._snapshot_label = ""
+            self._last_sync_poll = now
+            self._force_sync_refresh = False
+            self._worker = threading.Thread(
+                target=self._sync_worker,
+                args=(
+                    self._session_token,
+                    self.client,
+                    self.room_id,
+                    outgoing,
+                    int(self.last_sequence),
+                    snapshot_operations,
+                    snapshot_label,
+                ),
+                name="LiveSegmentation-edits",
+                daemon=True,
+            )
+            self._worker.start()
+
+        realtime_idle = (
+            self._realtime_worker is None or not self._realtime_worker.is_alive()
+        )
+        realtime_due = (
+            self._force_realtime_refresh
+            or bool(self.pending_chat)
+            or bool(self.pending_lock_changes)
+            or now - self._last_metadata_fetch >= 0.35
+        )
+        if realtime_idle and realtime_due:
+            presence = None
+            if self._force_realtime_refresh or now - self._last_presence_send >= 1.0:
+                presence = self._active_presence()
+                self._last_presence_send = now
+            self._last_metadata_fetch = now
+            self._force_realtime_refresh = False
+            self._realtime_worker = threading.Thread(
+                target=self._realtime_sync_worker,
+                args=(
+                    self._session_token,
+                    self.client,
+                    self.room_id,
+                    presence,
+                    list(self.pending_chat),
+                    int(self.last_chat_sequence),
+                    dict(self.pending_lock_changes),
+                ),
+                name="LiveSegmentation-realtime",
+                daemon=True,
+            )
+            self._realtime_worker.start()
+
+        maintenance_idle = (
+            self._maintenance_worker is None or not self._maintenance_worker.is_alive()
+        )
+        health_check = self._force_health_check or now - self._last_health_check >= 5.0
         backup_enabled = self.backup_enabled_checkbox.checked
         backup_enabled = backup_enabled() if callable(backup_enabled) else backup_enabled
-        if (
+        backup_check = (
             bool(backup_enabled)
             and isinstance(self.client, SharedFolderRoomClient)
             and self.initial_sync_complete
-            and not outgoing
+            and not self.outgoing
             and not self.dirty_segments
             and now - self._last_backup_check >= 10.0
+        )
+        actions = list(self.pending_actions)
+        if maintenance_idle and (
+            health_check or backup_check or self._force_advanced_refresh or actions
         ):
-            backup_check = True
-            backup_interval_seconds = max(60.0, float(backup_value) * 60.0)
-            self._last_backup_check = now
-        if fetch_metadata:
-            self._last_metadata_fetch = now
-        if health_check:
-            self._last_health_check = now
-        if fetch_advanced:
-            self._last_advanced_fetch = now
-        snapshot_operations = []
-        snapshot_label = ""
-        should_snapshot = (
-            self.initial_sync_complete
-            and not outgoing
-            and not self.dirty_segments
-            and (
-                self._snapshot_requested
-                or self.last_sequence - self._last_snapshot_sequence >= 100
+            backup_value = self.backup_interval_spin.value
+            backup_value = backup_value() if callable(backup_value) else backup_value
+            if health_check:
+                self._last_health_check = now
+            if backup_check:
+                self._last_backup_check = now
+            fetch_advanced = self._force_advanced_refresh
+            self._force_health_check = False
+            self._force_advanced_refresh = False
+            self._maintenance_worker = threading.Thread(
+                target=self._maintenance_sync_worker,
+                args=(
+                    self._session_token,
+                    self.client,
+                    self.room_id,
+                    actions,
+                    fetch_advanced,
+                    health_check,
+                    backup_check,
+                    max(60.0, float(backup_value) * 60.0),
+                ),
+                name="LiveSegmentation-maintenance",
+                daemon=True,
             )
-        )
-        if should_snapshot:
-            snapshot_operations = self._snapshot_operations()
-            snapshot_label = self._snapshot_label
-            self._snapshot_requested = False
-            self._snapshot_label = ""
-        self._force_refresh = False
-
-        self._worker = threading.Thread(
-            target=self._sync_worker,
-            args=(
-                self._session_token,
-                self.client,
-                self.room_id,
-                outgoing,
-                after_sequence,
-                presence,
-                chat_outgoing,
-                self.last_chat_sequence,
-                lock_changes,
-                actions,
-                fetch_metadata,
-                fetch_advanced,
-                health_check,
-                backup_check,
-                backup_interval_seconds,
-                snapshot_operations,
-                snapshot_label,
-            ),
-            name="LiveSegmentation-sync",
-            daemon=True,
-        )
-        self._worker.start()
+            self._maintenance_worker.start()
 
     def _sync_worker(
         self,
@@ -3084,16 +3405,6 @@ class LiveCollaborationController:
         room_id,
         outgoing,
         after_sequence,
-        presence,
-        chat_outgoing,
-        after_chat_sequence,
-        lock_changes,
-        actions,
-        fetch_metadata,
-        fetch_advanced,
-        health_check,
-        backup_check,
-        backup_interval_seconds,
         snapshot_operations,
         snapshot_label,
     ):
@@ -3101,14 +3412,8 @@ class LiveCollaborationController:
         try:
             outgoing_ids = []
             rejected_segments = []
-            chat_ids = []
-            lock_segment_ids = []
-            action_ids = []
-            action_results = []
             conflicts_detected = []
             command_errors = []
-            if health_check:
-                client.health_check(room_id)
             for operation in outgoing:
                 try:
                     pushed = client.push_operation(room_id, operation)
@@ -3121,6 +3426,50 @@ class LiveCollaborationController:
                     outgoing_ids.append(operation["client_operation_id"])
                     rejected_segments.append(operation["segment_id"])
                     command_errors.append(message)
+            snapshot = None
+            if snapshot_operations:
+                snapshot = client.publish_room_snapshot(
+                    room_id, snapshot_operations, compact=True, label=snapshot_label
+                )
+            operations = client.operations(room_id, after_sequence)
+            self._worker_results.put(
+                {
+                    "lane": "sync",
+                    "session_token": session_token,
+                    "outgoing_ids": outgoing_ids,
+                    "rejected_segments": rejected_segments,
+                    "conflicts_detected": conflicts_detected,
+                    "command_errors": command_errors,
+                    "operations": operations,
+                    "snapshot": snapshot,
+                    "duration": time.monotonic() - started,
+                }
+            )
+        except Exception as exc:
+            self._worker_results.put(
+                {
+                    "lane": "sync",
+                    "session_token": session_token,
+                    "error": str(exc),
+                    "duration": time.monotonic() - started,
+                }
+            )
+
+    def _realtime_sync_worker(
+        self,
+        session_token,
+        client,
+        room_id,
+        presence,
+        chat_outgoing,
+        after_chat_sequence,
+        lock_changes,
+    ):
+        started = time.monotonic()
+        try:
+            chat_ids = []
+            lock_segment_ids = []
+            command_errors = []
             for message in chat_outgoing:
                 try:
                     client.send_chat(
@@ -3141,15 +3490,12 @@ class LiveCollaborationController:
                     command_errors.append(message_text)
             for segment_id, change in lock_changes.items():
                 try:
-                    if isinstance(change, dict):
-                        client.set_segment_lock(
-                            room_id,
-                            segment_id,
-                            bool(change.get("locked")),
-                            int(change.get("expires_minutes", 0)),
-                        )
-                    else:
-                        client.set_segment_lock(room_id, segment_id, bool(change))
+                    client.set_segment_lock(
+                        room_id,
+                        segment_id,
+                        bool(change.get("locked")) if isinstance(change, dict) else bool(change),
+                        int(change.get("expires_minutes", 0)) if isinstance(change, dict) else 0,
+                    )
                     lock_segment_ids.append(segment_id)
                 except Exception as exc:
                     message = str(exc)
@@ -3160,6 +3506,52 @@ class LiveCollaborationController:
                         raise
                     lock_segment_ids.append(segment_id)
                     command_errors.append(message)
+            users = client.presence(room_id, presence) if presence is not None else None
+            messages = client.chat_messages(room_id, after_chat_sequence)
+            locks = client.segment_locks(room_id)
+            self._worker_results.put(
+                {
+                    "lane": "realtime",
+                    "session_token": session_token,
+                    "chat_ids": chat_ids,
+                    "lock_segment_ids": lock_segment_ids,
+                    "command_errors": command_errors,
+                    "users": users,
+                    "messages": messages,
+                    "locks": locks,
+                    "duration": time.monotonic() - started,
+                }
+            )
+        except Exception as exc:
+            self._worker_results.put(
+                {
+                    "lane": "realtime",
+                    "session_token": session_token,
+                    "error": str(exc),
+                    "duration": time.monotonic() - started,
+                }
+            )
+
+    def _maintenance_sync_worker(
+        self,
+        session_token,
+        client,
+        room_id,
+        actions,
+        fetch_advanced,
+        health_check,
+        backup_check,
+        backup_interval_seconds,
+    ):
+        started = time.monotonic()
+        health_ok = False
+        try:
+            if health_check:
+                client.health_check(room_id)
+                health_ok = True
+            action_ids = []
+            action_results = []
+            command_errors = []
             for action in actions:
                 try:
                     kind = action.get("action")
@@ -3188,6 +3580,10 @@ class LiveCollaborationController:
                             client.list_project_backups(room_id)
                             if hasattr(client, "list_project_backups")
                             else []
+                        )
+                    elif kind == "backup_now":
+                        value = client.reserve_project_backup(
+                            room_id, 0, force=True
                         )
                     elif kind == "pin_backup":
                         value = client.set_backup_pinned(
@@ -3220,23 +3616,6 @@ class LiveCollaborationController:
                 except Exception as exc:
                     action_ids.append(action["id"])
                     command_errors.append(str(exc))
-            snapshot = None
-            if snapshot_operations:
-                snapshot = client.publish_room_snapshot(
-                    room_id, snapshot_operations, compact=True, label=snapshot_label
-                )
-            operations = client.operations(room_id, after_sequence)
-            users = client.presence(room_id, presence) if presence is not None else None
-            messages = (
-                client.chat_messages(room_id, after_chat_sequence)
-                if fetch_metadata or chat_outgoing
-                else None
-            )
-            locks = (
-                client.segment_locks(room_id)
-                if fetch_metadata or lock_changes
-                else None
-            )
             advanced = None
             if fetch_advanced:
                 advanced = {
@@ -3257,30 +3636,26 @@ class LiveCollaborationController:
             )
             self._worker_results.put(
                 {
+                    "lane": "maintenance",
                     "session_token": session_token,
-                    "outgoing_ids": outgoing_ids,
-                    "rejected_segments": rejected_segments,
-                    "chat_ids": chat_ids,
-                    "lock_segment_ids": lock_segment_ids,
                     "action_ids": action_ids,
                     "action_results": action_results,
-                    "conflicts_detected": conflicts_detected,
                     "command_errors": command_errors,
-                    "operations": operations,
-                    "users": users,
-                    "messages": messages,
-                    "locks": locks,
                     "advanced": advanced,
-                    "snapshot": snapshot,
                     "backup": backup,
+                    "health_checked": bool(health_check),
+                    "health_ok": health_ok,
                     "duration": time.monotonic() - started,
                 }
             )
         except Exception as exc:
             self._worker_results.put(
                 {
+                    "lane": "maintenance",
                     "session_token": session_token,
                     "error": str(exc),
+                    "health_checked": bool(health_check),
+                    "health_ok": health_ok,
                     "duration": time.monotonic() - started,
                 }
             )
@@ -3297,13 +3672,26 @@ class LiveCollaborationController:
             ):
                 continue
             if "error" in result:
+                if result.get("lane") == "maintenance" and (
+                    result.get("health_ok") or not result.get("health_checked")
+                ):
+                    import slicer
+
+                    slicer.util.showStatusMessage(
+                        f"Live collaboration maintenance warning: {result['error']}", 6000
+                    )
+                    continue
                 show_popup = not self._connection_error_popup_shown
                 self._connection_error_popup_shown = True
                 self._show_error(result["error"], popup=show_popup)
                 continue
             self.connection_healthy = True
             self._connection_error_popup_shown = False
-            self._last_sync_duration = float(result.get("duration", 0.0))
+            if self._connection_error_dialog is not None:
+                self._connection_error_dialog.close()
+                self._connection_error_dialog = None
+            if result.get("lane") in {"sync", "realtime", None}:
+                self._last_sync_duration = float(result.get("duration", 0.0))
             sent_ids = set(result.get("outgoing_ids") or [])
             if sent_ids:
                 retained = []
@@ -3331,12 +3719,15 @@ class LiveCollaborationController:
                     item for item in self.pending_actions if item["id"] not in completed_action_ids
                 ]
             self._apply_operations(result.get("operations") or [])
+            if result.get("operations"):
+                self._refresh_label_combo()
             if result.get("users") is not None:
                 self._update_presence(result["users"])
             if result.get("messages") is not None:
                 self._append_chat_messages(result["messages"])
             if result.get("locks") is not None:
                 self._update_segment_locks(result["locks"])
+                self._refresh_label_combo()
             if result.get("advanced") is not None:
                 self._update_advanced_state(result["advanced"])
             self._handle_action_results(result.get("action_results") or [])
@@ -3358,7 +3749,7 @@ class LiveCollaborationController:
                 slicer.util.warningDisplay(
                     f"Concurrent edits overlapped in {overlap} voxels. Review the conflict panel."
                 )
-                self._last_advanced_fetch = 0.0
+                self._force_advanced_refresh = True
             for segment_id in result.get("rejected_segments") or []:
                 if self.segmentation_node_id:
                     self.dirty_segments.add((self.segmentation_node_id, segment_id))
@@ -3373,7 +3764,7 @@ class LiveCollaborationController:
             backup_ok = True
             if result.get("backup"):
                 backup_ok = self._create_project_backup(result["backup"])
-            if self.connected and backup_ok:
+            if self.connected and backup_ok and result.get("lane") != "maintenance":
                 if self._last_sync_duration >= 2.5:
                     self.status_label.setText(
                         f"● Slow connection ({self._last_sync_duration:.1f} s) — "
@@ -3452,9 +3843,15 @@ class LiveCollaborationController:
                                 }
                             ]
                         )
-                self._last_advanced_fetch = 0.0
+                self._force_advanced_refresh = True
             elif action == "list_backups":
                 self._update_backup_tree(value or [])
+            elif action == "backup_now":
+                if value and self._create_project_backup(value):
+                    self.backup_status_label.setText(
+                        "Manual project backup completed successfully."
+                    )
+                    self._queue_action("list_backups")
             elif action == "pin_backup":
                 self._queue_action("list_backups")
             elif action == "verify_backup":
@@ -3484,7 +3881,7 @@ class LiveCollaborationController:
                 "review_state",
                 "set_role",
             }:
-                self._last_advanced_fetch = 0.0
+                self._force_advanced_refresh = True
 
     def _update_backup_tree(self, backups):
         import qt
@@ -3569,8 +3966,6 @@ class LiveCollaborationController:
     def _append_chat_messages(self, messages):
         for message in sorted(messages, key=lambda item: int(item.get("sequence", 0))):
             sequence = int(message.get("sequence", 0))
-            if sequence <= self.last_chat_sequence or sequence in self.displayed_chat_sequences:
-                continue
             stamp = str(message.get("created_at") or "")
             try:
                 clock = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
@@ -3580,14 +3975,25 @@ class LiveCollaborationController:
             author = str(message.get("author") or "Unknown")
             text = str(message.get("text") or "")
             anchor = message.get("anchor")
+            client_message_id = str(message.get("client_message_id") or "")
+            message_key = (
+                f"{author}\0{client_message_id}"
+                if client_message_id
+                else f"sequence\0{sequence}"
+            )
+            already_displayed = message_key in self.displayed_chat_ids
             marker = " 📍" if isinstance(anchor, dict) and anchor else ""
-            self.chat_history.appendPlainText(f"[{clock_text}] {author}: {text}{marker}")
+            if not already_displayed:
+                self.chat_history.appendPlainText(f"[{clock_text}] {author}: {text}{marker}")
             if isinstance(anchor, dict) and anchor:
                 self.chat_anchors[sequence] = anchor
-                self.chat_location_combo.addItem(
-                    f"[{clock_text}] {author}: {text[:60]}", sequence
-                )
-                self.jump_to_chat_button.enabled = True
+                if sequence not in self.displayed_chat_sequences:
+                    self.chat_location_combo.addItem(
+                        f"[{clock_text}] {author}: {text[:60]}", sequence
+                    )
+                    self.jump_to_chat_button.enabled = True
+            self.optimistic_chat_ids.discard(client_message_id)
+            self.displayed_chat_ids.add(message_key)
             self.displayed_chat_sequences.add(sequence)
             self.last_chat_sequence = max(self.last_chat_sequence, sequence)
         scroll_bar = self.chat_history.verticalScrollBar()
@@ -3608,6 +4014,7 @@ class LiveCollaborationController:
                 "owner": owner,
                 "locked": bool(state.get("locked", False)),
                 "updated_at": state.get("updated_at"),
+                "expires_at": state.get("expires_at"),
             }
             self._set_segment_collaboration_tags(segment_id)
         self.segment_locks_state = states
@@ -3618,7 +4025,8 @@ class LiveCollaborationController:
     def _update_lock_controls(self):
         if not self.connected:
             return
-        _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        self._refresh_label_combo()
+        segment_id = self._selected_segment_id()
         if not segment_id:
             self.lock_status_label.setText("Select a label to manage its lock")
             self.lock_button.enabled = False

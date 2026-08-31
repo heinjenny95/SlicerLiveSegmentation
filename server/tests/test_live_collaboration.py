@@ -388,6 +388,58 @@ def test_shared_folder_label_owner_can_lock_and_peer_edits_are_rejected(tmp_path
     )["sequence"] == 2
 
 
+def test_realtime_files_do_not_wait_for_segmentation_sequence_lock(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice", lock_timeout_seconds=0.2)
+    bob = SharedFolderRoomClient(tmp_path, "bob", lock_timeout_seconds=0.2)
+    room = alice.join("independent realtime lanes", "a" * 64)
+    bob.join("independent realtime lanes", "a" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    first = empty.copy()
+    first[0, 0, 0] = 1
+    alice.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, first, operation_id="owner-realtime-1"),
+    )
+
+    started = time.monotonic()
+    with alice._sequence_lock(alice._room_path):
+        bob.send_chat(room["id"], "Still live", "chat-with-busy-edit-lock")
+        bob.presence(room["id"], {"active_segment_name": "Organ"})
+        alice.set_segment_lock(room["id"], "Organ", True)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert bob.chat_messages(room["id"], 0)[0]["text"] == "Still live"
+    assert alice.segment_locks(room["id"])[0]["locked"] is True
+
+
+def test_segment_owner_index_avoids_repeated_operation_history_scans(tmp_path, monkeypatch):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("indexed label owners", "b" * 64)
+    bob.join("indexed label owners", "b" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    first = empty.copy()
+    first[0, 0, 0] = 1
+    alice.push_operation(
+        room["id"],
+        operation_payload("Vessel", empty, first, operation_id="owner-index-1"),
+    )
+    assert bob.segment_locks(room["id"])[0]["owner"] == "alice"
+
+    original_read = collaboration_module._read_json_file
+
+    def reject_operation_history_reads(path):
+        if Path(path).parent.name == "operations":
+            raise AssertionError("lock polling rescanned the complete operation history")
+        return original_read(path)
+
+    monkeypatch.setattr(
+        collaboration_module, "_read_json_file", reject_operation_history_reads
+    )
+    assert bob.segment_locks(room["id"])[0]["owner"] == "alice"
+
+
 def test_shared_folder_health_leave_and_backup_reservation(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "alice")
     bob = SharedFolderRoomClient(tmp_path, "bob")
@@ -400,6 +452,7 @@ def test_shared_folder_health_leave_and_backup_reservation(tmp_path):
     reservation = alice.reserve_project_backup(room["id"], 300)
     assert reservation["path"].endswith(".mrb")
     assert bob.reserve_project_backup(room["id"], 300) is None
+    assert bob.reserve_project_backup(room["id"], 300, force=True)["path"].endswith(".mrb")
 
     metadata_path = bob._room_path / "room.json"
     unavailable_path = bob._room_path / "room.unavailable"

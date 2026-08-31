@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.8.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.9.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.8.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.9.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -65,17 +65,20 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Connection monitoring:** every active room is checked continuously. A failed
   server or network-folder access immediately changes the status from green to
   red and shows a clear error. Round trips of 2.5 seconds or more are marked as
-  a slow connection. **Refresh now** performs an immediate health, participant,
-  edit, chat, and lock refresh without leaving the room.
+  a slow connection. **Sync now** immediately requests participants, edits,
+  chat, locks, and a health check without rescanning history or backups.
 - **Permanent room chat:** messages are stored in the room and reappear after
   leaving, restarting Slicer, or joining from another computer. Messages can
   carry a Slicer crosshair/slice location and jump collaborators directly there.
+  The sender sees a message immediately while it is persisted independently in
+  the background.
 - **Live spatial presence:** online users publish active label, editor effect,
   crosshair and slice offsets. Users can jump to a collaborator or follow that
   person's view. Remote voxel changes receive a short-lived colored outline.
 - **Label ownership and locks:** the user whose first synchronized operation
   creates a label owns it. Locks may expire, access can be requested, ownership
-  can be transferred, and room administrators can resolve abandoned locks.
+  can be transferred, and room administrators can resolve abandoned locks. An
+  explicit **Label to manage** selector controls which label these actions affect.
   Other users' edits to a locked label are reverted locally and rejected at the
   transport boundary.
 - **Roles and review:** rooms support viewer, editor, reviewer, and administrator
@@ -94,7 +97,8 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Automatic project backups:** in shared-folder mode, a complete `.mrb` Slicer
   project bundle is saved at the selected interval (five minutes by default).
   Backups have SHA-256 sidecars, a configurable retention limit, pinning,
-  verification, and restore controls.
+  verification, restore controls, and an immediate **Back up now** action. The
+  settings remain editable while the room is active.
 - **Diagnostics:** the module reports transport latency, read/write health, free
   space, operation/snapshot/archive counts, pending changes, and backup count.
   A sanitized diagnostic JSON report intentionally omits users, room names,

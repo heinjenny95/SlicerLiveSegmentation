@@ -195,8 +195,19 @@ def run_probe():
 
         collaboration_extras = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_EXTRAS", "0") == "1":
+            if str(controller._combo_current_data(controller.label_combo)) != segment_id:
+                raise RuntimeError("Explicit label-management selector was not populated")
+            if not controller.backup_enabled_checkbox.enabled:
+                raise RuntimeError("Backup settings are disabled while the shared room is active")
+            controller.backup_enabled_checkbox.checked = True
+            if not controller.backup_interval_spin.enabled:
+                raise RuntimeError("Backup interval did not become editable")
+            controller.backup_enabled_checkbox.checked = False
+
             controller.chat_input.setText("Persistent controller chat test")
             controller.send_chat_message()
+            if "Persistent controller chat test" not in controller.chat_history.toPlainText():
+                raise RuntimeError("Own chat message was not displayed optimistically")
             deadline = time.time() + 8
             chat_text = ""
             while time.time() < deadline:
@@ -229,13 +240,23 @@ def run_probe():
             deadline = time.time() + 8
             while time.time() < deadline:
                 pump_events(0.15)
-                if controller.connection_healthy and "Refreshing" not in controller.status_label.text:
+                workers = (
+                    controller._worker,
+                    controller._realtime_worker,
+                    controller._maintenance_worker,
+                )
+                if controller.connection_healthy and not any(
+                    worker is not None and worker.is_alive() for worker in workers
+                ):
                     break
             if not controller.connection_healthy:
                 raise RuntimeError("Manual refresh did not verify the room connection")
             collaboration_extras = {
                 "chat_visible": True,
+                "chat_optimistic": True,
                 "lock_round_trip": True,
+                "explicit_label_selector": True,
+                "backup_settings_editable": True,
                 "manual_refresh": True,
             }
 
@@ -388,14 +409,24 @@ def run_probe():
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_CONNECTION", "0") == "1":
             if not hasattr(controller.client, "_room_path"):
                 raise RuntimeError("Connection interruption test requires shared-folder mode")
+            controller.timer.stop()
             deadline = time.time() + 5
-            while controller._worker is not None and controller._worker.is_alive():
+            while any(
+                worker is not None and worker.is_alive()
+                for worker in (
+                    controller._worker,
+                    controller._realtime_worker,
+                    controller._maintenance_worker,
+                )
+            ):
                 if time.time() >= deadline:
                     raise RuntimeError("Synchronization worker did not become idle")
                 pump_events(0.1)
+            controller._drain_worker_results()
             room_path = Path(controller.client._room_path)
             unavailable_path = room_path.with_name(room_path.name + ".offline-test")
             os.replace(room_path, unavailable_path)
+            controller.timer.start()
             try:
                 controller.refresh_now()
                 deadline = time.time() + 8
@@ -406,7 +437,21 @@ def run_probe():
                 if controller.connection_healthy or "Connection problem" not in controller.status_label.text:
                     raise RuntimeError("Interrupted share was still shown as online")
             finally:
+                controller.timer.stop()
+                deadline = time.time() + 5
+                while any(
+                    worker is not None and worker.is_alive()
+                    for worker in (
+                        controller._worker,
+                        controller._realtime_worker,
+                        controller._maintenance_worker,
+                    )
+                ):
+                    if time.time() >= deadline:
+                        raise RuntimeError("Offline workers did not become idle")
+                    pump_events(0.1)
                 os.replace(unavailable_path, room_path)
+                controller.timer.start()
             controller.refresh_now()
             deadline = time.time() + 8
             while time.time() < deadline:
