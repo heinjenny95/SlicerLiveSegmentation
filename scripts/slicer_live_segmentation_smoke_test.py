@@ -6,6 +6,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -58,7 +59,12 @@ def run_probe():
         volume = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLScalarVolumeNode", "Live Segmentation smoke volume"
         )
-        image = np.arange(12 * 11 * 10, dtype=np.int16).reshape((12, 11, 10))
+        shape_text = os.environ.get("LIVE_SEGMENTATION_SMOKE_VOLUME_SHAPE", "12,11,10")
+        image_shape = tuple(int(value) for value in shape_text.split(","))
+        if len(image_shape) != 3 or min(image_shape) < 10:
+            raise RuntimeError("LIVE_SEGMENTATION_SMOKE_VOLUME_SHAPE must contain three sizes >= 10")
+        image = np.zeros(image_shape, dtype=np.int16)
+        image[-1, -1, -1] = 1
         slicer.util.updateVolumeFromArray(volume, image)
 
         module = slicer.app.moduleManager().module("LiveSegmentation")
@@ -117,6 +123,8 @@ def run_probe():
             raise RuntimeError("Standard Segment Editor did not receive the room node")
 
         operations = []
+        edit_latency_seconds = None
+        receive_latency_seconds = None
         if mode == "produce":
             wait_for_return_edit = (
                 os.environ.get("LIVE_SEGMENTATION_SMOKE_WAIT_FOR_RETURN_EDIT", "0")
@@ -129,9 +137,21 @@ def run_probe():
                 pump_events(edit_delay)
             mask = np.zeros(image.shape, dtype=np.uint8)
             mask[2:5, 3:6, 4:7] = 1
-            widget.update_segment_binary_labelmap_from_array(
-                mask, segmentation, segment_id, volume
-            )
+            edit_started = time.monotonic()
+            if os.environ.get("LIVE_SEGMENTATION_SMOKE_INCREMENTAL_LOCAL_EDIT", "0") == "1":
+                if not widget.update_segment_binary_labelmap_crop(
+                    np.zeros((3, 3, 3), dtype=np.uint8),
+                    np.ones((3, 3, 3), dtype=np.uint8),
+                    [2, 5, 3, 6, 4, 7],
+                    segmentation,
+                    segment_id,
+                    volume,
+                ):
+                    raise RuntimeError("Incremental local test edit failed")
+            else:
+                widget.update_segment_binary_labelmap_from_array(
+                    mask, segmentation, segment_id, volume
+                )
 
             deadline = time.time() + 8
             while time.time() < deadline:
@@ -144,6 +164,7 @@ def run_probe():
                     if item["segment_id"] == segment_id:
                         shared_mask = apply_mask_delta(shared_mask, item)
                 if int(shared_mask.sum()) == 27:
+                    edit_latency_seconds = time.monotonic() - edit_started
                     break
             if not operations or int(shared_mask.sum()) != 27:
                 raise RuntimeError("Shared room did not receive the 27-voxel edit")
@@ -171,26 +192,59 @@ def run_probe():
             while time.time() < deadline:
                 pump_events(0.15)
                 operations = controller.client.operations(controller.room_id, 0)
+                if (
+                    os.environ.get("LIVE_SEGMENTATION_SMOKE_DIRECT_APPLY", "0") == "1"
+                    and controller.last_sequence == 0
+                    and operations
+                ):
+                    controller._apply_operations(operations)
                 segment = segmentation.GetSegmentation().GetSegment(segment_id)
                 if segment is not None:
-                    received = widget.segment_mask_in_reference_geometry(
-                        segmentation, segment_id, volume, image.shape
+                    received_crop = widget.segment_mask_region_in_reference_geometry(
+                        segmentation, segment_id, volume, [2, 8, 3, 8, 4, 9]
                     )
-                    voxel_count = int(np.asarray(received, dtype=np.uint8).sum())
+                    if received_crop is None:
+                        received = widget.segment_mask_in_reference_geometry(
+                            segmentation, segment_id, volume, image.shape
+                        )
+                        voxel_count = int(np.asarray(received, dtype=np.uint8).sum())
+                    else:
+                        received = None
+                        voxel_count = int(np.asarray(received_crop, dtype=np.uint8).sum())
                 if controller.initial_sync_complete and voxel_count == 27:
+                    try:
+                        created = datetime.fromisoformat(
+                            str(operations[-1]["created_at"]).replace("Z", "+00:00")
+                        ).timestamp()
+                        receive_latency_seconds = max(0.0, time.time() - created)
+                    except Exception:
+                        receive_latency_seconds = None
                     break
             if not operations:
                 raise RuntimeError("No remote live operation was received")
             if voxel_count != 27:
                 raise RuntimeError(
-                    f"Expected 27 synchronized voxels, received {voxel_count}"
+                    f"Expected 27 synchronized voxels, received {voxel_count}; "
+                    f"controller error={controller._last_error!r}; "
+                    f"sequence={controller.last_sequence}"
                 )
             if return_edit:
-                returned = np.asarray(received, dtype=np.uint8).copy()
-                returned[6:8, 6:8, 6:8] = 1
-                widget.update_segment_binary_labelmap_from_array(
-                    returned, segmentation, segment_id, volume
-                )
+                if received is None:
+                    if not widget.update_segment_binary_labelmap_crop(
+                        np.zeros((2, 2, 2), dtype=np.uint8),
+                        np.ones((2, 2, 2), dtype=np.uint8),
+                        [6, 8, 6, 8, 6, 8],
+                        segmentation,
+                        segment_id,
+                        volume,
+                    ):
+                        raise RuntimeError("Incremental return edit failed")
+                else:
+                    returned = np.asarray(received, dtype=np.uint8).copy()
+                    returned[6:8, 6:8, 6:8] = 1
+                    widget.update_segment_binary_labelmap_from_array(
+                        returned, segmentation, segment_id, volume
+                    )
                 deadline = time.time() + 8
                 while time.time() < deadline:
                     pump_events(0.15)
@@ -559,6 +613,43 @@ def run_probe():
                 "editor_cleared": editor.segmentationNode() is None,
             }
 
+        patch_probe_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", "Incremental patch probe"
+        )
+        patch_probe_node.SetReferenceImageGeometryParameterFromVolumeNode(volume)
+        patch_probe_node.GetSegmentation().AddEmptySegment("PatchProbe", "Patch probe")
+        patch_bounds = [1, 5, 1, 5, 1, 5]
+        patch_ones = np.ones((4, 4, 4), dtype=np.uint8)
+        if not widget.update_segment_binary_labelmap_crop(
+            np.zeros_like(patch_ones),
+            patch_ones,
+            patch_bounds,
+            patch_probe_node,
+            "PatchProbe",
+            volume,
+        ):
+            raise RuntimeError("Incremental addition probe failed")
+        patch_target = patch_ones.copy()
+        patch_target[1:3, 1:3, 1:3] = 0
+        if not widget.update_segment_binary_labelmap_crop(
+            patch_ones,
+            patch_target,
+            patch_bounds,
+            patch_probe_node,
+            "PatchProbe",
+            volume,
+        ):
+            raise RuntimeError("Incremental removal probe failed")
+        patch_result = widget.segment_mask_region_in_reference_geometry(
+            patch_probe_node, "PatchProbe", volume, patch_bounds
+        )
+        patch_voxels = int(np.asarray(patch_result, dtype=np.uint8).sum())
+        slicer.mrmlScene.RemoveNode(patch_probe_node)
+        if patch_voxels != 56:
+            raise RuntimeError(
+                f"Incremental removal kept {patch_voxels} voxels instead of 56"
+            )
+
         return {
             "ok": True,
             "module_path": slicer.util.modulePath("LiveSegmentation"),
@@ -574,6 +665,9 @@ def run_probe():
             "mode": mode,
             "transport": transport,
             "voxel_count": voxel_count,
+            "edit_latency_seconds": edit_latency_seconds,
+            "receive_latency_seconds": receive_latency_seconds,
+            "incremental_patch_probe_voxels": patch_voxels,
             "lifecycle": lifecycle,
             "backup": backup,
             "collaboration_extras": collaboration_extras,

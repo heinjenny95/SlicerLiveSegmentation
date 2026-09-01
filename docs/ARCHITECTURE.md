@@ -106,7 +106,10 @@ project bundles under the room's `backups` directory. Bundles are staged locally
 and atomically published; prior versions are never overwritten.
 
 Segmentation checkpoints are appended as contiguous groups of normal `snapshot`
-operations. This keeps them readable by operation-only clients. Once a complete
+operations. Snapshot payloads contain only each segment's effective non-zero
+extent (or a zero-changed-voxel one-voxel marker for an empty label), while still
+reconstructing a complete segment state. This keeps them readable by
+operation-only clients without transferring a source-volume-sized zero field. Once a complete
 group exists, older loose operation JSON files move into a ZIP archive. Timeline
 and restoration read active and archived records, while new joins replay only a
 recent full snapshot group and newer patches.

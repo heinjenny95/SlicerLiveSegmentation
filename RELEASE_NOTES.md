@@ -1,4 +1,39 @@
-# Live Segmentation 0.10.0
+# Live Segmentation 0.10.1
+
+Version 0.10.1 replaces full-volume synchronization with incremental Slicer
+labelmap updates. It directly addresses the 40-second delay observed with large
+biological image volumes.
+
+## True region-based live edits
+
+- Local changes are read from each segment's effective internal labelmap extent;
+  the plugin no longer exports a temporary reference-sized label volume for every
+  Segment Editor event.
+- First edits, empty-label announcements, and checkpoints use compact cropped
+  snapshots instead of marking every source-volume voxel as changed.
+- Incoming patches mutate only their changed voxel bounding box through Slicer's
+  native binary-labelmap merge operations. The complete 3D labelmap is no longer
+  re-imported for a small brush stroke.
+- Incoming changes update the ordered baseline in place and preserve concurrent
+  local work only inside the affected crop, avoiding several full-volume copies.
+- Remote-change highlights are also cropped, eliminating a second hidden
+  full-volume import for every edit.
+- Reverting an unauthorized edit to a locked label now updates only the label's
+  affected extent instead of re-importing the complete mask.
+- Linear parent transforms are handled in segmentation coordinates; uncommon
+  non-linear geometries retain the general resampling fallback for correctness.
+
+## Measured verification
+
+- 30 automated transport/server tests pass, including cropped delta, compact
+  non-empty snapshot, and zero-voxel empty-label snapshot regressions.
+- Two actual Slicer 5.12.3 processes synchronized a 27-voxel edit on a
+  512×512×512 reference volume in about 0.55 seconds end-to-end on the test host.
+- Bidirectional two-process convergence, Ruff, and Python compilation pass.
+
+---
+
+# Previous release: Live Segmentation 0.10.0
 
 Version 0.10.0 removes the remaining shared-folder polling barriers and keeps
 communication visible while users work in Segment Editor.

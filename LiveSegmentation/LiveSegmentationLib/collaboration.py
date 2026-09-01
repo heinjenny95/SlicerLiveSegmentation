@@ -240,13 +240,22 @@ def encode_mask_delta(previous, current, replace=False):
     if current.ndim != 3:
         raise ValueError("A live mask must be three-dimensional")
     if replace:
-        changed = np.ones(current.shape, dtype=bool)
+        # A snapshot starts from an all-zero mask when decoded, therefore zero
+        # voxels do not have to be transmitted. Older releases marked the whole
+        # reference volume as changed, turning tiny insect labels into enormous
+        # payloads and full-volume imports.
+        changed = current != 0
     else:
         previous = np.asarray(previous, dtype=np.uint8)
         if previous.shape != current.shape:
             raise ValueError("Previous and current masks must have identical shapes")
         changed = previous != current
     bounds = _delta_bounds(changed)
+    if bounds is None and replace:
+        # A zero-changed-voxel snapshot still has a tiny valid payload. Snapshot
+        # semantics clear the previous mask before decoding, while the empty
+        # changed bitset avoids fake voxel counts and conflict overlaps.
+        bounds = [0, 1, 0, 1, 0, 1]
     if bounds is None:
         return None
     z0, z1, y0, y1, x0, x1 = bounds
@@ -262,6 +271,103 @@ def encode_mask_delta(previous, current, replace=False):
         "encoding": LIVE_ENCODING,
         "payload": base64.b64encode(zlib.compress(raw, level=6)).decode("ascii"),
     }
+
+
+def _bounds_union(first, second):
+    if first is None:
+        return list(second) if second is not None else None
+    if second is None:
+        return list(first)
+    return [
+        min(int(first[0]), int(second[0])),
+        max(int(first[1]), int(second[1])),
+        min(int(first[2]), int(second[2])),
+        max(int(first[3]), int(second[3])),
+        min(int(first[4]), int(second[4])),
+        max(int(first[5]), int(second[5])),
+    ]
+
+
+def encode_mask_crop_delta(
+    previous,
+    current_crop,
+    current_bounds,
+    previous_bounds,
+    volume_shape,
+):
+    """Encode a complete cropped segment against a reference-sized baseline.
+
+    ``current_bounds`` encloses every non-zero voxel of the current segment.
+    Comparing only its union with the previous effective bounds avoids scanning
+    or exporting the complete reference volume for each brush stroke.
+    """
+    previous = np.asarray(previous, dtype=np.uint8)
+    volume_shape = tuple(int(value) for value in volume_shape)
+    if previous.shape != volume_shape:
+        raise ValueError("Baseline and live volume geometry do not match")
+    comparison_bounds = _bounds_union(current_bounds, previous_bounds)
+    if comparison_bounds is None:
+        return None
+    z0, z1, y0, y1, x0, x1 = comparison_bounds
+    if (
+        z0 < 0
+        or y0 < 0
+        or x0 < 0
+        or z1 > volume_shape[0]
+        or y1 > volume_shape[1]
+        or x1 > volume_shape[2]
+    ):
+        raise ValueError("Segment crop exceeds the live volume geometry")
+    current_region = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
+    if current_crop is not None and current_bounds is not None:
+        cz0, cz1, cy0, cy1, cx0, cx1 = [int(value) for value in current_bounds]
+        current_region[
+            cz0 - z0 : cz1 - z0,
+            cy0 - y0 : cy1 - y0,
+            cx0 - x0 : cx1 - x0,
+        ] = np.asarray(current_crop, dtype=np.uint8)
+    previous_region = previous[z0:z1, y0:y1, x0:x1]
+    encoded = encode_mask_delta(previous_region, current_region, replace=False)
+    if encoded is None:
+        return None
+    ez0, ez1, ey0, ey1, ex0, ex1 = encoded["voxel_bbox"]
+    encoded["voxel_bbox"] = [
+        z0 + ez0,
+        z0 + ez1,
+        y0 + ey0,
+        y0 + ey1,
+        x0 + ex0,
+        x0 + ex1,
+    ]
+    encoded["volume_shape"] = [int(value) for value in volume_shape]
+    return encoded
+
+
+def encode_mask_crop_snapshot(current_crop, current_bounds, volume_shape):
+    """Encode a full segment state from its effective crop, including empty labels."""
+    volume_shape = tuple(int(value) for value in volume_shape)
+    if current_crop is None or current_bounds is None:
+        crop = np.zeros((1, 1, 1), dtype=np.uint8)
+        origin = (0, 0, 0)
+    else:
+        crop = np.asarray(current_crop, dtype=np.uint8)
+        origin = (
+            int(current_bounds[0]),
+            int(current_bounds[2]),
+            int(current_bounds[4]),
+        )
+    encoded = encode_mask_delta(np.zeros_like(crop), crop, replace=True)
+    ez0, ez1, ey0, ey1, ex0, ex1 = encoded["voxel_bbox"]
+    encoded["voxel_bbox"] = [
+        origin[0] + ez0,
+        origin[0] + ez1,
+        origin[1] + ey0,
+        origin[1] + ey1,
+        origin[2] + ex0,
+        origin[2] + ex1,
+    ]
+    encoded["volume_shape"] = [int(value) for value in volume_shape]
+    return encoded
 
 
 def decode_mask_delta(operation):
@@ -2007,6 +2113,7 @@ class LiveCollaborationController:
         self.segmentation_node_id = None
         self.volume_shape = None
         self.baselines = {}
+        self.baseline_bounds = {}
         self.dirty_segments = set()
         self.force_snapshots = set()
         self.outgoing = []
@@ -3185,6 +3292,7 @@ class LiveCollaborationController:
             self.initial_sequence = int(room.get("latest_sequence", 0))
             self.initial_sync_complete = self.initial_sequence == 0
             self.baselines.clear()
+            self.baseline_bounds.clear()
             self.dirty_segments.clear()
             self.force_snapshots.clear()
             self.outgoing.clear()
@@ -3357,6 +3465,7 @@ class LiveCollaborationController:
         self.initial_sequence = 0
         self.initial_sync_complete = False
         self.baselines.clear()
+        self.baseline_bounds.clear()
         self.dirty_segments.clear()
         self.force_snapshots.clear()
         self.outgoing.clear()
@@ -3529,20 +3638,77 @@ class LiveCollaborationController:
             return
         for segment_id in node.GetSegmentation().GetSegmentIDs():
             key = (node.GetID(), segment_id)
-            mask = self._read_mask(node, segment_id)
+            crop, bounds = self._read_mask_crop(node, segment_id)
+            mask = self._mask_from_crop(crop, bounds)
             if seed:
                 self.baselines[key] = np.zeros_like(mask)
+                self.baseline_bounds[key] = None
                 self.force_snapshots.add(key)
                 self.dirty_segments.add(key)
             else:
                 self.baselines[key] = mask.copy()
+                self.baseline_bounds[key] = list(bounds) if bounds is not None else None
 
-    def _read_mask(self, node, segment_id):
+    def _read_mask_crop(self, node, segment_id):
         volume_node = self.owner.get_volume_node()
+        crop_reader = getattr(
+            self.owner, "segment_mask_crop_in_reference_geometry", None
+        )
+        if callable(crop_reader):
+            fast = crop_reader(node, segment_id, volume_node)
+            if fast is not None:
+                crop, bounds = fast
+                return (
+                    None if crop is None else np.asarray(crop, dtype=np.uint8),
+                    None if bounds is None else [int(value) for value in bounds],
+                )
         mask = self.owner.segment_mask_in_reference_geometry(
             node, segment_id, volume_node, self.volume_shape
         )
-        return np.asarray(mask, dtype=np.uint8)
+        mask = np.asarray(mask, dtype=np.uint8)
+        bounds = _delta_bounds(mask != 0)
+        if bounds is None:
+            return None, None
+        z0, z1, y0, y1, x0, x1 = bounds
+        return np.ascontiguousarray(mask[z0:z1, y0:y1, x0:x1]), bounds
+
+    def _mask_from_crop(self, crop, bounds):
+        mask = np.zeros(tuple(self.volume_shape), dtype=np.uint8)
+        if crop is not None and bounds is not None:
+            z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+            mask[z0:z1, y0:y1, x0:x1] = np.asarray(crop, dtype=np.uint8)
+        return mask
+
+    def _read_mask(self, node, segment_id):
+        crop, bounds = self._read_mask_crop(node, segment_id)
+        return self._mask_from_crop(crop, bounds)
+
+    def _read_mask_region(self, node, segment_id, bounds):
+        volume_node = self.owner.get_volume_node()
+        region_reader = getattr(
+            self.owner, "segment_mask_region_in_reference_geometry", None
+        )
+        if callable(region_reader):
+            region = region_reader(node, segment_id, volume_node, bounds)
+            if region is not None:
+                return np.asarray(region, dtype=np.uint8)
+        mask = self._read_mask(node, segment_id)
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+        return np.ascontiguousarray(mask[z0:z1, y0:y1, x0:x1])
+
+    @staticmethod
+    def _crop_region(crop, crop_bounds, region_bounds):
+        rz0, rz1, ry0, ry1, rx0, rx1 = [int(value) for value in region_bounds]
+        result = np.zeros((rz1 - rz0, ry1 - ry0, rx1 - rx0), dtype=np.uint8)
+        if crop is None or crop_bounds is None:
+            return result
+        cz0, cz1, cy0, cy1, cx0, cx1 = [int(value) for value in crop_bounds]
+        result[
+            cz0 - rz0 : cz1 - rz0,
+            cy0 - ry0 : cy1 - ry0,
+            cx0 - rx0 : cx1 - rx0,
+        ] = np.asarray(crop, dtype=np.uint8)
+        return result
 
     @staticmethod
     def _segment_color_hex(segment):
@@ -3589,9 +3755,36 @@ class LiveCollaborationController:
             return
         self._applying_remote = True
         try:
-            self.owner.update_segment_binary_labelmap_from_array(
-                baseline, node, segment_id, self.owner.get_volume_node()
+            current_crop, current_bounds = self._read_mask_crop(node, segment_id)
+            restore_bounds = _bounds_union(
+                current_bounds,
+                self.baseline_bounds.get((node.GetID(), segment_id)),
             )
+            restored_incrementally = restore_bounds is None
+            if restore_bounds is not None:
+                z0, z1, y0, y1, x0, x1 = restore_bounds
+                current_region = self._crop_region(
+                    current_crop, current_bounds, restore_bounds
+                )
+                target_region = baseline[z0:z1, y0:y1, x0:x1]
+                crop_updater = getattr(
+                    self.owner, "update_segment_binary_labelmap_crop", None
+                )
+                restored_incrementally = bool(
+                    callable(crop_updater)
+                    and crop_updater(
+                        current_region,
+                        target_region,
+                        restore_bounds,
+                        node,
+                        segment_id,
+                        self.owner.get_volume_node(),
+                    )
+                )
+            if not restored_incrementally:
+                self.owner.update_segment_binary_labelmap_from_array(
+                    baseline, node, segment_id, self.owner.get_volume_node()
+                )
             self.owner.refresh_segmentation_display(node, segment_id)
         finally:
             self._applying_remote = False
@@ -3612,24 +3805,39 @@ class LiveCollaborationController:
             if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
                 self.dirty_segments.discard(key)
                 continue
-            current = self._read_mask(node, key[1])
             previous = self.baselines.get(key)
+            current_crop, current_bounds = self._read_mask_crop(node, key[1])
             if self._current_role() == "viewer":
+                current = self._mask_from_crop(current_crop, current_bounds)
                 if previous is not None and np.any(current != previous):
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
                 continue
             if self._locked_by_other(key[1]):
+                current = self._mask_from_crop(current_crop, current_bounds)
                 if previous is not None and np.any(current != previous):
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
                 continue
-            replace = key in self.force_snapshots or previous is None
             if previous is None:
-                previous = np.zeros_like(current)
-            encoded = encode_mask_delta(previous, current, replace=replace)
+                previous = np.zeros(tuple(self.volume_shape), dtype=np.uint8)
+            # A new room/label is announced as a snapshot, but that snapshot is
+            # encoded from the segment's effective crop (one voxel when empty),
+            # never from the complete microscopy volume.
+            if key in self.force_snapshots:
+                encoded = encode_mask_crop_snapshot(
+                    current_crop, current_bounds, self.volume_shape
+                )
+            else:
+                encoded = encode_mask_crop_delta(
+                    previous,
+                    current_crop,
+                    current_bounds,
+                    self.baseline_bounds.get(key),
+                    self.volume_shape,
+                )
             if encoded is None:
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
@@ -3670,10 +3878,16 @@ class LiveCollaborationController:
         result = []
         for segment_id in node.GetSegmentation().GetSegmentIDs():
             segment = node.GetSegmentation().GetSegment(segment_id)
-            mask = self.baselines.get((node.GetID(), segment_id))
+            key = (node.GetID(), segment_id)
+            mask = self.baselines.get(key)
             if mask is None:
                 mask = self._read_mask(node, segment_id)
-            encoded = encode_mask_delta(np.zeros_like(mask), mask, replace=True)
+            bounds = self.baseline_bounds.get(key)
+            crop = None
+            if bounds is not None:
+                z0, z1, y0, y1, x0, x1 = bounds
+                crop = np.ascontiguousarray(mask[z0:z1, y0:y1, x0:x1])
+            encoded = encode_mask_crop_snapshot(crop, bounds, self.volume_shape)
             if encoded is not None:
                 result.append(
                     {
@@ -5038,52 +5252,129 @@ class LiveCollaborationController:
                 key = (node.GetID(), segment_id)
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
-                current = self._read_mask(node, segment_id)
-                server_before = self.baselines.get(key)
-                if server_before is None:
-                    server_before = np.zeros(self.volume_shape, dtype=np.uint8)
+                operation_bounds = [
+                    int(value) for value in operation["voxel_bbox"]
+                ]
+                changed, values = decode_mask_delta(operation)
+                baseline = self.baselines.get(key)
+                if baseline is None:
+                    baseline = np.zeros(tuple(self.volume_shape), dtype=np.uint8)
+                    self.baselines[key] = baseline
 
-                # Local edits can continue while an earlier operation is in flight.
-                # Keep that local overlay on top of the newly ordered server state;
-                # it will be sent as the next operation and therefore wins later.
-                local_overlay = None
-                if self.initial_sync_complete:
-                    local_overlay = encode_mask_delta(server_before, current)
-                server_after = apply_mask_delta(server_before, operation)
-                remote_highlight = None
-                if operation.get("author") != self.user_name:
-                    try:
-                        changed, _ = decode_mask_delta(operation)
-                        z0, z1, y0, y1, x0, x1 = [
-                            int(value) for value in operation["voxel_bbox"]
-                        ]
-                        remote_highlight = np.zeros(self.volume_shape, dtype=np.uint8)
-                        remote_highlight[z0:z1, y0:y1, x0:x1] = changed.astype(np.uint8)
-                    except Exception:
-                        remote_highlight = None
-                visible_after = (
-                    apply_mask_delta(server_after, local_overlay)
-                    if local_overlay is not None
-                    else server_after
+                # Ordinary edits only touch the operation crop. Checkpoints may
+                # clear old content, so their affected region also covers the
+                # previous baseline and the locally visible segment. This keeps
+                # the hot path independent of the complete source-volume size.
+                current_crop = None
+                current_bounds = None
+                if operation.get("operation_kind") == "snapshot":
+                    current_crop, current_bounds = self._read_mask_crop(
+                        node, segment_id
+                    )
+                    affected_bounds = _bounds_union(
+                        self.baseline_bounds.get(key), current_bounds
+                    )
+                    affected_bounds = _bounds_union(
+                        affected_bounds, operation_bounds
+                    )
+                    current_region = self._crop_region(
+                        current_crop, current_bounds, affected_bounds
+                    )
+                else:
+                    affected_bounds = operation_bounds
+                    current_region = self._read_mask_region(
+                        node, segment_id, affected_bounds
+                    )
+
+                az0, az1, ay0, ay1, ax0, ax1 = affected_bounds
+                server_before_region = baseline[
+                    az0:az1, ay0:ay1, ax0:ax1
+                ].copy()
+                local_changes = (
+                    current_region != server_before_region
+                    if self.initial_sync_complete
+                    else np.zeros(current_region.shape, dtype=bool)
                 )
-                self.owner.update_segment_binary_labelmap_from_array(
-                    visible_after, node, segment_id, self.owner.get_volume_node()
-                )
+
+                if operation.get("operation_kind") == "snapshot":
+                    baseline.fill(0)
+                oz0, oz1, oy0, oy1, ox0, ox1 = operation_bounds
+                baseline_operation_crop = baseline[
+                    oz0:oz1, oy0:oy1, ox0:ox1
+                ]
+                baseline_operation_crop[changed] = values[changed]
+                server_after_region = baseline[
+                    az0:az1, ay0:ay1, ax0:ax1
+                ]
+                visible_region = server_after_region.copy()
+                visible_region[local_changes] = current_region[local_changes]
+
+                applied_incrementally = True
+                if np.any(current_region != visible_region):
+                    crop_updater = getattr(
+                        self.owner, "update_segment_binary_labelmap_crop", None
+                    )
+                    applied_incrementally = bool(
+                        callable(crop_updater)
+                        and crop_updater(
+                            current_region,
+                            visible_region,
+                            affected_bounds,
+                            node,
+                            segment_id,
+                            self.owner.get_volume_node(),
+                        )
+                    )
+                if not applied_incrementally:
+                    # Geometry with a non-linear parent transform uses Slicer's
+                    # general full-volume resampling path for correctness.
+                    visible_full = baseline.copy()
+                    visible_full[
+                        az0:az1, ay0:ay1, ax0:ax1
+                    ][local_changes] = current_region[local_changes]
+                    self.owner.update_segment_binary_labelmap_from_array(
+                        visible_full, node, segment_id, self.owner.get_volume_node()
+                    )
                 node.Modified()
                 try:
                     self.owner.refresh_segmentation_display(node, segment_id)
                 except Exception:
                     pass
-                self.baselines[key] = server_after.copy()
-                if np.any(visible_after != server_after):
+                if operation.get("operation_kind") == "snapshot":
+                    local_nonzero = _delta_bounds(values != 0)
+                    if local_nonzero is None:
+                        self.baseline_bounds[key] = None
+                    else:
+                        lz0, lz1, ly0, ly1, lx0, lx1 = local_nonzero
+                        self.baseline_bounds[key] = [
+                            oz0 + lz0,
+                            oz0 + lz1,
+                            oy0 + ly0,
+                            oy0 + ly1,
+                            ox0 + lx0,
+                            ox0 + lx1,
+                        ]
+                else:
+                    self.baseline_bounds[key] = _bounds_union(
+                        self.baseline_bounds.get(key),
+                        operation.get("voxel_bbox"),
+                    )
+                if np.any(local_changes):
                     self.dirty_segments.add(key)
                 self._known_segment_ids.add(segment_id)
                 self._set_segment_collaboration_tags(segment_id)
                 if operation.get("author") != self.user_name:
-                    if remote_highlight is not None and np.any(remote_highlight):
+                    highlight_changed = changed
+                    if (
+                        operation.get("operation_kind") == "snapshot"
+                        and not np.any(values)
+                    ):
+                        highlight_changed = None
+                    if highlight_changed is not None and np.any(highlight_changed):
                         try:
-                            self.owner.show_remote_change_highlight(
-                                remote_highlight,
+                            self.owner.show_remote_change_highlight_crop(
+                                highlight_changed.astype(np.uint8),
+                                operation_bounds,
                                 str(operation.get("author") or "Collaborator"),
                             )
                         except Exception:

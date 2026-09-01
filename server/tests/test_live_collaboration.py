@@ -25,6 +25,8 @@ from collaboration import (  # noqa: E402
     SharedFolderRoomClient,
     _atomic_temporary_path,
     apply_mask_delta,
+    encode_mask_crop_delta,
+    encode_mask_crop_snapshot,
     encode_mask_delta,
     volume_signature,
 )
@@ -83,6 +85,50 @@ def test_snapshot_replaces_preexisting_local_voxels():
     local = np.ones_like(remote)
     snapshot = encode_mask_delta(np.zeros_like(remote), remote, replace=True)
     assert np.array_equal(apply_mask_delta(local, snapshot), remote)
+    assert snapshot["voxel_bbox"] == [1, 3, 1, 3, 1, 3]
+
+
+def test_empty_snapshot_clears_without_a_full_volume_payload():
+    empty = np.zeros((40, 50, 60), dtype=np.uint8)
+    local = np.ones_like(empty)
+    snapshot = encode_mask_delta(empty, empty, replace=True)
+    assert snapshot["voxel_bbox"] == [0, 1, 0, 1, 0, 1]
+    assert np.array_equal(apply_mask_delta(local, snapshot), empty)
+
+
+def test_cropped_delta_only_compares_effective_segment_region():
+    shape = (200, 300, 400)
+    previous = np.zeros(shape, dtype=np.uint8)
+    previous[90:93, 120:123, 210:213] = 1
+    current_crop = np.ones((4, 3, 3), dtype=np.uint8)
+    encoded = encode_mask_crop_delta(
+        previous,
+        current_crop,
+        [90, 94, 120, 123, 210, 213],
+        [90, 93, 120, 123, 210, 213],
+        shape,
+    )
+    assert encoded["volume_shape"] == list(shape)
+    assert encoded["voxel_bbox"] == [93, 94, 120, 123, 210, 213]
+    result = apply_mask_delta(previous, encoded)
+    assert int(result.sum()) == 36
+
+
+def test_cropped_snapshot_announces_empty_and_nonempty_labels_compactly():
+    shape = (50, 60, 70)
+    empty = encode_mask_crop_snapshot(None, None, shape)
+    assert empty["operation_kind"] == "snapshot"
+    assert empty["voxel_bbox"] == [0, 1, 0, 1, 0, 1]
+    assert not np.any(collaboration_module.decode_mask_delta(empty)[0])
+    assert not np.any(apply_mask_delta(np.ones(shape, dtype=np.uint8), empty))
+
+    crop = np.ones((2, 3, 4), dtype=np.uint8)
+    nonempty = encode_mask_crop_snapshot(
+        crop, [12, 14, 23, 26, 34, 38], shape
+    )
+    assert nonempty["voxel_bbox"] == [12, 14, 23, 26, 34, 38]
+    restored = apply_mask_delta(np.zeros(shape, dtype=np.uint8), nonempty)
+    assert int(restored.sum()) == 24
 
 
 def test_volume_signature_detects_different_source_content():
