@@ -1,4 +1,45 @@
-# Live Segmentation 0.10.1
+# Live Segmentation 0.10.2
+
+Version 0.10.2 removes the serial shared-folder metadata round trips that could
+still make a small remote edit appear roughly ten seconds after it was drawn.
+
+## One-read LSDF hot feed
+
+- Each atomic sequence-state update now carries a bounded, self-contained set of
+  the newest complete voxel operations. A receiver reads the state once and can
+  immediately apply the edit instead of opening a second operation file.
+- The hot feed acts as a write-ahead journal. Append-only operation files,
+  idempotency indexes, and label-owner metadata are derived in a bounded
+  background lane; an inline record is archived synchronously before eviction.
+- Unchanged compact label-owner metadata is no longer rewritten for every brush
+  stroke. Ephemeral sequence-lock ownership also avoids an unnecessary durable
+  flush.
+- Operation history, snapshots, reconnection, idempotent retry, global ordering,
+  and old shared rooms remain compatible with the existing format.
+
+## Faster Slicer-side detection and display
+
+- Slicer-provided segment IDs restrict a normal Segment Editor event to the one
+  label that changed. The compatibility fallback checks all labels only when a
+  third-party editor cannot identify its active segment.
+- Label-management widgets are no longer rebuilt for representation-only paint
+  events.
+- The actual segment is refreshed before the optional remote-change highlight is
+  generated, improving perceived display latency.
+
+## Measured verification
+
+- The direct new-operation feed was visible to a second client on the real LSDF
+  share after 0.047 seconds in the transport probe.
+- Two real Slicer 5.12.3 processes communicating through LSDF converged
+  bidirectionally on 35 voxels. Sender publication took 0.343 seconds and the
+  receiver applied the remote operation after 0.448 seconds.
+- 31 automated tests, Ruff, Python compilation, and the complete advanced Slicer
+  smoke test pass.
+
+---
+
+# Previous release: Live Segmentation 0.10.1
 
 Version 0.10.1 replaces full-volume synchronization with incremental Slicer
 labelmap updates. It directly addresses the 40-second delay observed with large

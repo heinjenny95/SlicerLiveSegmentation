@@ -319,6 +319,12 @@ def test_shared_folder_reads_independent_operation_files_in_parallel(tmp_path, m
             ),
         )
 
+    client._artifact_queue.join()
+    state_path = client._room_path / "sequence-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("inline_operations", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
     original_read = collaboration_module._read_json_file
     state_lock = threading.Lock()
     active = 0
@@ -365,6 +371,30 @@ def test_recent_operation_feed_avoids_relisting_the_network_directory(tmp_path, 
 
     monkeypatch.setattr(Path, "glob", reject_live_directory_listing)
     assert [item["sequence"] for item in client.operations(room["id"], 0)] == [1]
+
+
+def test_inline_operation_feed_avoids_live_operation_file_roundtrip(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("inline operation feed", "7" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed[0, 0, 0] = 1
+    client.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, changed, operation_id="inline-operation-1"),
+    )
+
+    original_read = collaboration_module._read_json_file
+
+    def reject_operation_file_read(path):
+        if Path(path).parent.name == "operations":
+            raise AssertionError("hot operation polling opened an archived operation file")
+        return original_read(path)
+
+    monkeypatch.setattr(collaboration_module, "_read_json_file", reject_operation_file_read)
+    operations = client.operations(room["id"], 0)
+    assert [item["sequence"] for item in operations] == [1]
+    assert operations[0]["client_operation_id"] == "inline-operation-1"
 
 
 def test_recent_chat_feed_avoids_relisting_the_network_directory(tmp_path, monkeypatch):

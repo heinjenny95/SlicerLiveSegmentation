@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.10.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.10.2.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.10.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.10.2`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -123,6 +123,14 @@ to the same voxel, the operation ordered later by the shared transport wins.
   effective internal labelmap extents and incoming edits mutate only the changed
   voxel box. Small brush strokes no longer export, copy, or re-import the entire
   source-volume geometry.
+- **One-read live edit feed:** the complete newest voxel operations are embedded
+  in a bounded atomic hot feed. Receivers no longer wait for a state-file read
+  followed by a second network-file read. Append-only archives, retry indexes,
+  and unchanged label-owner metadata are maintained outside the visible path.
+- **Targeted Slicer observation:** when Slicer identifies the modified segment,
+  only that label is compared. Editing one label no longer scans every label in
+  the shared segmentation; generic third-party editing remains supported through
+  a conservative fallback.
 
 ## Optional collaboration server
 
@@ -138,13 +146,15 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 30 automated transport, API, chat-anchor, snapshot/compaction, history,
+- 31 automated transport, API, chat-anchor, snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel
   edit and an 8-voxel return edit in both directions through a shared folder.
 - Two Slicer processes synchronized a 27-voxel edit on a 512×512×512 reference
   volume in about 0.55 seconds end-to-end on the development host.
+- A separate two-Slicer round trip through the real LSDF share published the
+  sender edit in 0.343 seconds and applied it remotely in 0.448 seconds.
 - A joining client starts without a Segmentation node, receives the room node
   automatically, and the built-in Segment Editor edits that exact node.
 - The module contains no bundled inference session or custom segmentation UI.

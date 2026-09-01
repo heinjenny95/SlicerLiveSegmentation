@@ -64,6 +64,8 @@ LIVE_ENCODING = "zlib-packbits-v1"
 SHARED_FOLDER_SCHEMA_VERSION = 1
 MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
+INLINE_OPERATION_LIMIT = 8
+INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
 
 
 class LiveCollaborationError(RuntimeError):
@@ -157,6 +159,34 @@ def _write_json_atomic(path, payload, durable=True):
         except OSError:
             pass
     return destination
+
+
+def _bounded_inline_operations(operations):
+    """Keep a small self-contained hot feed for one-read live synchronization."""
+    selected = []
+    total_bytes = 0
+    for operation in reversed(list(operations or [])):
+        try:
+            encoded_size = len(
+                json.dumps(
+                    operation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            continue
+        if selected and (
+            len(selected) >= INLINE_OPERATION_LIMIT
+            or total_bytes + encoded_size > INLINE_OPERATION_BYTES_LIMIT
+        ):
+            break
+        if encoded_size > INLINE_OPERATION_BYTES_LIMIT:
+            continue
+        selected.append(operation)
+        total_bytes += encoded_size
+    return list(reversed(selected))
 
 
 def _write_presence_json(path, payload):
@@ -671,6 +701,9 @@ class SharedFolderRoomClient:
         self._room_id = None
         self._room_path = None
         self._segment_owners_cache = {}
+        self._artifact_queue = queue.Queue()
+        self._artifact_worker = None
+        self._artifact_worker_lock = threading.Lock()
 
     @staticmethod
     def _room_key(room_name):
@@ -787,6 +820,7 @@ class SharedFolderRoomClient:
                 _write_json_atomic(
                     lock_path / "owner.json",
                     {"token": token, "user": self.user_name, "created_at": _utc_iso()},
+                    durable=False,
                 )
                 break
             except Exception:
@@ -810,6 +844,70 @@ class SharedFolderRoomClient:
 
     def _sequence_lock(self, room_path):
         return self._named_lock(room_path, "sequence")
+
+    @staticmethod
+    def _operation_paths(room_path, operation):
+        operation_id = str(operation.get("client_operation_id") or "")
+        operation_hash = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:20]
+        sequence = int(operation.get("sequence", 0))
+        destination = room_path / "operations" / f"{sequence:020d}--{operation_hash}.json"
+        index_path = room_path / "operation-index" / f"{operation_hash}.json"
+        return operation_hash, destination, index_path
+
+    def _persist_operation_artifacts(self, room_path, operation):
+        operation_hash, destination, index_path = self._operation_paths(
+            room_path, operation
+        )
+        if not destination.is_file():
+            _write_json_atomic(destination, operation, durable=False)
+        if not index_path.is_file():
+            _write_json_atomic(
+                index_path,
+                {"sequence": int(operation["sequence"]), "file": destination.name},
+                durable=False,
+            )
+        self._remember_segment_owner(
+            room_path, operation.get("segment_id"), operation.get("author")
+        )
+        self._update_compact_segment_owner(
+            room_path, operation.get("segment_id"), operation.get("author")
+        )
+        return operation_hash, destination
+
+    def _queue_operation_artifacts(self, room_path, operation):
+        """Persist hot-feed records without delaying their live publication."""
+        self._artifact_queue.put((Path(room_path), dict(operation)))
+        with self._artifact_worker_lock:
+            if self._artifact_worker is not None and self._artifact_worker.is_alive():
+                return
+
+            def drain():
+                while True:
+                    try:
+                        item_room_path, item_operation = self._artifact_queue.get_nowait()
+                    except queue.Empty:
+                        with self._artifact_worker_lock:
+                            if self._artifact_queue.empty():
+                                self._artifact_worker = None
+                                return
+                        continue
+                    try:
+                        self._persist_operation_artifacts(
+                            item_room_path, item_operation
+                        )
+                    except Exception:
+                        # The complete operation remains atomically stored in the
+                        # hot feed. A later writer archives it before eviction.
+                        pass
+                    finally:
+                        self._artifact_queue.task_done()
+
+            self._artifact_worker = threading.Thread(
+                target=drain,
+                name="LiveSegmentation-operation-archive",
+                daemon=True,
+            )
+            self._artifact_worker.start()
 
     def join(self, room_name, signature):
         room_key = self._room_key(room_name)
@@ -881,9 +979,22 @@ class SharedFolderRoomClient:
         operation_hash = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:20]
         operations_path = room_path / "operations"
         operation_index_path = room_path / "operation-index" / f"{operation_hash}.json"
+        state_path = room_path / "sequence-state.json"
         conflicts = []
         with self._sequence_lock(room_path):
+            state = {}
+            if state_path.is_file():
+                try:
+                    state = _read_json_file(state_path)
+                except LiveCollaborationError:
+                    state = {}
             existing = None
+            for recent_operation in state.get("inline_operations") or []:
+                if str(recent_operation.get("client_operation_id") or "") == operation_id:
+                    return {
+                        "sequence": int(recent_operation.get("sequence", 0)),
+                        "duplicate": True,
+                    }
             if operation_index_path.is_file():
                 try:
                     indexed = _read_json_file(operation_index_path)
@@ -915,7 +1026,13 @@ class SharedFolderRoomClient:
                         f"Label is locked by {lock_state.get('owner') or 'another user'}"
                     )
             base_sequence = int(operation.get("base_sequence", 0) or 0)
-            sequence = self._latest_sequence(room_path) + 1
+            try:
+                latest_sequence = max(0, int(state.get("latest_sequence", 0)))
+            except (TypeError, ValueError):
+                latest_sequence = 0
+            if latest_sequence <= 0 and not state:
+                latest_sequence = self._latest_sequence(room_path)
+            sequence = latest_sequence + 1
             stored = {
                 **operation,
                 "sequence": sequence,
@@ -929,38 +1046,50 @@ class SharedFolderRoomClient:
             except Exception:
                 pass
             destination = operations_path / f"{sequence:020d}--{operation_hash}.json"
-            previous_latest, recent_operations = self._recent_feed_state(
-                room_path / "sequence-state.json",
-                "latest_sequence",
-                "recent_operations",
-            )
-            del previous_latest
+            recent_operations = list(state.get("recent_operations") or [])
             recent_operations = [
                 item for item in recent_operations if int(item.get("sequence", 0)) != sequence
             ]
-            recent_operations.append({"sequence": sequence, "file": destination.name})
-            recent_operations = recent_operations[-RECENT_FEED_LIMIT:]
-            _write_json_atomic(destination, stored)
-            _write_json_atomic(
-                operation_index_path,
-                {"sequence": sequence, "file": destination.name},
-                durable=False,
+            recent_operations.append(
+                {
+                    "sequence": sequence,
+                    "file": destination.name,
+                    "operation_hash": operation_hash,
+                }
             )
+            recent_operations = recent_operations[-RECENT_FEED_LIMIT:]
+            previous_inline = list(state.get("inline_operations") or [])
+            inline_operations = _bounded_inline_operations(previous_inline + [stored])
+            retained_sequences = {
+                int(item.get("sequence", 0)) for item in inline_operations
+            }
+            # The hot feed is also a write-ahead journal. Before an old inline
+            # record is evicted, make sure its append-only archive exists.
+            for previous_operation in previous_inline:
+                previous_sequence = int(previous_operation.get("sequence", 0))
+                if previous_sequence in retained_sequences:
+                    continue
+                _, previous_destination, _ = self._operation_paths(
+                    room_path, previous_operation
+                )
+                if not previous_destination.is_file():
+                    _write_json_atomic(
+                        previous_destination, previous_operation, durable=False
+                    )
             _write_json_atomic(
-                room_path / "sequence-state.json",
+                state_path,
                 {
                     "latest_sequence": sequence,
                     "updated_at": _utc_iso(),
                     "recent_operations": recent_operations,
+                    "inline_operations": inline_operations,
                 },
                 durable=False,
             )
-            self._remember_segment_owner(
-                room_path, stored.get("segment_id"), stored.get("author")
-            )
-            self._update_compact_segment_owner(
-                room_path, stored.get("segment_id"), stored.get("author")
-            )
+        # The state file above is the latency-sensitive, complete operation
+        # journal. Append-only history, retry index, and owner metadata are
+        # derived immediately in one background lane.
+        self._queue_operation_artifacts(room_path, stored)
         # Conflict analysis can involve decoding many historical deltas. It is
         # intentionally outside the sequence lock, so another collaborator can
         # publish the next edit while this diagnostic work finishes.
@@ -1026,13 +1155,40 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError(
                 f"Shared operations folder is unavailable: {operations_path}"
             )
-        latest, recent = self._recent_feed_state(
-            room_path / "sequence-state.json",
-            "latest_sequence",
-            "recent_operations",
-        )
+        state_path = room_path / "sequence-state.json"
+        state = _read_json_file(state_path) if state_path.is_file() else {}
+        try:
+            latest = max(0, int(state.get("latest_sequence", 0)))
+        except (TypeError, ValueError):
+            latest = 0
         if latest <= after_sequence:
             return []
+        inline_by_sequence = {
+            int(item.get("sequence", 0)): dict(item)
+            for item in state.get("inline_operations") or []
+            if isinstance(item, dict) and int(item.get("sequence", 0) or 0) > 0
+        }
+        expected_sequences = list(
+            range(after_sequence + 1, min(latest, after_sequence + limit) + 1)
+        )
+        if expected_sequences and all(
+            sequence in inline_by_sequence for sequence in expected_sequences
+        ):
+            operations = [inline_by_sequence[sequence] for sequence in expected_sequences]
+            for operation in operations:
+                segment_id = str(operation.get("segment_id") or "")
+                author = str(operation.get("author") or "")
+                if segment_id and author:
+                    self._segment_owners_cache.setdefault(segment_id, author)
+            return operations
+
+        recent = [
+            item
+            for item in state.get("recent_operations") or []
+            if isinstance(item, dict)
+            and int(item.get("sequence", 0) or 0) > 0
+            and Path(str(item.get("file") or "")).name == str(item.get("file") or "")
+        ]
         recent = sorted(recent, key=lambda item: int(item["sequence"]))
         recent_covers_request = bool(recent) and (
             after_sequence >= int(recent[0]["sequence"]) - 1
@@ -1064,9 +1220,10 @@ class SharedFolderRoomClient:
 
         operations = _parallel_map(read_operation, selected)
         for operation in operations:
-            self._remember_segment_owner(
-                room_path, operation.get("segment_id"), operation.get("author")
-            )
+            segment_id = str(operation.get("segment_id") or "")
+            author = str(operation.get("author") or "")
+            if segment_id and author:
+                self._segment_owners_cache.setdefault(segment_id, author)
         return operations
 
     def _presence_path(self, room_path):
@@ -1330,6 +1487,9 @@ class SharedFolderRoomClient:
             except LiveCollaborationError:
                 state = {}
         owners = dict(state.get("owners") or {})
+        if str(owners.get(segment_id) or "") == owner:
+            self._segment_owners_cache.setdefault(segment_id, owner)
+            return
         owners.setdefault(segment_id, owner)
         _write_json_atomic(
             state_path,
@@ -1345,6 +1505,17 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError(
                 f"Shared label metadata is unavailable in {room_path}"
             )
+        hot_state_path = room_path / "sequence-state.json"
+        if hot_state_path.is_file():
+            try:
+                hot_state = _read_json_file(hot_state_path)
+                for operation in hot_state.get("inline_operations") or []:
+                    segment_id = str(operation.get("segment_id") or "")
+                    owner = str(operation.get("author") or "")
+                    if segment_id and owner:
+                        creators.setdefault(segment_id, owner)
+            except LiveCollaborationError:
+                pass
         compact_index_path = room_path / "segment-index-state.json"
         if compact_index_path.is_file():
             try:
@@ -1754,6 +1925,16 @@ class SharedFolderRoomClient:
         for archived in _parallel_map(read_archive, archive_paths):
             for sequence, operation in archived:
                 records.setdefault(sequence, operation)
+        state_path = room_path / "sequence-state.json"
+        if state_path.is_file():
+            try:
+                state = _read_json_file(state_path)
+                for operation in state.get("inline_operations") or []:
+                    sequence = int(operation.get("sequence", 0))
+                    if sequence > 0:
+                        records.setdefault(sequence, dict(operation))
+            except (LiveCollaborationError, TypeError, ValueError):
+                pass
         for sequence, operation in records.items():
             operation["sequence"] = int(sequence)
         return [records[key] for key in sorted(records)]
@@ -1845,6 +2026,7 @@ class SharedFolderRoomClient:
                     "latest_sequence": sequence,
                     "updated_at": _utc_iso(),
                     "recent_operations": recent_operations,
+                    "inline_operations": _bounded_inline_operations(created),
                 },
                 durable=False,
             )
@@ -2122,6 +2304,7 @@ class LiveCollaborationController:
         self._observed_node = None
         self._observed_segmentation = None
         self._observer_tags = []
+        self._observer_callbacks = []
         self._applying_remote = False
         # Independent lanes keep slow project maintenance from blocking live
         # edits, presence, chat, or label locks.
@@ -3583,23 +3766,40 @@ class LiveCollaborationController:
         return slicer.mrmlScene.GetNodeByID(self.segmentation_node_id) if self.segmentation_node_id else None
 
     def _observe_segmentation(self, node):
+        import vtk
         import vtkSegmentationCorePython as vtkSegmentationCore
 
         self._unobserve_segmentation()
         self._observed_node = node
         self._observed_segmentation = node.GetSegmentation()
-        observed_events = (
+        string_events = (
             vtkSegmentationCore.vtkSegmentation.SegmentAdded,
             vtkSegmentationCore.vtkSegmentation.SegmentRemoved,
             vtkSegmentationCore.vtkSegmentation.SegmentModified,
-            vtkSegmentationCore.vtkSegmentation.SourceRepresentationModified,
         )
-        for event_id in observed_events:
+        for event_id in string_events:
+            @vtk.calldata_type(vtk.VTK_STRING)
+            def segment_callback(caller, event, segment_id, controller=self):
+                controller._on_segmentation_modified(
+                    caller, event, str(segment_id or "")
+                )
+
+            self._observer_callbacks.append(segment_callback)
             self._observer_tags.append(
                 self._observed_segmentation.AddObserver(
-                    event_id, self._on_segmentation_modified
+                    event_id, segment_callback
                 )
             )
+        def source_callback(caller, event, controller=self):
+            controller._on_segmentation_modified(caller, event, None)
+
+        self._observer_callbacks.append(source_callback)
+        self._observer_tags.append(
+            self._observed_segmentation.AddObserver(
+                vtkSegmentationCore.vtkSegmentation.SourceRepresentationModified,
+                source_callback,
+            )
+        )
 
     def _unobserve_segmentation(self):
         if self._observed_segmentation is not None:
@@ -3611,8 +3811,9 @@ class LiveCollaborationController:
         self._observed_node = None
         self._observed_segmentation = None
         self._observer_tags = []
+        self._observer_callbacks = []
 
-    def _on_segmentation_modified(self, caller=None, event=None):
+    def _on_segmentation_modified(self, caller=None, event=None, segment_id=None):
         del caller, event
         if self._applying_remote or not self.connected:
             return
@@ -3620,17 +3821,34 @@ class LiveCollaborationController:
         if node is None:
             return
         current_ids = set(node.GetSegmentation().GetSegmentIDs())
-        for segment_id in current_ids - self._known_segment_ids:
-            self.force_snapshots.add((node.GetID(), segment_id))
-            self.segment_owners.setdefault(segment_id, self.user_name)
+        ids_changed = current_ids != self._known_segment_ids
+        for added_segment_id in current_ids - self._known_segment_ids:
+            self.force_snapshots.add((node.GetID(), added_segment_id))
+            self.segment_owners.setdefault(added_segment_id, self.user_name)
         self._known_segment_ids = current_ids
-        # Mark every segment as a candidate. Delta encoding below discards the
-        # unchanged ones. This observes edits from Segment Editor and from any
-        # separately installed module without coupling to that module's UI.
-        for segment_id in current_ids:
-            self.dirty_segments.add((node.GetID(), segment_id))
-        self._refresh_label_combo()
-        self._update_lock_controls()
+        candidates = set()
+        segment_id = str(segment_id or "")
+        if segment_id in current_ids:
+            candidates.add(segment_id)
+        if not candidates:
+            try:
+                selected_node, selected_segment_id = (
+                    self.owner.get_selected_segmentation_node_and_segment_id()
+                )
+                if selected_node == node and selected_segment_id in current_ids:
+                    candidates.add(str(selected_segment_id))
+            except Exception:
+                pass
+        if not candidates:
+            # Non-interactive modules may not expose an active Segment Editor
+            # label. Preserve compatibility by checking all labels only then.
+            candidates = current_ids
+        for candidate in candidates:
+            self.dirty_segments.add((node.GetID(), candidate))
+        if ids_changed or bool(segment_id):
+            self._refresh_label_combo()
+            self._update_lock_controls()
+        self._force_sync_refresh = True
 
     def _initialize_baselines_and_seed(self, seed=False):
         node = self._segmentation_node()
@@ -5372,10 +5590,20 @@ class LiveCollaborationController:
                         highlight_changed = None
                     if highlight_changed is not None and np.any(highlight_changed):
                         try:
-                            self.owner.show_remote_change_highlight_crop(
-                                highlight_changed.astype(np.uint8),
-                                operation_bounds,
-                                str(operation.get("author") or "Collaborator"),
+                            import qt
+
+                            highlight_crop = highlight_changed.astype(np.uint8).copy()
+                            highlight_bounds = list(operation_bounds)
+                            highlight_author = str(
+                                operation.get("author") or "Collaborator"
+                            )
+                            qt.QTimer.singleShot(
+                                100,
+                                lambda crop=highlight_crop, bounds=highlight_bounds, author=highlight_author: (
+                                    self.owner.show_remote_change_highlight_crop(
+                                        crop, bounds, author
+                                    )
+                                ),
                             )
                         except Exception:
                             pass
