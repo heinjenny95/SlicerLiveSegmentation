@@ -299,6 +299,44 @@ def test_shared_folder_reads_independent_operation_files_in_parallel(tmp_path, m
     assert peak_active >= 2
 
 
+def test_recent_operation_feed_avoids_relisting_the_network_directory(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("indexed operation feed", "1" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed[0, 0, 0] = 1
+    client.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, changed, operation_id="indexed-operation-1"),
+    )
+
+    original_glob = Path.glob
+
+    def reject_live_directory_listing(path, pattern):
+        if path.name == "operations":
+            raise AssertionError("recent operation polling relisted the network directory")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_live_directory_listing)
+    assert [item["sequence"] for item in client.operations(room["id"], 0)] == [1]
+
+
+def test_recent_chat_feed_avoids_relisting_the_network_directory(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("indexed chat feed", "2" * 64)
+    client.send_chat(room["id"], "hello", "indexed-chat-message")
+
+    original_glob = Path.glob
+
+    def reject_live_directory_listing(path, pattern):
+        if path.name == "chat":
+            raise AssertionError("recent chat polling relisted the network directory")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_live_directory_listing)
+    assert [item["text"] for item in client.chat_messages(room["id"], 0)] == ["hello"]
+
+
 def test_sequence_lock_retries_transient_windows_permission_error(tmp_path, monkeypatch):
     client = SharedFolderRoomClient(tmp_path, "alice")
     room = client.join("permission race room", "e" * 64)

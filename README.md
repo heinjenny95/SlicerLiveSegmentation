@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.9.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.10.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.9.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.10.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -71,7 +71,8 @@ to the same voxel, the operation ordered later by the shared transport wins.
   leaving, restarting Slicer, or joining from another computer. Messages can
   carry a Slicer crosshair/slice location and jump collaborators directly there.
   The sender sees a message immediately while it is persisted independently in
-  the background.
+  the background. A persistent Slicer dock keeps chat visible while Segment
+  Editor or another module is active.
 - **Live spatial presence:** online users publish active label, editor effect,
   crosshair and slice offsets. Users can jump to a collaborator or follow that
   person's view. Remote voxel changes receive a short-lived colored outline.
@@ -84,9 +85,10 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Roles and review:** rooms support viewer, editor, reviewer, and administrator
   roles. Labels progress through draft, in-progress, review, changes-requested,
   and approved states; approval locks the reviewed label.
-- **Version timeline:** every voxel operation remains auditable. A selected
-  revision can be restored as a new append-only revision, so no history is
-  silently rewritten.
+- **Live activity and version timeline:** label creation and editing entries
+  appear as soon as their ordered operation arrives (for example,
+  `07:34 Jenny created label “Label 1”`). A selected revision can be restored as
+  a new append-only revision, so no history is silently rewritten.
 - **Snapshots and compaction:** full segment snapshots are periodically appended
   using the normal backwards-compatible operation format. Older loose operation
   files move into ZIP archives, keeping join time and folder enumeration bounded
@@ -111,10 +113,11 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Clean leave/rejoin:** leaving detaches Segment Editor and removes every local
   room replica. Rejoining always rebuilds exactly one clean replica from the
   permanent operation history.
-- **Parallel shared-folder I/O:** independent labels, realtime metadata, and
-  collections of operation, presence, chat, lock, history, and backup files are
-  processed concurrently with bounded worker pools. Ordering remains serialized
-  only where the same label or the global voxel sequence requires it.
+- **Low-latency shared-folder I/O:** edit upload/download, chat send/receive,
+  presence, lock set/read, health, and maintenance use independent worker lanes.
+  Compact recent-operation, chat, and label-owner indexes avoid relisting large
+  network directories during every poll. Ordering remains serialized only where
+  the same label or the global voxel sequence requires it.
 
 ## Optional collaboration server
 
@@ -130,7 +133,7 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 25 automated transport, API, chat-anchor, snapshot/compaction, history,
+- 27 automated transport, API, chat-anchor, snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel

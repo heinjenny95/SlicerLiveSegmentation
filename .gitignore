@@ -25,3 +25,5 @@ two-user-*.json
 .shared-installed-*/
 .shared-parallel-*/
 .shared-realtime-*/
+.shared-v*/
+.v*-*.json

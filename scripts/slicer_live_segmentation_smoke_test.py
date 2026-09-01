@@ -20,6 +20,22 @@ def pump_events(seconds):
         time.sleep(0.03)
 
 
+def controller_workers(controller):
+    return tuple(
+        getattr(controller, name, None)
+        for name in (
+            "_edit_push_worker",
+            "_edit_pull_worker",
+            "_chat_send_worker",
+            "_chat_pull_worker",
+            "_presence_worker",
+            "_lock_set_worker",
+            "_lock_pull_worker",
+            "_maintenance_worker",
+        )
+    )
+
+
 def run_probe():
     widget = None
     controller = None
@@ -208,6 +224,10 @@ def run_probe():
             controller.send_chat_message()
             if "Persistent controller chat test" not in controller.chat_history.toPlainText():
                 raise RuntimeError("Own chat message was not displayed optimistically")
+            if controller.chat_dock is None or controller.chat_dock_history is None:
+                raise RuntimeError("Persistent chat dock was not created")
+            if "Persistent controller chat test" not in controller.chat_dock_history.toPlainText():
+                raise RuntimeError("Persistent chat dock did not mirror the room message")
             deadline = time.time() + 8
             chat_text = ""
             while time.time() < deadline:
@@ -240,11 +260,7 @@ def run_probe():
             deadline = time.time() + 8
             while time.time() < deadline:
                 pump_events(0.15)
-                workers = (
-                    controller._worker,
-                    controller._realtime_worker,
-                    controller._maintenance_worker,
-                )
+                workers = controller_workers(controller)
                 if controller.connection_healthy and not any(
                     worker is not None and worker.is_alive() for worker in workers
                 ):
@@ -413,11 +429,7 @@ def run_probe():
             deadline = time.time() + 5
             while any(
                 worker is not None and worker.is_alive()
-                for worker in (
-                    controller._worker,
-                    controller._realtime_worker,
-                    controller._maintenance_worker,
-                )
+                for worker in controller_workers(controller)
             ):
                 if time.time() >= deadline:
                     raise RuntimeError("Synchronization worker did not become idle")
@@ -441,11 +453,7 @@ def run_probe():
                 deadline = time.time() + 5
                 while any(
                     worker is not None and worker.is_alive()
-                    for worker in (
-                        controller._worker,
-                        controller._realtime_worker,
-                        controller._maintenance_worker,
-                    )
+                    for worker in controller_workers(controller)
                 ):
                     if time.time() >= deadline:
                         raise RuntimeError("Offline workers did not become idle")

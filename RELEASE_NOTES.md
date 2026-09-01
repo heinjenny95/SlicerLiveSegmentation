@@ -1,4 +1,44 @@
-# Live Segmentation 0.9.1
+# Live Segmentation 0.10.0
+
+Version 0.10.0 removes the remaining shared-folder polling barriers and keeps
+communication visible while users work in Segment Editor.
+
+## Low-latency live lanes
+
+- Edit upload and download, chat send and receive, presence heartbeat, lock set
+  and read, health checks, and maintenance now run in fully independent lanes.
+  A slow network operation can no longer hold unrelated live results.
+- Compact recent-operation and recent-chat feeds avoid relisting complete SMB
+  directories every 200 milliseconds. Deterministic per-message indexes also
+  make retries constant-time.
+- A compact label-owner index makes the normal owner lock path a single cached
+  lookup. Non-critical audit writes no longer delay chat, label locks, or edits.
+- Windows/SMB atomic replacement retries short reader-sharing windows without
+  weakening atomic publication.
+
+## Communication and activity UI
+
+- Room chat is available in a persistent Slicer dock that remains visible while
+  Segment Editor or another module is active.
+- Dock messages can attach the current Slicer position as a spatial comment and
+  retain the existing jump-to-location behavior.
+- The timeline is now a live activity feed. New ordered operations immediately
+  produce human-readable entries such as “Jenny created label ‘Label 1’” without
+  requiring the full-history refresh button.
+- Full history refreshes merge with already received activity, avoiding a race
+  that could hide a just-arrived event.
+
+## Verification
+
+- 27 automated transport/server tests pass, including regressions proving that
+  normal operation and chat polling do not relist their network directories.
+- Ruff, compilation, and the complete Slicer 5.12.3 UI smoke suite pass.
+- Two simultaneous Slicer processes exchanged bidirectional edits and converged
+  on the same 35-voxel label.
+
+---
+
+# Previous release: Live Segmentation 0.9.1
 
 Version 0.9.1 adds bounded parallel processing for independent work on shared
 folders and the optional collaboration server, while preserving deterministic
