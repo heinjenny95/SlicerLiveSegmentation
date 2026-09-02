@@ -56,7 +56,16 @@ def operation_payload(segment_id, previous, current, replace=False, operation_id
 
 def test_shared_folder_watchdogs_allow_institutional_smb_latency():
     assert collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS == 15.0
-    assert collaboration_module.SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS == 10.0
+    assert collaboration_module.SHARED_FOLDER_SLOW_RESPONSE_SECONDS == 10.0
+    assert collaboration_module.SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS == 30.0
+
+
+def test_shared_folder_watchdog_warns_before_it_disconnects():
+    state = collaboration_module.shared_folder_response_state
+    assert state(9.999) == "live"
+    assert state(10.0) == "slow"
+    assert state(29.999) == "slow"
+    assert state(30.0) == "offline"
 
 
 def deletion_payload(segment_id, shape, operation_id="delete-segment-1"):

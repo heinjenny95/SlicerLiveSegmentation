@@ -73,7 +73,18 @@ SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 # watchdogs around background work, so increasing them never blocks Slicer's
 # GUI thread.
 SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 15.0
-SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 10.0
+SHARED_FOLDER_SLOW_RESPONSE_SECONDS = 10.0
+SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 30.0
+
+
+def shared_folder_response_state(elapsed_seconds):
+    """Classify silence without treating a brief SMB stall as an outage."""
+    elapsed = max(0.0, float(elapsed_seconds))
+    if elapsed >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS:
+        return "offline"
+    if elapsed >= SHARED_FOLDER_SLOW_RESPONSE_SECONDS:
+        return "slow"
+    return "live"
 
 
 class LiveCollaborationError(RuntimeError):
@@ -2761,6 +2772,7 @@ class LiveCollaborationController:
         self._last_error = None
         self._last_transport_warning = None
         self._last_transport_result_at = 0.0
+        self._transport_stall_status_second = -1
         self._session_token = 0
         self.connection_healthy = False
         self._connection_validation_pending = False
@@ -4107,6 +4119,7 @@ class LiveCollaborationController:
             self._connection_validation_started_at = 0.0
             self._last_transport_warning = None
             self._last_transport_result_at = time.monotonic()
+            self._transport_stall_status_second = -1
             self.connection_healthy = True
             self.connected = True
             self._observe_segmentation(segmentation_node)
@@ -4265,6 +4278,7 @@ class LiveCollaborationController:
         self._force_advanced_refresh = False
         self._connection_error_popup_shown = False
         self._last_transport_result_at = 0.0
+        self._transport_stall_status_second = -1
         try:
             self.owner.clear_live_segmentation(segmentation_node_id)
         except Exception:
@@ -4979,17 +4993,28 @@ class LiveCollaborationController:
             return
         if not self.connected:
             return
-        if (
-            isinstance(self.client, SharedFolderRoomClient)
-            and self._last_transport_result_at
-            and monotonic_now - self._last_transport_result_at
-            >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS
-        ):
-            self._disconnect_for_connection_loss(
-                "The shared folder did not answer any live-sync request within "
-                f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
-            )
-            return
+        if isinstance(self.client, SharedFolderRoomClient) and self._last_transport_result_at:
+            response_silence = monotonic_now - self._last_transport_result_at
+            response_state = shared_folder_response_state(response_silence)
+            if response_state == "offline":
+                self._disconnect_for_connection_loss(
+                    "The shared folder did not answer any live-sync request within "
+                    f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
+                )
+                return
+            if response_state == "slow":
+                silence_second = int(response_silence)
+                if silence_second != self._transport_stall_status_second:
+                    self._transport_stall_status_second = silence_second
+                    self.connection_healthy = False
+                    self.status_label.setText(
+                        "● Shared folder is responding slowly — checking connection "
+                        f"({silence_second} s)"
+                    )
+                    self.status_label.setStyleSheet(
+                        "color: #b26a00; font-weight: bold;"
+                    )
+                self._force_health_check = True
         if (
             isinstance(self.client, SharedFolderRoomClient)
             and self._connection_validation_pending
@@ -5989,6 +6014,13 @@ class LiveCollaborationController:
                     )
                 self._last_error = None
             self._update_lock_controls()
+            # Applying a received voxel patch to MRML can itself take several
+            # seconds on a large volume.  Refresh the transport timestamp after
+            # all local result processing so that CPU/rendering time is never
+            # misclassified as network silence by the next timer tick.
+            if self.connected:
+                self._last_transport_result_at = time.monotonic()
+                self._transport_stall_status_second = -1
 
     def _queue_snapshot_operations(self, operations):
         for operation in operations or []:

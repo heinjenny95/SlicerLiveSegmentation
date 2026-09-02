@@ -13,7 +13,22 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-PLUGIN_VERSION = "0.11.4"
+PLUGIN_VERSION = "0.11.5"
+
+
+def clear_legacy_connection_settings():
+    """Remove network targets before the module widget or any Qt path field exists."""
+    settings = qt.QSettings()
+    prefix = "LiveSegmentation/collaboration/"
+    for key in ("room", "transport", "sharedFolder", "server"):
+        settings.remove(prefix + key)
+    settings.sync()
+
+
+# Scripted modules are imported while Slicer discovers them.  Clearing legacy
+# connection targets here is intentionally earlier than widget setup so a stale
+# UNC value from an older release cannot survive until UI restoration.
+clear_legacy_connection_settings()
 
 
 class LiveSegmentation(ScriptedLoadableModule):
@@ -718,4 +733,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.11.4")
+        self.assertEqual(PLUGIN_VERSION, "0.11.5")

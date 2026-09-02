@@ -10,6 +10,29 @@
 3. A response after more than four but less than 15 seconds must still open the
    room. Only 15 seconds without a response may cancel the local attempt.
 
+## Temporary active-session stall
+
+1. While joined, delay or suspend responses from the test share for more than
+   ten but less than 30 seconds.
+2. Verify that the status turns orange and reports a slow shared folder while
+   the shared segmentation and current room remain loaded.
+3. Restore responses and verify that live status returns automatically.
+4. Repeat with more than 30 seconds of complete silence and verify that the
+   session is reset locally without freezing Slicer.
+
+## Safe Start recovery
+
+1. Install the package and verify both **Live Segmentation** and **Live
+   Segmentation Safe Start** desktop shortcuts exist.
+2. Put an intentionally unusable value into an older Live Segmentation
+   connection setting or use a disposable Slicer profile containing stale
+   state.
+3. Launch **Live Segmentation Safe Start** and verify Slicer reaches the module
+   without opening or probing the stale network location.
+4. Verify the ordinary Slicer profile and separately installed extensions were
+   not deleted or modified. The shortcut arguments must contain
+   `--disable-settings --ignore-slicerrc`.
+
 ## Preparation
 
 1. Create an empty folder in a shared location writable by both test users.

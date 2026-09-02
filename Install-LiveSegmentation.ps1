@@ -57,14 +57,26 @@ $shortcut.IconLocation = "$SlicerPath,0"
 $shortcut.Description = '3D Slicer mit dem eigenständigen Live Segmentation Plugin öffnen'
 $shortcut.Save()
 
+$safeShortcutPath = Join-Path $desktop 'Live Segmentation Safe Start.lnk'
+$safeShortcut = $shell.CreateShortcut($safeShortcutPath)
+$safeShortcut.TargetPath = $SlicerPath
+$safeShortcut.Arguments = "--disable-settings --ignore-slicerrc --additional-module-path `"$moduleDestination`" --python-code `"slicer.util.selectModule('LiveSegmentation')`""
+$safeShortcut.WorkingDirectory = Split-Path -Parent $SlicerPath
+$safeShortcut.IconLocation = "$SlicerPath,0"
+$safeShortcut.Description = 'Live Segmentation mit isolierten lokalen Slicer-Einstellungen starten'
+$safeShortcut.Save()
+
 $message = @"
 Live Segmentation $version wurde separat installiert.
 
 Andere Segmentierungs-Plugins: bleiben unverändert installiert
 Live-Plugin: $moduleDestination
 Desktop-Shortcut: $shortcutPath
+Recovery-Shortcut ohne gespeicherte Slicer-Einstellungen: $safeShortcutPath
 
 Öffne künftig den neuen Shortcut „Live Segmentation“.
+Falls Slicer mit alten Einstellungen nicht startet, verwende einmal
+„Live Segmentation Safe Start“.
 "@
 
 Write-Host $message

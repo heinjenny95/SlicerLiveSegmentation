@@ -235,6 +235,44 @@ def run_probe():
         if widget.segmentation_selector.currentNode() != segmentation:
             raise RuntimeError("The room segmentation was not selected automatically")
 
+        slow_watchdog_probe = None
+        if (
+            transport == "shared-folder"
+            and os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_SLOW_WATCHDOG", "0")
+            == "1"
+        ):
+            import LiveSegmentationLib.collaboration as collaboration_module
+
+            controller.timer.stop()
+            worker_deadline = time.time() + 3.0
+            while time.time() < worker_deadline and any(
+                worker is not None and worker.is_alive()
+                for worker in controller_workers(controller)
+            ):
+                pump_events(0.05)
+            controller._drain_worker_results()
+            simulated_silence = (
+                collaboration_module.SHARED_FOLDER_SLOW_RESPONSE_SECONDS + 1.0
+            )
+            controller._last_transport_result_at = (
+                time.monotonic() - simulated_silence
+            )
+            controller.on_timer()
+            if not controller.connected:
+                raise RuntimeError("Slow-response warning disconnected the live room")
+            if "responding slowly" not in controller.status_label.text:
+                raise RuntimeError("Slow-response warning was not shown")
+            slow_watchdog_probe = {
+                "simulated_silence_seconds": simulated_silence,
+                "room_preserved": True,
+                "warning_visible": True,
+            }
+            controller._last_transport_result_at = time.monotonic()
+            controller._transport_stall_status_second = -1
+            controller.connection_healthy = True
+            controller.status_label.setText(controller._live_status_text())
+            controller.timer.start()
+
         widget.open_segment_editor()
         editor = widget._standard_segment_editor_widget()
         if editor is None or editor.segmentationNode() != segmentation:
@@ -1138,6 +1176,7 @@ def run_probe():
             "startup_reset": bool(startup_reset_probe),
             "async_timeout": async_timeout_probe,
             "delayed_join": delayed_join_probe,
+            "slow_watchdog": slow_watchdog_probe,
             "async_leave": async_leave_probe,
         }
     except Exception as exc:

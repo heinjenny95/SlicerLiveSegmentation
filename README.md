@@ -17,13 +17,19 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.4.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.5.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
+The installer also creates **Live Segmentation Safe Start**. It launches Slicer
+with `--disable-settings --ignore-slicerrc` and therefore bypasses stale scene,
+module, startup-script, or network state from the normal Slicer profile. Use it
+when an existing Slicer profile cannot reach its main window; it does not delete
+or overwrite the normal profile.
+
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.4`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.5`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -74,6 +80,20 @@ live-sync or read/write-health response, preventing a single brief network stall
 from being mistaken for an outage while keeping the UI responsive and locally
 cancellable throughout.
 
+Version 0.11.5 separates a slow active session from a confirmed outage. Ten
+seconds without a completed request now produces an orange connection warning
+and an immediate health probe without removing the shared segmentation. The
+hard local reset occurs only after 30 seconds of complete silence or an explicit
+failed read/write health check. Time spent applying a large received voxel patch
+inside Slicer is refreshed after local processing and no longer counts as
+network silence.
+
+Version 0.11.5 also clears legacy room, transport, shared-folder, and server
+targets as soon as Slicer imports the module, before widget setup. The Windows
+installer adds a **Live Segmentation Safe Start** shortcut that ignores saved
+settings and the user startup script for that launch, so a damaged or stale
+normal Slicer profile cannot prevent access to the plugin.
+
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
 subdirectory containing room metadata, ordered voxel operations, and expiring
@@ -86,8 +106,9 @@ to the same voxel, the operation ordered later by the shared transport wins.
 
 ## Collaboration controls
 
-- **Connection monitoring:** every active room is checked continuously. Failed
-  shared-folder validation is reported and reset locally within ten seconds;
+- **Connection monitoring:** every active room is checked continuously. Ten
+  seconds without a response produces a visible warning and health check;
+  30 seconds of complete silence or an explicit failed validation resets locally.
   the UI remains responsive and never silently reconnects at the next launch.
   Round trips of 2.5 seconds or more are marked as a slow connection. **Sync
   now** immediately requests participants, edits, chat, locks, and a health

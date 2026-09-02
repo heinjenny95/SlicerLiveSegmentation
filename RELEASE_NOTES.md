@@ -1,4 +1,45 @@
-# Live Segmentation 0.11.4
+# Live Segmentation 0.11.5
+
+Version 0.11.5 fixes a false active-session disconnect that could still occur
+when a reachable shared folder or a large local segmentation update took more
+than ten seconds to complete.
+
+## Two-stage active-session watchdog
+
+- Ten seconds without a completed shared-folder request now changes the status
+  to an orange **responding slowly** warning and requests a dedicated health
+  check. The room, shared labels, chat, and locks remain loaded.
+- A local reset now requires 30 seconds of complete transport silence or an
+  explicit failed read/write health check. A genuine returned access error can
+  therefore still disconnect promptly, while a temporary SMB backlog does not.
+- The timestamp used by the network watchdog is refreshed after a received
+  operation has finished applying to Slicer's MRML scene. CPU, voxel conversion,
+  and rendering time on a large dataset no longer masquerade as network delay.
+- The 15-second, cancellable, non-blocking initial connection watchdog from
+  version 0.11.4 remains unchanged.
+
+## Startup recovery
+
+- Legacy room, transport, shared-folder, and server targets are removed during
+  scripted-module import, before the Live Segmentation widget is constructed.
+- The Windows installer now creates **Live Segmentation Safe Start** alongside
+  the normal shortcut. Safe Start uses Slicer's supported `--disable-settings`
+  and `--ignore-slicerrc` switches, bypassing stale normal-profile and startup-
+  script state without deleting that profile or changing separately installed
+  extensions.
+
+## Verification
+
+- 45 automated tests cover the live/slow/offline boundaries in addition to the
+  existing transport, deletion, backup, and collaboration suite.
+- Ruff, Python compilation, release validation, normal-profile and isolated-
+  settings Safe Start tests, and real Slicer smoke tests
+  confirm that slow warnings preserve the room while hard failures still reset
+  locally without blocking the interface or shutdown.
+
+---
+
+# Previous release: Live Segmentation 0.11.4
 
 Version 0.11.4 prevents slow but reachable institutional SMB shares from being
 reported as offline during connection setup or a brief live-session stall.
