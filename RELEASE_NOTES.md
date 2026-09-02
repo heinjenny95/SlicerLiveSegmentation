@@ -1,4 +1,44 @@
-# Live Segmentation 0.10.3
+# Live Segmentation 0.10.4
+
+Version 0.10.4 guarantees that rapid consecutive edits of the same label are
+queued and delivered without losing a component.
+
+## Lossless rapid-stroke queue
+
+- A label can now have multiple local patches in flight. Every new patch is
+  compared with the confirmed server baseline plus all queued and published
+  patches that have not yet returned through the ordered room feed.
+- Queued operation crops are overlaid sparsely; the plugin does not copy the
+  complete reference volume to preserve rapid strokes.
+- Sender echoes are tracked across independent push and pull lanes, including
+  the race where the receiver observes its own operation before the push worker
+  reports completion.
+
+## Reliable Segment Editor selection and settling
+
+- Slicer 5.12 uses `currentSegmentID`; the plugin now uses this API while retaining
+  compatibility with versions that expose `selectedSegmentID`. The previous
+  silent fallback to the first label could make the trailing verifier inspect the
+  wrong label.
+- Interactive labels receive sparse trailing state comparisons for two seconds.
+  This catches the Slicer event ordering in which a Paint notification arrives
+  just before the final voxel write.
+
+## Measured verification
+
+- The original failure was confirmed from the live room: only two yellow patch
+  operations existed for three visible local components.
+- Two real Slicer 5.12.3 processes on the LSDF share then synchronized three
+  rapid, disconnected additions to the same existing label. All 24 of 24 new
+  voxels were visible in the second Slicer; the initial edit published in 0.42
+  seconds and was received in 0.29 seconds.
+- All 32 automated tests, Ruff, Python compilation, and the complete advanced
+  Slicer smoke test pass, including chat, locks, history, backups, conflicts,
+  connection recovery, clean rejoin, and the early-event rapid-stroke probe.
+
+---
+
+# Previous release: Live Segmentation 0.10.3
 
 Version 0.10.3 removes the remaining manual Segment Editor and SMB maintenance
 delays observed for a large edit confined to one microscopy slice.

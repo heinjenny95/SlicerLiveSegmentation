@@ -125,6 +125,7 @@ def run_probe():
         operations = []
         edit_latency_seconds = None
         receive_latency_seconds = None
+        rapid_component_voxels = None
         if mode == "produce":
             wait_for_return_edit = (
                 os.environ.get("LIVE_SEGMENTATION_SMOKE_WAIT_FOR_RETURN_EDIT", "0")
@@ -262,6 +263,76 @@ def run_probe():
                     raise RuntimeError("Room did not receive the peer's return edit")
         else:
             raise RuntimeError(f"Unsupported smoke-test mode: {mode}")
+
+        if os.environ.get("LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS", "0") == "1":
+            rapid_segment_id = segment_id
+            rapid_bounds = (
+                [0, 2, 0, 2, 0, 2],
+                [6, 8, 0, 2, 7, 9],
+                [9, 11, 8, 10, 0, 2],
+            )
+            if mode == "produce":
+                editor.setCurrentSegmentID(rapid_segment_id)
+                slicer.app.processEvents()
+                for index, bounds in enumerate(rapid_bounds):
+                    component = np.ones((2, 2, 2), dtype=np.uint8)
+                    if index == 2:
+                        # Reproduce Slicer's occasional early paint event: the
+                        # notification precedes the final voxel write and there
+                        # is deliberately no second explicit notification.
+                        controller._on_segmentation_modified(
+                            segmentation.GetSegmentation(), None, rapid_segment_id
+                        )
+                    if not widget.update_segment_binary_labelmap_crop(
+                        np.zeros_like(component),
+                        component,
+                        bounds,
+                        segmentation,
+                        rapid_segment_id,
+                        volume,
+                    ):
+                        raise RuntimeError("Rapid component edit failed")
+                    if index < 2:
+                        controller._on_segmentation_modified(
+                            segmentation.GetSegmentation(), None, rapid_segment_id
+                        )
+                    pump_events(0.12)
+
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    pump_events(0.12)
+                    operations = controller.client.operations(controller.room_id, 0)
+                    rapid_mask = np.zeros(image.shape, dtype=np.uint8)
+                    from LiveSegmentationLib.collaboration import apply_mask_delta
+
+                    for item in operations:
+                        if item["segment_id"] == rapid_segment_id:
+                            rapid_mask = apply_mask_delta(rapid_mask, item)
+                    rapid_component_voxels = int(rapid_mask.sum()) - 27
+                    if rapid_component_voxels == 24:
+                        break
+            else:
+                deadline = time.time() + 12
+                while time.time() < deadline:
+                    pump_events(0.12)
+                    rapid_segment = segmentation.GetSegmentation().GetSegment(
+                        rapid_segment_id
+                    )
+                    if rapid_segment is None:
+                        continue
+                    rapid_mask = widget.segment_mask_in_reference_geometry(
+                        segmentation, rapid_segment_id, volume, image.shape
+                    )
+                    rapid_component_voxels = int(
+                        np.asarray(rapid_mask, dtype=np.uint8).sum()
+                    ) - 27
+                    if rapid_component_voxels == 24:
+                        break
+            if rapid_component_voxels != 24:
+                raise RuntimeError(
+                    "Rapid same-label synchronization lost a component: "
+                    f"received {rapid_component_voxels} of 24 voxels"
+                )
 
         collaboration_extras = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_EXTRAS", "0") == "1":
@@ -667,6 +738,7 @@ def run_probe():
             "voxel_count": voxel_count,
             "edit_latency_seconds": edit_latency_seconds,
             "receive_latency_seconds": receive_latency_seconds,
+            "rapid_component_voxels": rapid_component_voxels,
             "incremental_patch_probe_voxels": patch_voxels,
             "lifecycle": lifecycle,
             "backup": backup,

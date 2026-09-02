@@ -26,6 +26,7 @@ from collaboration import (  # noqa: E402
     _atomic_temporary_path,
     apply_mask_delta,
     encode_mask_crop_delta,
+    encode_mask_crop_delta_after_operations,
     encode_mask_crop_snapshot,
     encode_mask_delta,
     volume_signature,
@@ -112,6 +113,57 @@ def test_cropped_delta_only_compares_effective_segment_region():
     assert encoded["voxel_bbox"] == [93, 94, 120, 123, 210, 213]
     result = apply_mask_delta(previous, encoded)
     assert int(result.sum()) == 36
+
+
+def test_rapid_same_label_components_queue_without_losing_a_stroke():
+    shape = (9, 48, 52)
+    baseline = np.zeros(shape, dtype=np.uint8)
+    states = []
+    current = baseline.copy()
+    for bounds in (
+        (4, 5, 4, 10, 5, 11),
+        (4, 5, 18, 24, 22, 28),
+        (4, 5, 31, 38, 39, 46),
+    ):
+        z0, z1, y0, y1, x0, x1 = bounds
+        current = current.copy()
+        current[z0:z1, y0:y1, x0:x1] = 1
+        states.append(current)
+
+    queued = []
+    previous_bounds = None
+    for state in states:
+        nonzero = np.nonzero(state)
+        current_bounds = [
+            int(nonzero[0].min()),
+            int(nonzero[0].max()) + 1,
+            int(nonzero[1].min()),
+            int(nonzero[1].max()) + 1,
+            int(nonzero[2].min()),
+            int(nonzero[2].max()) + 1,
+        ]
+        z0, z1, y0, y1, x0, x1 = current_bounds
+        operation = encode_mask_crop_delta_after_operations(
+            baseline,
+            state[z0:z1, y0:y1, x0:x1],
+            current_bounds,
+            previous_bounds,
+            shape,
+            queued,
+        )
+        assert operation is not None
+        queued.append(operation)
+
+    restored = baseline
+    for operation in queued:
+        restored = apply_mask_delta(restored, operation)
+    assert np.array_equal(restored, states[-1])
+    assert len(queued) == 3
+    assert [int(apply_mask_delta(baseline, item).sum()) for item in queued] == [
+        36,
+        36,
+        49,
+    ]
 
 
 def test_cropped_snapshot_announces_empty_and_nonempty_labels_compactly():

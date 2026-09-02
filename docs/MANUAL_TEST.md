@@ -23,6 +23,17 @@
 5. In B add a non-overlapping area to the same segment and verify both areas in A.
 6. Erase part of the segment in B and verify the removal in A.
 
+## Rapid same-label strokes
+
+1. Select a single label in instance A and paint three disconnected components
+   in quick succession without waiting for the peer between strokes.
+2. Verify instance B receives all three components, in order, without pressing
+   **Sync now**.
+3. Repeat while the first component is still being transmitted over a slower
+   network share. Verify no component is lost or assigned to a different label.
+4. Select a different label and repeat. Confirm the Segment Editor selection,
+   live history, and the received label identity all agree.
+
 ## Separately installed tools
 
 1. Keep the live room connected.
@@ -108,4 +119,7 @@
 processes. The consumer starts without a Segmentation node and must receive the
 room node plus the producer's 27 voxels. It then adds 8 voxels to the same
 segment; both processes must converge on 35 voxels without any artificial
-generic `Modified()` call.
+generic `Modified()` call. With `LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS=1`,
+the producer also adds three disconnected components to the same existing label
+at 120 ms intervals. The third notification intentionally precedes its voxel
+write; the peer must still receive all 24 new voxels.

@@ -13,7 +13,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-PLUGIN_VERSION = "0.10.3"
+PLUGIN_VERSION = "0.10.4"
 
 
 class LiveSegmentation(ScriptedLoadableModule):
@@ -406,7 +406,10 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             try:
                 editor_node = editor.segmentationNode()
                 if editor_node == segmentation_node:
-                    selected_segment_id = str(editor.selectedSegmentID() or "")
+                    if hasattr(editor, "currentSegmentID"):
+                        selected_segment_id = str(editor.currentSegmentID() or "")
+                    elif hasattr(editor, "selectedSegmentID"):
+                        selected_segment_id = str(editor.selectedSegmentID() or "")
             except Exception:
                 selected_segment_id = None
 
@@ -424,7 +427,10 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         try:
             if editor.segmentationNode() != segmentation_node:
                 editor.setSegmentationNode(segmentation_node)
-            editor.setSelectedSegmentID(str(segment_id))
+            if hasattr(editor, "setCurrentSegmentID"):
+                editor.setCurrentSegmentID(str(segment_id))
+            else:
+                editor.setSelectedSegmentID(str(segment_id))
             return True
         except Exception:
             return False
@@ -712,4 +718,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.10.3")
+        self.assertEqual(PLUGIN_VERSION, "0.10.4")

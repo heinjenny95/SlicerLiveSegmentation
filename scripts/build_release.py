@@ -169,14 +169,14 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 31,
+            "automated_tests": 32,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
                 "backups-history-snapshot-conflict-review-diagnostics-connection-recovery"
             ),
             "two_process_slicer_live_sync_test": (
-                "passed-lsdf-hot-feed-under-half-second-and-bidirectional-convergence"
+                "passed-lsdf-rapid-three-component-same-label-convergence"
             ),
             "docker_runtime_test": "pending-no-local-docker-installation",
         },

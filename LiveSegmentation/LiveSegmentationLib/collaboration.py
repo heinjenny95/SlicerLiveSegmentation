@@ -373,6 +373,91 @@ def encode_mask_crop_delta(
     return encoded
 
 
+def encode_mask_crop_delta_after_operations(
+    previous,
+    current_crop,
+    current_bounds,
+    previous_bounds,
+    volume_shape,
+    pending_operations,
+):
+    """Encode a crop after applying locally queued operations to its baseline.
+
+    Paint can modify the same label again while an earlier patch is still being
+    written to a network share.  Comparing the new crop only with the confirmed
+    server baseline would either duplicate that earlier patch or force the new
+    stroke to wait.  This helper overlays the small queued operation crops onto
+    the baseline first, so every later stroke can be queued immediately and in
+    order without copying the complete reference volume.
+    """
+    previous = np.asarray(previous, dtype=np.uint8)
+    volume_shape = tuple(int(value) for value in volume_shape)
+    if previous.shape != volume_shape:
+        raise ValueError("Baseline and live volume geometry do not match")
+
+    operations = list(pending_operations or [])
+    comparison_bounds = _bounds_union(current_bounds, previous_bounds)
+    for operation in operations:
+        operation_shape = tuple(int(value) for value in operation["volume_shape"])
+        if operation_shape != volume_shape:
+            raise ValueError("Pending operation belongs to a different volume geometry")
+        comparison_bounds = _bounds_union(
+            comparison_bounds, operation.get("voxel_bbox")
+        )
+    if comparison_bounds is None:
+        return None
+
+    z0, z1, y0, y1, x0, x1 = [int(value) for value in comparison_bounds]
+    if (
+        z0 < 0
+        or y0 < 0
+        or x0 < 0
+        or z1 > volume_shape[0]
+        or y1 > volume_shape[1]
+        or x1 > volume_shape[2]
+    ):
+        raise ValueError("Segment crop exceeds the live volume geometry")
+
+    current_region = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
+    if current_crop is not None and current_bounds is not None:
+        cz0, cz1, cy0, cy1, cx0, cx1 = [int(value) for value in current_bounds]
+        current_region[
+            cz0 - z0 : cz1 - z0,
+            cy0 - y0 : cy1 - y0,
+            cx0 - x0 : cx1 - x0,
+        ] = np.asarray(current_crop, dtype=np.uint8)
+
+    queued_region = previous[z0:z1, y0:y1, x0:x1].copy()
+    for operation in operations:
+        if operation.get("operation_kind") == "snapshot":
+            queued_region.fill(0)
+        oz0, oz1, oy0, oy1, ox0, ox1 = [
+            int(value) for value in operation["voxel_bbox"]
+        ]
+        changed, values = decode_mask_delta(operation)
+        target = queued_region[
+            oz0 - z0 : oz1 - z0,
+            oy0 - y0 : oy1 - y0,
+            ox0 - x0 : ox1 - x0,
+        ]
+        target[changed] = values[changed]
+
+    encoded = encode_mask_delta(queued_region, current_region, replace=False)
+    if encoded is None:
+        return None
+    ez0, ez1, ey0, ey1, ex0, ex1 = encoded["voxel_bbox"]
+    encoded["voxel_bbox"] = [
+        z0 + ez0,
+        z0 + ez1,
+        y0 + ey0,
+        y0 + ey1,
+        x0 + ex0,
+        x0 + ex1,
+    ]
+    encoded["volume_shape"] = [int(value) for value in volume_shape]
+    return encoded
+
+
 def encode_mask_crop_snapshot(current_crop, current_bounds, volume_shape):
     """Encode a full segment state from its effective crop, including empty labels."""
     volume_shape = tuple(int(value) for value in volume_shape)
@@ -2375,12 +2460,15 @@ class LiveCollaborationController:
         self.force_snapshots = set()
         self.outgoing = []
         self.outgoing_keys = set()
+        self.awaiting_echo = []
+        self._applied_local_operation_ids = set()
         self._known_segment_ids = set()
         self._observed_node = None
         self._observed_segmentation = None
         self._observer_tags = []
         self._observer_callbacks = []
         self._segment_revisions = {}
+        self._segment_verifications = {}
         self._shared_folder_watcher = None
         self._applying_remote = False
         # Independent lanes keep slow project maintenance from blocking live
@@ -3560,7 +3648,10 @@ class LiveCollaborationController:
             self.force_snapshots.clear()
             self.outgoing.clear()
             self.outgoing_keys.clear()
+            self.awaiting_echo.clear()
+            self._applied_local_operation_ids.clear()
             self._segment_revisions.clear()
+            self._segment_verifications.clear()
             self.last_chat_sequence = 0
             self.pending_chat.clear()
             self.displayed_chat_sequences.clear()
@@ -3736,7 +3827,10 @@ class LiveCollaborationController:
         self.force_snapshots.clear()
         self.outgoing.clear()
         self.outgoing_keys.clear()
+        self.awaiting_echo.clear()
+        self._applied_local_operation_ids.clear()
         self._segment_revisions.clear()
+        self._segment_verifications.clear()
         self._known_segment_ids.clear()
         self.pending_chat.clear()
         self.displayed_chat_sequences.clear()
@@ -3917,6 +4011,36 @@ class LiveCollaborationController:
         key = (node.GetID(), str(segment_id))
         self._segment_revisions[key] = self._segment_revision(node, segment_id)
 
+    def _schedule_segment_verification(self, key, duration=2.0):
+        """Recheck a recently edited label after early Segment Editor events."""
+        now = time.monotonic()
+        existing = self._segment_verifications.get(key)
+        if existing is None:
+            self._segment_verifications[key] = {
+                "deadline": now + float(duration),
+                "next": now + 0.05,
+                "delay": 0.08,
+            }
+            return
+        existing["deadline"] = max(
+            float(existing.get("deadline", 0.0)), now + float(duration)
+        )
+        existing["next"] = min(float(existing.get("next", now)), now + 0.05)
+        existing["delay"] = min(float(existing.get("delay", 0.08)), 0.08)
+
+    def _queue_due_segment_verifications(self, now):
+        """Queue sparse trailing comparisons until an interactive edit settles."""
+        for key, state in list(self._segment_verifications.items()):
+            if now < float(state.get("next", 0.0)):
+                continue
+            self.dirty_segments.add(key)
+            if now >= float(state.get("deadline", 0.0)):
+                self._segment_verifications.pop(key, None)
+                continue
+            delay = min(max(float(state.get("delay", 0.08)) * 2.0, 0.12), 0.60)
+            state["delay"] = delay
+            state["next"] = now + delay
+
     def _probe_selected_segment_revision(self):
         """Catch interactive edits whose normal segmentation event is delayed."""
         if self._applying_remote or not self.initial_sync_complete:
@@ -3935,6 +4059,7 @@ class LiveCollaborationController:
         self._segment_revisions[key] = revision
         if previous is not None and revision != previous:
             self.dirty_segments.add(key)
+            self._schedule_segment_verification(key)
             self._force_sync_refresh = True
 
     def _stop_shared_folder_watcher(self):
@@ -4037,7 +4162,9 @@ class LiveCollaborationController:
             # label. Preserve compatibility by checking all labels only then.
             candidates = current_ids
         for candidate in candidates:
-            self.dirty_segments.add((node.GetID(), candidate))
+            key = (node.GetID(), candidate)
+            self.dirty_segments.add(key)
+            self._schedule_segment_verification(key)
         if ids_changed or bool(segment_id):
             self._refresh_label_combo()
             self._update_lock_controls()
@@ -4211,8 +4338,6 @@ class LiveCollaborationController:
         if not self.initial_sync_complete:
             return
         for key in list(self.dirty_segments):
-            if key in self.outgoing_keys:
-                continue
             node = slicer.mrmlScene.GetNodeByID(key[0])
             if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
                 self.dirty_segments.discard(key)
@@ -4244,12 +4369,18 @@ class LiveCollaborationController:
                     current_crop, current_bounds, self.volume_shape
                 )
             else:
-                encoded = encode_mask_crop_delta(
+                pending_operations = [
+                    operation
+                    for operation in [*self.awaiting_echo, *self.outgoing]
+                    if str(operation.get("segment_id") or "") == key[1]
+                ]
+                encoded = encode_mask_crop_delta_after_operations(
                     previous,
                     current_crop,
                     current_bounds,
                     self.baseline_bounds.get(key),
                     self.volume_shape,
+                    pending_operations,
                 )
             if encoded is None:
                 self.dirty_segments.discard(key)
@@ -4318,6 +4449,7 @@ class LiveCollaborationController:
         self._drain_worker_results()
         self._probe_selected_segment_revision()
         now = time.time()
+        self._queue_due_segment_verifications(time.monotonic())
 
         force_sync = bool(self._force_sync_refresh)
         force_realtime = bool(self._force_realtime_refresh)
@@ -5135,15 +5267,30 @@ class LiveCollaborationController:
             sent_ids = set(result.get("outgoing_ids") or [])
             if sent_ids:
                 retained = []
+                sent_operations = []
                 self.outgoing_keys.clear()
                 for operation in self.outgoing:
-                    if operation["client_operation_id"] not in sent_ids:
+                    operation_id = operation["client_operation_id"]
+                    if operation_id not in sent_ids:
                         retained.append(operation)
+                    else:
+                        sent_operations.append(operation)
                 self.outgoing = retained
                 for operation in retained:
                     self.outgoing_keys.add(
                         (self.segmentation_node_id, operation["segment_id"])
                     )
+                awaiting_ids = {
+                    operation["client_operation_id"]
+                    for operation in self.awaiting_echo
+                }
+                for operation in sent_operations:
+                    operation_id = operation["client_operation_id"]
+                    if operation_id in self._applied_local_operation_ids:
+                        self._applied_local_operation_ids.discard(operation_id)
+                    elif operation_id not in awaiting_ids:
+                        self.awaiting_echo.append(operation)
+                        awaiting_ids.add(operation_id)
             sent_chat_ids = set(result.get("chat_ids") or [])
             if sent_chat_ids:
                 self.pending_chat = [
@@ -5306,7 +5453,8 @@ class LiveCollaborationController:
                 self.last_diagnostics = dict(value or {})
                 self.last_diagnostics.update(
                     {
-                        "pending_operations": len(self.outgoing),
+                        "pending_operations": len(self.outgoing)
+                        + len(self.awaiting_echo),
                         "dirty_segments": len(self.dirty_segments),
                         "pending_chat_messages": len(self.pending_chat),
                         "connection_healthy": bool(self.connection_healthy),
@@ -5814,6 +5962,24 @@ class LiveCollaborationController:
                         f"{operation.get('segment_name') or segment_id}",
                         1800,
                     )
+                else:
+                    operation_id = str(operation.get("client_operation_id") or "")
+                    if operation_id:
+                        awaiting_count = len(self.awaiting_echo)
+                        self.awaiting_echo = [
+                            queued
+                            for queued in self.awaiting_echo
+                            if queued.get("client_operation_id") != operation_id
+                        ]
+                        if len(self.awaiting_echo) == awaiting_count and any(
+                            queued.get("client_operation_id") == operation_id
+                            for queued in self.outgoing
+                        ):
+                            # The pull lane can observe the server echo before the
+                            # push lane result is drained.  Remember that ordering
+                            # so the sent patch is not re-added to awaiting_echo.
+                            self._applied_local_operation_ids.add(operation_id)
+                    self._schedule_segment_verification(key, duration=0.8)
                 self.last_sequence = sequence
             except Exception as exc:
                 self._show_error(f"Could not apply live edit {sequence}: {exc}")
