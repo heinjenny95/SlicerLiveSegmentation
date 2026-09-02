@@ -1,4 +1,39 @@
-# Live Segmentation 0.11.1
+# Live Segmentation 0.11.2
+
+Version 0.11.2 synchronizes deletion of complete Slicer labels. Removing a
+segment on one participant now removes that MRML segment for every participant
+instead of leaving stale labels on peers.
+
+## Ordered label-deletion tombstones
+
+- Slicer's `SegmentRemoved` event is converted into a small ordered tombstone
+  carrying the deleted segment ID, name, color, author, and room sequence.
+- The receiver removes the complete segment and clears its local baseline,
+  verification, lock, and review state. An empty but intentionally retained
+  label remains distinct from a deleted label.
+- Tombstones are supported by both shared-folder and optional server transports,
+  remain visible as `label deleted` entries in the permanent activity timeline,
+  and participate in semantic concurrent-edit conflict detection.
+- Historical reconstruction tracks label lifetime: a deleted label is absent at
+  later revisions, while a deliberately recreated label with the same ID can
+  appear again as a later ordered operation.
+- Shared-folder rooms migrate from protocol schema 1 to schema 2 on first join.
+  The room records 0.11.2 as its minimum plugin version so older clients stop
+  clearly rather than silently displaying a label they cannot delete.
+
+## Verification
+
+- Four deletion and migration regressions increase the automated suite to 42
+  tests; Ruff and Python compilation also pass.
+- A real Slicer 5.12.3 smoke test confirms local removal publication, application
+  of a peer deletion to the MRML scene, deletion-aware historical state, and
+  continued absence after a clean leave/rejoin. The same run retained 24/24
+  rapid component voxels and restored the remaining label exactly at 51/51
+  voxels with a 0.172-second initial edit publication.
+
+---
+
+# Previous release: Live Segmentation 0.11.1
 
 Version 0.11.1 prevents a recoverable Windows/SMB read gap from briefly flashing
 an otherwise healthy shared-folder room offline.

@@ -33,6 +33,10 @@ def operation_overlap_count(first, second, decode_mask_delta):
     """Return changed-voxel overlap for two operations in global IJK space."""
     if str(first.get("segment_id")) != str(second.get("segment_id")):
         return 0
+    # Deleting a label conflicts semantically with every concurrent edit of
+    # that label, even though the compact tombstone has no changed mask voxels.
+    if first.get("segment_deleted") or second.get("segment_deleted"):
+        return 1
     first_bounds = [int(value) for value in first["voxel_bbox"]]
     second_bounds = [int(value) for value in second["voxel_bbox"]]
     overlap = (
@@ -70,6 +74,7 @@ def operation_summary(operation, decode_mask_delta=None):
         "snapshot_group_id": operation.get("snapshot_group_id"),
         "snapshot_label": operation.get("snapshot_label"),
         "system_snapshot": bool(operation.get("system_snapshot", False)),
+        "segment_deleted": bool(operation.get("segment_deleted", False)),
         "client_operation_id": operation.get("client_operation_id"),
     }
     if operation.get("changed_voxels") is not None:
@@ -90,8 +95,12 @@ def reconstruct_snapshot_operations(
     """Reconstruct all known segments at a historical global sequence."""
     ordered = sorted(operations, key=lambda item: int(item.get("sequence", 0)))
     metadata = {}
-    shapes = {}
+    masks = {}
+    active_segments = set()
+    target_sequence = int(target_sequence)
     for operation in ordered:
+        if int(operation.get("sequence", 0)) > target_sequence:
+            break
         segment_id = str(operation.get("segment_id") or "")
         if not segment_id:
             continue
@@ -100,20 +109,18 @@ def reconstruct_snapshot_operations(
             "segment_name": operation.get("segment_name") or segment_id,
             "color_hex": operation.get("color_hex") or "#4A90E2",
         }
-        shapes[segment_id] = tuple(int(value) for value in operation["volume_shape"])
-    masks = {
-        segment_id: np.zeros(shape, dtype=np.uint8)
-        for segment_id, shape in shapes.items()
-    }
-    target_sequence = int(target_sequence)
-    for operation in ordered:
-        if int(operation.get("sequence", 0)) > target_sequence:
-            break
-        segment_id = str(operation.get("segment_id") or "")
-        if segment_id in masks:
-            masks[segment_id] = apply_mask_delta(masks[segment_id], operation)
+        if operation.get("segment_deleted"):
+            masks.pop(segment_id, None)
+            active_segments.discard(segment_id)
+            continue
+        shape = tuple(int(value) for value in operation["volume_shape"])
+        current = masks.get(segment_id)
+        if current is None or current.shape != shape:
+            current = np.zeros(shape, dtype=np.uint8)
+        masks[segment_id] = apply_mask_delta(current, operation)
+        active_segments.add(segment_id)
     result = []
-    for segment_id in sorted(masks, key=str.casefold):
+    for segment_id in sorted(active_segments, key=str.casefold):
         empty = np.zeros_like(masks[segment_id])
         encoded = encode_mask_delta(empty, masks[segment_id], replace=True)
         if encoded is None:

@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.2.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.2`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -49,6 +49,12 @@ Every participant joining an existing room receives a clean local replica that
 is rebuilt from the room history with identical segment IDs. A local node exists
 on each computer because Slicer scenes are local, but they represent and update
 the same room segmentation.
+
+Version 0.11.2 adds the first structural room operation: deleting a complete
+label removes it for every participant and from reconstructed/rejoined room
+state. All participants in a shared-folder room must update to 0.11.2; joining
+an older room upgrades its protocol metadata so earlier clients fail clearly
+instead of silently retaining deleted labels.
 
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
@@ -85,7 +91,7 @@ to the same voxel, the operation ordered later by the shared transport wins.
 - **Roles and review:** rooms support viewer, editor, reviewer, and administrator
   roles. Labels progress through draft, in-progress, review, changes-requested,
   and approved states; approval locks the reviewed label.
-- **Live activity and version timeline:** label creation and editing entries
+- **Live activity and version timeline:** label creation, editing, and deletion entries
   appear as soon as their ordered operation arrives (for example,
   `07:34 Jenny created label “Label 1”`). A selected revision can be restored as
   a new append-only revision, so no history is silently rewritten.
@@ -177,7 +183,7 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 38 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
+- 42 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel
@@ -199,6 +205,9 @@ legacy shared API key does not verify individual identities.
 - The full advanced Slicer smoke test passed rich presence, spatial chat,
   templates, review/access requests, snapshot compaction, conflict detection,
   diagnostics, backup verification, connection recovery, and clean rejoin.
+- A real Slicer 5.12.3 deletion smoke test confirmed that local label removal
+  publishes a tombstone, a peer deletion removes the complete MRML segment,
+  historical reconstruction excludes it, and it remains absent after rejoin.
 
 Use only an institutionally approved shared folder with suitable access
 controls. Segmentation changes may themselves represent sensitive research or

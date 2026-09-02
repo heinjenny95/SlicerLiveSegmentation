@@ -61,7 +61,8 @@ except ImportError:  # regular-Python transport tests import this file directly
     )
 
 LIVE_ENCODING = "zlib-packbits-v1"
-SHARED_FOLDER_SCHEMA_VERSION = 1
+SHARED_FOLDER_SCHEMA_VERSION = 2
+SHARED_FOLDER_MINIMUM_PLUGIN_VERSION = "0.11.2"
 MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
@@ -1261,6 +1262,8 @@ class SharedFolderRoomClient:
             else:
                 metadata = {
                     "schema_version": SHARED_FOLDER_SCHEMA_VERSION,
+                    "minimum_plugin_version": SHARED_FOLDER_MINIMUM_PLUGIN_VERSION,
+                    "capabilities": ["segment-deletion-tombstone-v1"],
                     "name": str(room_name).strip(),
                     "room_id": room_key,
                     "volume_signature": str(signature),
@@ -1270,7 +1273,17 @@ class SharedFolderRoomClient:
                 _write_json_atomic(metadata_path, metadata)
                 created = True
 
-        if int(metadata.get("schema_version", 0)) != SHARED_FOLDER_SCHEMA_VERSION:
+        schema_version = int(metadata.get("schema_version", 0))
+        if schema_version == 1:
+            metadata = {
+                **metadata,
+                "schema_version": SHARED_FOLDER_SCHEMA_VERSION,
+                "minimum_plugin_version": SHARED_FOLDER_MINIMUM_PLUGIN_VERSION,
+                "capabilities": ["segment-deletion-tombstone-v1"],
+            }
+            _write_json_atomic(metadata_path, metadata)
+            schema_version = SHARED_FOLDER_SCHEMA_VERSION
+        if schema_version != SHARED_FOLDER_SCHEMA_VERSION:
             raise LiveCollaborationError("Unsupported shared-room format")
         self._room_id = room_key
         self._room_path = room_path
@@ -1296,7 +1309,10 @@ class SharedFolderRoomClient:
     ):
         conflicts = []
         segment_id = str(operation.get("segment_id") or "")
-        if base_sequence > 0 and operation.get("operation_kind") != "snapshot":
+        if base_sequence > 0 and (
+            operation.get("operation_kind") != "snapshot"
+            or operation.get("segment_deleted")
+        ):
             for previous in self.operations(room_id, base_sequence, limit=5000):
                 previous_sequence = int(previous.get("sequence", 0))
                 if previous_sequence <= base_sequence or previous_sequence >= sequence:
@@ -2694,6 +2710,8 @@ class LiveCollaborationController:
         self.awaiting_echo = []
         self._applied_local_operation_ids = set()
         self._known_segment_ids = set()
+        self._segment_metadata = {}
+        self.pending_segment_deletions = {}
         self._observed_node = None
         self._observed_segmentation = None
         self._observer_tags = []
@@ -3883,6 +3901,8 @@ class LiveCollaborationController:
             self.outgoing_keys.clear()
             self.awaiting_echo.clear()
             self._applied_local_operation_ids.clear()
+            self._segment_metadata.clear()
+            self.pending_segment_deletions.clear()
             self._segment_revisions.clear()
             self._segment_verifications.clear()
             self.last_chat_sequence = 0
@@ -3942,6 +3962,8 @@ class LiveCollaborationController:
             self._observe_segmentation(segmentation_node)
             self._arm_shared_folder_watcher()
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
+            for segment_id in self._known_segment_ids:
+                self._remember_segment_metadata(segmentation_node, segment_id)
             if self.initial_sync_complete:
                 self._initialize_baselines_and_seed(
                     seed=bool(room.get("created"))
@@ -4065,6 +4087,8 @@ class LiveCollaborationController:
         self.outgoing_keys.clear()
         self.awaiting_echo.clear()
         self._applied_local_operation_ids.clear()
+        self._segment_metadata.clear()
+        self.pending_segment_deletions.clear()
         self._segment_revisions.clear()
         self._segment_verifications.clear()
         self._known_segment_ids.clear()
@@ -4247,6 +4271,26 @@ class LiveCollaborationController:
         key = (node.GetID(), str(segment_id))
         self._segment_revisions[key] = self._segment_revision(node, segment_id)
 
+    def _remember_segment_metadata(self, node, segment_id):
+        """Cache display metadata while a segment still exists.
+
+        Slicer's SegmentRemoved callback runs after the segment object has gone,
+        so a deletion tombstone must use metadata captured earlier.
+        """
+        segment_id = str(segment_id or "")
+        if node is None or not segment_id:
+            return self._segment_metadata.get(segment_id)
+        segment = node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return self._segment_metadata.get(segment_id)
+        metadata = {
+            "segment_id": segment_id,
+            "segment_name": segment.GetName() or segment_id,
+            "color_hex": self._segment_color_hex(segment),
+        }
+        self._segment_metadata[segment_id] = metadata
+        return metadata
+
     def _schedule_segment_verification(self, key, duration=2.0):
         """Recheck a recently edited label after early Segment Editor events."""
         now = time.monotonic()
@@ -4375,16 +4419,38 @@ class LiveCollaborationController:
         if node is None:
             return
         current_ids = set(node.GetSegmentation().GetSegmentIDs())
-        ids_changed = current_ids != self._known_segment_ids
-        for added_segment_id in current_ids - self._known_segment_ids:
+        previous_ids = set(self._known_segment_ids)
+        added_ids = current_ids - previous_ids
+        removed_ids = previous_ids - current_ids
+        ids_changed = bool(added_ids or removed_ids)
+        for current_segment_id in current_ids:
+            self._remember_segment_metadata(node, current_segment_id)
+        for added_segment_id in added_ids:
             self.force_snapshots.add((node.GetID(), added_segment_id))
             self.segment_owners.setdefault(added_segment_id, self.user_name)
+        for removed_segment_id in removed_ids:
+            key = (node.GetID(), removed_segment_id)
+            metadata = dict(
+                self._segment_metadata.get(removed_segment_id)
+                or {
+                    "segment_id": removed_segment_id,
+                    "segment_name": removed_segment_id,
+                    "color_hex": "#4A90E2",
+                }
+            )
+            if self.initial_sync_complete:
+                self.pending_segment_deletions[removed_segment_id] = metadata
+            self.dirty_segments.discard(key)
+            self.force_snapshots.discard(key)
+            self._segment_revisions.pop(key, None)
+            self._segment_verifications.pop(key, None)
         self._known_segment_ids = current_ids
         candidates = set()
         segment_id = str(segment_id or "")
+        removal_event = segment_id in removed_ids
         if segment_id in current_ids:
             candidates.add(segment_id)
-        if not candidates:
+        if not candidates and not removal_event:
             try:
                 selected_node, selected_segment_id = (
                     self.owner.get_selected_segmentation_node_and_segment_id()
@@ -4393,7 +4459,7 @@ class LiveCollaborationController:
                     candidates.add(str(selected_segment_id))
             except Exception:
                 pass
-        if not candidates:
+        if not candidates and not removal_event:
             # Non-interactive modules may not expose an active Segment Editor
             # label. Preserve compatibility by checking all labels only then.
             candidates = current_ids
@@ -4411,6 +4477,7 @@ class LiveCollaborationController:
         if node is None:
             return
         for segment_id in node.GetSegmentation().GetSegmentIDs():
+            self._remember_segment_metadata(node, segment_id)
             key = (node.GetID(), segment_id)
             crop, bounds = self._read_mask_crop(node, segment_id)
             if seed:
@@ -4590,6 +4657,39 @@ class LiveCollaborationController:
 
         if not self.initial_sync_complete:
             return
+        node = self._segmentation_node()
+        for segment_id, metadata in list(self.pending_segment_deletions.items()):
+            key = (self.segmentation_node_id, segment_id)
+            baseline = self.baselines.get(key)
+            if self._current_role() == "viewer" or self._locked_by_other(segment_id):
+                if node is not None:
+                    self._applying_remote = True
+                    try:
+                        self._ensure_segment(node, metadata)
+                    finally:
+                        self._applying_remote = False
+                    self._restore_locked_segment(node, segment_id, baseline)
+                    self._known_segment_ids.add(segment_id)
+                    self._remember_segment_metadata(node, segment_id)
+                self.pending_segment_deletions.pop(segment_id, None)
+                continue
+            encoded = encode_mask_crop_snapshot(None, None, self.volume_shape)
+            operation = {
+                "client_operation_id": str(uuid.uuid4()),
+                "segment_id": segment_id,
+                "segment_name": metadata.get("segment_name") or segment_id,
+                "color_hex": metadata.get("color_hex") or "#4A90E2",
+                "base_sequence": int(self.last_sequence),
+                "segment_deleted": True,
+                **encoded,
+            }
+            self.outgoing.append(operation)
+            self.outgoing_keys.add(key)
+            self.pending_segment_deletions.pop(segment_id, None)
+            self.baselines.pop(key, None)
+            self.baseline_bounds.pop(key, None)
+            self._segment_revisions.pop(key, None)
+            self._segment_verifications.pop(key, None)
         for key in list(self.dirty_segments):
             node = slicer.mrmlScene.GetNodeByID(key[0])
             if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
@@ -5845,13 +5945,19 @@ class LiveCollaborationController:
                 activity_type = "checkpoint"
                 if record.get("snapshot_label"):
                     action += f" “{record.get('snapshot_label')}”"
+            elif record.get("segment_deleted"):
+                action = f"{author} deleted label “{segment_name}”"
+                activity_type = "label deleted"
             elif segment_id not in known_segments:
                 action = f"{author} created label “{segment_name}”"
                 activity_type = "label created"
             else:
                 action = f"{author} edited label “{segment_name}”"
                 activity_type = str(record.get("operation_kind") or "patch")
-            known_segments.add(segment_id)
+            if record.get("segment_deleted"):
+                known_segments.discard(segment_id)
+            else:
+                known_segments.add(segment_id)
             item = qt.QTreeWidgetItem(
                 [
                     self._local_clock_text(record.get("created_at"), include_seconds=True),
@@ -6126,7 +6232,27 @@ class LiveCollaborationController:
                 segment.SetColor(*(int(color[index : index + 2], 16) / 255.0 for index in (0, 2, 4)))
             except Exception:
                 pass
+        self._remember_segment_metadata(node, segment_id)
         return segment
+
+    def _acknowledge_local_operation(self, operation):
+        operation_id = str(operation.get("client_operation_id") or "")
+        if not operation_id:
+            return
+        awaiting_count = len(self.awaiting_echo)
+        self.awaiting_echo = [
+            queued
+            for queued in self.awaiting_echo
+            if queued.get("client_operation_id") != operation_id
+        ]
+        if len(self.awaiting_echo) == awaiting_count and any(
+            queued.get("client_operation_id") == operation_id
+            for queued in self.outgoing
+        ):
+            # The pull lane can observe the server echo before the push lane
+            # result is drained. Remember that ordering so the sent operation
+            # is not re-added to awaiting_echo.
+            self._applied_local_operation_ids.add(operation_id)
 
     def _apply_operations(self, operations):
         import slicer
@@ -6142,6 +6268,40 @@ class LiveCollaborationController:
             try:
                 segment_id = operation["segment_id"]
                 key = (node.GetID(), segment_id)
+                if operation.get("segment_deleted"):
+                    self._segment_metadata[segment_id] = {
+                        "segment_id": segment_id,
+                        "segment_name": operation.get("segment_name") or segment_id,
+                        "color_hex": operation.get("color_hex") or "#4A90E2",
+                    }
+                    self._applying_remote = True
+                    try:
+                        if node.GetSegmentation().GetSegment(segment_id) is not None:
+                            node.GetSegmentation().RemoveSegment(segment_id)
+                    finally:
+                        self._applying_remote = False
+                    self.baselines.pop(key, None)
+                    self.baseline_bounds.pop(key, None)
+                    self.dirty_segments.discard(key)
+                    self.force_snapshots.discard(key)
+                    self.pending_segment_deletions.pop(segment_id, None)
+                    self._segment_revisions.pop(key, None)
+                    self._segment_verifications.pop(key, None)
+                    self._known_segment_ids.discard(segment_id)
+                    self.pending_lock_changes.pop(segment_id, None)
+                    self.segment_locks_state.pop(segment_id, None)
+                    self.review_states_state.pop(segment_id, None)
+                    node.Modified()
+                    if operation.get("author") != self.user_name:
+                        slicer.util.showStatusMessage(
+                            f"Live: {operation.get('author')} deleted label "
+                            f"{operation.get('segment_name') or segment_id}",
+                            2500,
+                        )
+                    else:
+                        self._acknowledge_local_operation(operation)
+                    self.last_sequence = sequence
+                    continue
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
                 operation_bounds = [
@@ -6290,22 +6450,7 @@ class LiveCollaborationController:
                         1800,
                     )
                 else:
-                    operation_id = str(operation.get("client_operation_id") or "")
-                    if operation_id:
-                        awaiting_count = len(self.awaiting_echo)
-                        self.awaiting_echo = [
-                            queued
-                            for queued in self.awaiting_echo
-                            if queued.get("client_operation_id") != operation_id
-                        ]
-                        if len(self.awaiting_echo) == awaiting_count and any(
-                            queued.get("client_operation_id") == operation_id
-                            for queued in self.outgoing
-                        ):
-                            # The pull lane can observe the server echo before the
-                            # push lane result is drained.  Remember that ordering
-                            # so the sent patch is not re-added to awaiting_echo.
-                            self._applied_local_operation_ids.add(operation_id)
+                    self._acknowledge_local_operation(operation)
                     self._schedule_segment_verification(key, duration=0.8)
                 self.last_sequence = sequence
             except Exception as exc:

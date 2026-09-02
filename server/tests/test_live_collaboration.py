@@ -39,6 +39,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from features import (  # noqa: E402
     build_invitation,
     parse_invitation,
+    reconstruct_snapshot_operations,
     validate_material_template,
 )
 
@@ -50,6 +51,17 @@ def operation_payload(segment_id, previous, current, replace=False, operation_id
         "segment_name": segment_id,
         "color_hex": "#37E8B8",
         **encode_mask_delta(previous, current, replace=replace),
+    }
+
+
+def deletion_payload(segment_id, shape, operation_id="delete-segment-1"):
+    return {
+        "client_operation_id": operation_id,
+        "segment_id": segment_id,
+        "segment_name": segment_id,
+        "color_hex": "#37E8B8",
+        "segment_deleted": True,
+        **encode_mask_crop_snapshot(None, None, shape),
     }
 
 
@@ -139,6 +151,46 @@ def test_empty_snapshot_clears_without_a_full_volume_payload():
     snapshot = encode_mask_delta(empty, empty, replace=True)
     assert snapshot["voxel_bbox"] == [0, 1, 0, 1, 0, 1]
     assert np.array_equal(apply_mask_delta(local, snapshot), empty)
+
+
+def test_historical_reconstruction_removes_and_can_recreate_a_deleted_label():
+    shape = (4, 4, 4)
+    empty = np.zeros(shape, dtype=np.uint8)
+    mask = empty.copy()
+    mask[1:3, 1:3, 1:3] = 1
+    created = {
+        **operation_payload("Organ", empty, mask, replace=True),
+        "sequence": 1,
+        "author": "alice",
+    }
+    deleted = {
+        **deletion_payload("Organ", shape),
+        "sequence": 2,
+        "author": "alice",
+    }
+    recreated = {
+        **operation_payload(
+            "Organ", empty, mask, replace=True, operation_id="recreate-segment-1"
+        ),
+        "sequence": 3,
+        "author": "bob",
+    }
+
+    before_delete = reconstruct_snapshot_operations(
+        [created, deleted, recreated], 1, apply_mask_delta, encode_mask_delta
+    )
+    after_delete = reconstruct_snapshot_operations(
+        [created, deleted, recreated], 2, apply_mask_delta, encode_mask_delta
+    )
+    after_recreate = reconstruct_snapshot_operations(
+        [created, deleted, recreated], 3, apply_mask_delta, encode_mask_delta
+    )
+
+    assert [item["segment_id"] for item in before_delete] == ["Organ"]
+    assert after_delete == []
+    assert [item["segment_id"] for item in after_recreate] == ["Organ"]
+    restored = apply_mask_delta(empty, after_recreate[0])
+    assert np.array_equal(restored, mask)
 
 
 def test_cropped_delta_only_compares_effective_segment_region():
@@ -438,6 +490,41 @@ def test_live_room_join_ordered_idempotent_operations_and_presence(client, heade
     assert presence["bob"]["active_segment_name"] == "Tumor"
 
 
+def test_server_transport_preserves_label_deletion_tombstone(client, headers):
+    joined = client.post(
+        "/api/live/rooms/join",
+        headers=headers,
+        json={"room_name": "Deletion API", "volume_signature": "d" * 64},
+    )
+    assert joined.status_code == 200
+    room_id = joined.json()["id"]
+    empty = np.zeros((3, 3, 3), dtype=np.uint8)
+    mask = empty.copy()
+    mask[1, 1, 1] = 1
+    created = client.post(
+        f"/api/live/rooms/{room_id}/operations",
+        headers=headers,
+        json=operation_payload("Organ", empty, mask, operation_id="api-create-organ"),
+    )
+    assert created.status_code == 201, created.text
+    deleted = client.post(
+        f"/api/live/rooms/{room_id}/operations",
+        headers=headers,
+        json={
+            **deletion_payload("Organ", empty.shape, "api-delete-organ"),
+            "base_sequence": 1,
+        },
+    )
+    assert deleted.status_code == 201, deleted.text
+
+    operations = client.get(
+        f"/api/live/rooms/{room_id}/operations?after=0", headers=headers
+    ).json()
+    assert [item["sequence"] for item in operations] == [1, 2]
+    assert operations[0]["segment_deleted"] is False
+    assert operations[1]["segment_deleted"] is True
+
+
 def test_shared_folder_room_orders_operations_and_retries_idempotently(tmp_path):
     signature = "c" * 64
     alice = SharedFolderRoomClient(tmp_path, "alice")
@@ -471,12 +558,65 @@ def test_shared_folder_room_orders_operations_and_retries_idempotently(tmp_path)
     assert np.array_equal(reconstructed, combined)
 
 
+def test_shared_folder_deletion_is_live_historical_and_persistent_on_rejoin(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("deletion room", "e" * 64)
+    bob.join("deletion room", "e" * 64)
+    shape = (4, 4, 4)
+    empty = np.zeros(shape, dtype=np.uint8)
+    mask = empty.copy()
+    mask[1:3, 1:3, 1:3] = 1
+    alice.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, mask, operation_id="shared-create-organ"),
+    )
+    alice.push_operation(
+        room["id"],
+        {
+            **deletion_payload("Organ", shape, "shared-delete-organ"),
+            "base_sequence": 1,
+        },
+    )
+
+    operations = bob.operations(room["id"], 0)
+    assert [bool(item.get("segment_deleted")) for item in operations] == [False, True]
+    assert [item["segment_id"] for item in bob.state_at_sequence(room["id"], 1)] == [
+        "Organ"
+    ]
+    assert bob.state_at_sequence(room["id"], 2) == []
+    assert bob.room_history(room["id"])[-1]["segment_deleted"] is True
+
+    charlie = SharedFolderRoomClient(tmp_path, "charlie")
+    rejoined = charlie.join("deletion room", "e" * 64)
+    assert rejoined["latest_sequence"] == 2
+    assert charlie.operations(rejoined["id"], 0)[-1]["segment_deleted"] is True
+
+
 def test_shared_folder_room_rejects_a_different_source_volume(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "alice")
     bob = SharedFolderRoomClient(tmp_path, "bob")
     alice.join("specimen mismatch", "d" * 64)
     with pytest.raises(LiveCollaborationError, match="different source volume"):
         bob.join("SPECIMEN MISMATCH", "e" * 64)
+
+
+def test_shared_folder_upgrades_old_room_before_deletion_capability_is_used(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    alice.join("legacy room", "f" * 64)
+    metadata_path = alice._room_path / "room.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = 1
+    metadata.pop("minimum_plugin_version", None)
+    metadata.pop("capabilities", None)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    bob.join("legacy room", "f" * 64)
+    upgraded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert upgraded["schema_version"] == 2
+    assert upgraded["minimum_plugin_version"] == "0.11.2"
+    assert "segment-deletion-tombstone-v1" in upgraded["capabilities"]
 
 
 def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):

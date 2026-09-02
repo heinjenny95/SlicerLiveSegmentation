@@ -169,12 +169,12 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 38,
+            "automated_tests": 42,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
                 "backups-history-chunked-snapshot-conflict-review-diagnostics-"
-                "connection-recovery-exact-rejoin"
+                "connection-recovery-label-deletion-exact-rejoin"
             ),
             "two_process_slicer_live_sync_test": (
                 "passed-two-slicer-256-cubed-bidirectional-rapid-three-component-"

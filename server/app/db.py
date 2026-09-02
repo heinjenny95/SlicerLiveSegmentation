@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS live_operations (
     snapshot_group_count INTEGER,
     system_snapshot INTEGER NOT NULL DEFAULT 0,
     snapshot_label TEXT,
+    segment_deleted INTEGER NOT NULL DEFAULT 0,
     changed_voxels INTEGER,
     created_at TEXT NOT NULL,
     UNIQUE (room_id, author, client_operation_id)
@@ -149,6 +150,12 @@ class Database:
             self._ensure_column(connection, "live_operations", "snapshot_group_count", "INTEGER")
             self._ensure_column(connection, "live_operations", "system_snapshot", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "live_operations", "snapshot_label", "TEXT")
+            self._ensure_column(
+                connection,
+                "live_operations",
+                "segment_deleted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             self._ensure_column(connection, "live_operations", "changed_voxels", "INTEGER")
             self._ensure_column(connection, "live_chat_messages", "anchor", "TEXT")
             self._ensure_column(connection, "live_segment_locks", "expires_at", "TEXT")

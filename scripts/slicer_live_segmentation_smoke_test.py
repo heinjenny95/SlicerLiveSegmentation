@@ -679,6 +679,116 @@ def run_probe():
                 "valid_mrb": True,
             }
 
+        deletion_sync = None
+        deleted_probe_ids = ("LocalDeletionProbe", "RemoteDeletionProbe")
+        if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_DELETION", "0") == "1":
+            if not hasattr(controller.client, "_room_path"):
+                raise RuntimeError("Label deletion smoke test requires shared-folder mode")
+            from LiveSegmentationLib.collaboration import (
+                SharedFolderRoomClient,
+                encode_mask_crop_snapshot,
+            )
+
+            local_delete_id, remote_delete_id = deleted_probe_ids
+            segmentation.GetSegmentation().AddEmptySegment(
+                local_delete_id, "Local deletion probe"
+            )
+            deadline = time.time() + 8
+            local_create_sequence = 0
+            while time.time() < deadline:
+                pump_events(0.12)
+                for item in controller.client.operations(controller.room_id, 0):
+                    if (
+                        item.get("segment_id") == local_delete_id
+                        and not item.get("segment_deleted")
+                    ):
+                        local_create_sequence = int(item["sequence"])
+                if local_create_sequence:
+                    break
+            if not local_create_sequence:
+                raise RuntimeError("Locally created deletion probe did not synchronize")
+            segmentation.GetSegmentation().RemoveSegment(local_delete_id)
+            deadline = time.time() + 8
+            local_delete_sequence = 0
+            while time.time() < deadline:
+                pump_events(0.12)
+                for item in controller.client.operations(
+                    controller.room_id, local_create_sequence
+                ):
+                    if item.get("segment_id") == local_delete_id and item.get(
+                        "segment_deleted"
+                    ):
+                        local_delete_sequence = int(item["sequence"])
+                if local_delete_sequence:
+                    break
+            if not local_delete_sequence:
+                raise RuntimeError("Local SegmentRemoved event did not publish a tombstone")
+
+            peer = SharedFolderRoomClient(
+                os.environ["LIVE_SEGMENTATION_SMOKE_SHARED_FOLDER"],
+                "deletion-peer-smoke",
+            )
+            room_metadata = json.loads(
+                controller.client._require_room(controller.room_id)
+                .joinpath("room.json")
+                .read_text(encoding="utf-8")
+            )
+            peer.join(room_name, room_metadata["volume_signature"])
+            remote_crop = np.ones((2, 2, 2), dtype=np.uint8)
+            remote_create = {
+                "client_operation_id": f"remote-create-{uuid.uuid4()}",
+                "segment_id": remote_delete_id,
+                "segment_name": "Remote deletion probe",
+                "color_hex": "#FFD23F",
+                "base_sequence": int(controller.last_sequence),
+                **encode_mask_crop_snapshot(
+                    remote_crop, [1, 3, 1, 3, 1, 3], image.shape
+                ),
+            }
+            remote_create_sequence = int(
+                peer.push_operation(controller.room_id, remote_create)["sequence"]
+            )
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                pump_events(0.12)
+                if segmentation.GetSegmentation().GetSegment(remote_delete_id) is not None:
+                    break
+            if segmentation.GetSegmentation().GetSegment(remote_delete_id) is None:
+                raise RuntimeError("Remote label creation did not reach the Slicer scene")
+            remote_delete = {
+                "client_operation_id": f"remote-delete-{uuid.uuid4()}",
+                "segment_id": remote_delete_id,
+                "segment_name": "Remote deletion probe",
+                "color_hex": "#FFD23F",
+                "base_sequence": remote_create_sequence,
+                "segment_deleted": True,
+                **encode_mask_crop_snapshot(None, None, image.shape),
+            }
+            remote_delete_sequence = int(
+                peer.push_operation(controller.room_id, remote_delete)["sequence"]
+            )
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                pump_events(0.12)
+                if segmentation.GetSegmentation().GetSegment(remote_delete_id) is None:
+                    break
+            if segmentation.GetSegmentation().GetSegment(remote_delete_id) is not None:
+                raise RuntimeError("Remote label deletion remained visible in Slicer")
+            if any(
+                item.get("segment_id") in deleted_probe_ids
+                for item in peer.state_at_sequence(
+                    controller.room_id, remote_delete_sequence
+                )
+            ):
+                raise RuntimeError("Deleted labels remained in reconstructed room state")
+            deletion_sync = {
+                "local_remove_published": True,
+                "remote_remove_applied": True,
+                "historical_state_excludes_deleted_labels": True,
+                "local_delete_sequence": local_delete_sequence,
+                "remote_delete_sequence": remote_delete_sequence,
+            }
+
         standard_segment_editor_node = editor.segmentationNode().GetID()
         lifecycle = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_LIFECYCLE", "0") == "1":
@@ -761,6 +871,11 @@ def run_probe():
                 timer_active = (
                     timer_active() if callable(timer_active) else bool(timer_active)
                 )
+            if deletion_sync and any(
+                rejoined.GetSegmentation().GetSegment(probe_id) is not None
+                for probe_id in deleted_probe_ids
+            ):
+                raise RuntimeError("A deleted label reappeared after leaving and rejoining")
                 queued_results = []
                 while not controller._worker_results.empty():
                     queued_results.append(controller._worker_results.get_nowait())
@@ -873,6 +988,7 @@ def run_probe():
             "collaboration_extras": collaboration_extras,
             "advanced_features": advanced_features,
             "connection_recovery": connection_recovery,
+            "deletion_sync": deletion_sync,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}

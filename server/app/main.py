@@ -40,6 +40,7 @@ def public_live_operation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["volume_shape"] = json.loads(data["volume_shape"])
     data["voxel_bbox"] = json.loads(data["voxel_bbox"])
     data["system_snapshot"] = bool(data.get("system_snapshot", False))
+    data["segment_deleted"] = bool(data.get("segment_deleted", False))
     return data
 
 
@@ -79,6 +80,8 @@ def changed_voxel_count(operation: dict[str, Any]) -> int:
 def operation_overlap(first: dict[str, Any], second: dict[str, Any]) -> int:
     if str(first.get("segment_id")) != str(second.get("segment_id")):
         return 0
+    if first.get("segment_deleted") or second.get("segment_deleted"):
+        return 1
     return len(changed_voxel_coordinates(first) & changed_voxel_coordinates(second))
 
 
@@ -97,7 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Live Segmentation Server",
-        version="0.11.1",
+        version="0.11.2",
         description="Optional relay for the Live Segmentation 3D Slicer extension.",
         lifespan=lifespan,
     )
@@ -352,9 +355,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         voxel_bbox, encoding, payload, base_sequence,
                         snapshot_group_id, snapshot_group_index,
                         snapshot_group_count, system_snapshot, snapshot_label,
+                        segment_deleted,
                         changed_voxels,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -375,6 +379,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         payload.snapshot_group_count,
                         int(payload.system_snapshot),
                         payload.snapshot_label,
+                        int(payload.segment_deleted),
                         changed_voxels,
                         iso_now(),
                     ),
