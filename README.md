@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.5.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.6.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.5`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.6`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -93,6 +93,14 @@ targets as soon as Slicer imports the module, before widget setup. The Windows
 installer adds a **Live Segmentation Safe Start** shortcut that ignores saved
 settings and the user startup script for that launch, so a damaged or stale
 normal Slicer profile cannot prevent access to the plugin.
+
+Version 0.11.6 adds a safe recent-folder dropdown. The active shared-folder
+field still starts empty, but its dropdown offers up to eight locations that
+previously completed a successful connection. Loading or opening the dropdown
+only reads local text settings and never probes those network paths. Selecting
+an entry copies it into the field; network access starts only after **Join live
+room**. Failed locations are not remembered, and **Clear list** removes the
+local history.
 
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`

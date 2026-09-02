@@ -61,6 +61,7 @@ def run_probe():
             "LiveSegmentation/collaboration/transport",
             "LiveSegmentation/collaboration/sharedFolder",
             "LiveSegmentation/collaboration/server",
+            "LiveSegmentation/collaboration/recentSharedFolders",
         )
         for key in keys:
             settings_snapshot[key] = (
@@ -70,6 +71,20 @@ def run_probe():
         startup_reset_probe = (
             os.environ.get("LIVE_SEGMENTATION_SMOKE_STARTUP_RESET", "0") == "1"
         )
+        recent_folders_probe = (
+            os.environ.get("LIVE_SEGMENTATION_SMOKE_RECENT_FOLDERS", "0") == "1"
+        )
+        recent_folders_result = None
+        seeded_recent_folders = [
+            r"\\history.invalid\recent-one",
+            r"Z:\recent-two",
+        ]
+        if recent_folders_probe:
+            settings.setValue(
+                "LiveSegmentation/collaboration/recentSharedFolders",
+                json.dumps(seeded_recent_folders),
+            )
+            settings.sync()
         if startup_reset_probe:
             settings.setValue(
                 "LiveSegmentation/collaboration/sharedFolder",
@@ -110,6 +125,23 @@ def run_probe():
             ):
                 if settings.contains(key):
                     raise RuntimeError(f"Startup kept stale connection setting: {key}")
+        if recent_folders_probe:
+            if controller._text(controller.shared_folder_edit):
+                raise RuntimeError("Recent-folder history populated the active path at startup")
+            dropdown_count = controller.shared_folder_edit.count
+            if callable(dropdown_count):
+                dropdown_count = dropdown_count()
+            history_items = [
+                str(controller.shared_folder_edit.itemText(index))
+                for index in range(dropdown_count)
+            ]
+            if history_items != seeded_recent_folders:
+                raise RuntimeError(f"Recent-folder dropdown mismatch: {history_items}")
+            controller.shared_folder_edit.setCurrentIndex(0)
+            if controller._text(controller.shared_folder_edit) != seeded_recent_folders[0]:
+                raise RuntimeError("Recent-folder dropdown selection did not populate the path")
+            controller.shared_folder_edit.setCurrentIndex(-1)
+            controller.shared_folder_edit.setEditText("")
         controller.backup_enabled_checkbox.checked = False
 
         widget.source_volume_selector.setCurrentNode(volume)
@@ -126,7 +158,7 @@ def run_probe():
             if not shared_folder:
                 raise RuntimeError("LIVE_SEGMENTATION_SMOKE_SHARED_FOLDER is required")
             controller.transport_combo.setCurrentIndex(0)
-            controller.shared_folder_edit.setText(shared_folder)
+            controller.shared_folder_edit.setEditText(shared_folder)
         elif transport == "server":
             controller.transport_combo.setCurrentIndex(1)
             controller.server_edit.setText("http://127.0.0.1:8000")
@@ -186,7 +218,7 @@ def run_probe():
             finally:
                 collaboration_module.SharedFolderRoomClient.join = original_join
                 collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = original_timeout
-            controller.shared_folder_edit.setText(shared_folder)
+            controller.shared_folder_edit.setEditText(shared_folder)
             controller.user_edit.setText(user_name)
             controller.room_edit.setText(room_name)
 
@@ -224,11 +256,37 @@ def run_probe():
             finally:
                 collaboration_module.SharedFolderRoomClient.join = original_join
             controller.leave()
-            controller.shared_folder_edit.setText(shared_folder)
+            controller.shared_folder_edit.setEditText(shared_folder)
             controller.user_edit.setText(user_name)
             controller.room_edit.setText(room_name)
         controller.join()
         wait_for_connection(controller)
+        if recent_folders_probe and transport == "shared-folder":
+            expected_current = str(Path(shared_folder).resolve())
+            stored_history = json.loads(
+                str(
+                    settings.value(
+                        "LiveSegmentation/collaboration/recentSharedFolders", "[]"
+                    )
+                )
+            )
+            dropdown_count = controller.shared_folder_edit.count
+            if callable(dropdown_count):
+                dropdown_count = dropdown_count()
+            dropdown_history = [
+                str(controller.shared_folder_edit.itemText(index))
+                for index in range(dropdown_count)
+            ]
+            if stored_history[0] != expected_current or dropdown_history != stored_history:
+                raise RuntimeError(
+                    f"Successful shared folder was not promoted in history: {stored_history}"
+                )
+            recent_folders_result = {
+                "startup_path_empty": True,
+                "selectable_history": seeded_recent_folders,
+                "successful_path_promoted": True,
+                "stored_count": len(stored_history),
+            }
         segmentation = controller._segmentation_node()
         if segmentation is None:
             raise RuntimeError("The room did not provide a shared segmentation node")
@@ -804,7 +862,7 @@ def run_probe():
                 # platform detail part of the connection-recovery assertion.
                 shutil.copytree(unavailable_path, room_path, dirs_exist_ok=True)
             controller.transport_combo.setCurrentIndex(0)
-            controller.shared_folder_edit.setText(shared_root)
+            controller.shared_folder_edit.setEditText(shared_root)
             controller.user_edit.setText(reconnect_user)
             controller.room_edit.setText(reconnect_room)
             controller.join()
@@ -1177,6 +1235,7 @@ def run_probe():
             "async_timeout": async_timeout_probe,
             "delayed_join": delayed_join_probe,
             "slow_watchdog": slow_watchdog_probe,
+            "recent_shared_folders": recent_folders_result,
             "async_leave": async_leave_probe,
         }
     except Exception as exc:

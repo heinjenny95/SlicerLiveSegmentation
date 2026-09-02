@@ -1,5 +1,21 @@
 # Manual two-user acceptance test
 
+## Safe recent shared-folder dropdown
+
+1. In a normal Slicer profile, join a room through a reachable shared folder
+   and then leave the room.
+2. Restart Slicer normally. Verify the active **Shared folder** field is empty
+   and startup does not wait for or contact the previous location.
+3. Open the dropdown and verify the successfully used path is listed. Select it
+   and verify it is copied into the active field without starting a connection.
+4. Click **Join live room** and verify only then does the extension access the
+   location. Reusing a path must move it to the top of the list.
+5. Attempt a failed or timed-out connection and verify that location is not
+   added to the dropdown.
+6. Verify at most eight unique entries are kept and **Clear list** removes them.
+7. Launch **Live Segmentation Safe Start** and verify its isolated settings do
+   not expose or probe the normal profile's recent-folder history.
+
 ## Slow first network access
 
 1. Disconnect an existing Windows connection to the test share or use a UNC

@@ -28,11 +28,13 @@ from collaboration import (  # noqa: E402
     _is_transient_shared_read_error,
     _read_json_file,
     apply_mask_delta,
+    decode_recent_shared_folders,
     encode_chunked_mask_snapshot,
     encode_mask_crop_delta,
     encode_mask_crop_delta_after_operations,
     encode_mask_crop_snapshot,
     encode_mask_delta,
+    update_recent_shared_folders,
     volume_signature,
 )
 from fastapi.testclient import TestClient  # noqa: E402
@@ -66,6 +68,33 @@ def test_shared_folder_watchdog_warns_before_it_disconnects():
     assert state(10.0) == "slow"
     assert state(29.999) == "slow"
     assert state(30.0) == "offline"
+
+
+def test_recent_shared_folder_history_is_bounded_and_does_not_touch_paths():
+    raw = json.dumps(
+        [
+            r"\\server\share",
+            r"C:/research/live",
+            r"c:\research\live",
+            "",
+            "/mnt/case-sensitive",
+            "/mnt/Case-sensitive",
+        ]
+    )
+    assert decode_recent_shared_folders(raw, limit=4) == [
+        r"\\server\share",
+        r"C:/research/live",
+        "/mnt/case-sensitive",
+        "/mnt/Case-sensitive",
+    ]
+
+
+def test_recent_shared_folder_history_moves_successful_path_to_front():
+    assert update_recent_shared_folders(
+        [r"\\server\old", r"D:\shared"],
+        r"d:/shared",
+        limit=2,
+    ) == [r"d:/shared", r"\\server\old"]
 
 
 def deletion_payload(segment_id, shape, operation_id="delete-segment-1"):

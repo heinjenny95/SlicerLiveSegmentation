@@ -1,4 +1,37 @@
-# Live Segmentation 0.11.5
+# Live Segmentation 0.11.6
+
+Version 0.11.6 restores convenient access to previously used collaboration
+locations without reintroducing network-dependent Slicer startup.
+
+## Safe recent-folder history
+
+- **Shared folder** is now an editable dropdown containing up to eight paths
+  whose connection and room health check completed successfully.
+- The active path still starts empty after every normal Slicer launch. Building
+  and opening the dropdown reads only local settings; it does not resolve,
+  enumerate, or probe any saved network location.
+- Selecting an entry only copies its text into the field. Access to the shared
+  folder begins after the user clicks **Join live room** and remains cancellable
+  on a background lane.
+- Failed or timed-out paths are never added. Reusing a successful path moves it
+  to the top, Windows paths are de-duplicated case-insensitively, and **Clear
+  list** removes the local history.
+- Safe Start continues to use isolated settings, so it intentionally does not
+  import the normal profile's recent-folder list.
+
+## Verification
+
+- 47 automated tests cover the bounded and de-duplicated history helpers as
+  well as the existing live/slow/offline, transport, deletion, backup, and
+  collaboration behavior.
+- A real Slicer 5.12.3 smoke test verifies blank startup state, dropdown
+  selection, successful-path promotion, and persistence without startup path
+  access. Ruff, Python compilation, release validation, normal launch, and Safe
+  Start regression checks remain part of the release process.
+
+---
+
+# Previous release: Live Segmentation 0.11.5
 
 Version 0.11.5 fixes a false active-session disconnect that could still occur
 when a reachable shared folder or a large local segmentation update took more

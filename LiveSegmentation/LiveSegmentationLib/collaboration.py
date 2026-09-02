@@ -75,6 +75,7 @@ SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 15.0
 SHARED_FOLDER_SLOW_RESPONSE_SECONDS = 10.0
 SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 30.0
+RECENT_SHARED_FOLDER_LIMIT = 8
 
 
 def shared_folder_response_state(elapsed_seconds):
@@ -85,6 +86,49 @@ def shared_folder_response_state(elapsed_seconds):
     if elapsed >= SHARED_FOLDER_SLOW_RESPONSE_SECONDS:
         return "slow"
     return "live"
+
+
+def decode_recent_shared_folders(value, limit=RECENT_SHARED_FOLDER_LIMIT):
+    """Return a bounded, de-duplicated path history without touching the paths."""
+    if value is None:
+        candidates = []
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            decoded = [value]
+        candidates = decoded if isinstance(decoded, list) else []
+    else:
+        try:
+            candidates = list(value)
+        except TypeError:
+            candidates = []
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if not path:
+            continue
+        windows_like = path.startswith("\\\\") or bool(re.match(r"^[A-Za-z]:[\\/]", path))
+        key = path.replace("/", "\\").casefold() if windows_like else path
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+        if len(result) >= max(0, int(limit)):
+            break
+    return result
+
+
+def update_recent_shared_folders(existing, selected, limit=RECENT_SHARED_FOLDER_LIMIT):
+    """Move a successfully used path to the front of the local history."""
+    selected = str(selected or "").strip()
+    if not selected:
+        return decode_recent_shared_folders(existing, limit)
+    return decode_recent_shared_folders(
+        [selected, *decode_recent_shared_folders(existing, limit)], limit
+    )
 
 
 class LiveCollaborationError(RuntimeError):
@@ -2832,6 +2876,9 @@ class LiveCollaborationController:
         default_transport = "shared-folder"
         default_shared_folder = ""
         default_server = "http://127.0.0.1:8000"
+        recent_shared_folders = decode_recent_shared_folders(
+            settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]")
+        )
 
         self.group = qt.QGroupBox("Live collaboration")
         layout = qt.QVBoxLayout(self.group)
@@ -2859,12 +2906,30 @@ class LiveCollaborationController:
         self.shared_folder_widget = qt.QWidget()
         shared_folder_layout = qt.QHBoxLayout(self.shared_folder_widget)
         shared_folder_layout.setContentsMargins(0, 0, 0, 0)
-        self.shared_folder_edit = qt.QLineEdit(default_shared_folder)
-        self.shared_folder_edit.setPlaceholderText(r"e.g. P:\LiveSegmentation or \\server\share")
+        self.shared_folder_edit = qt.QComboBox()
+        self.shared_folder_edit.setEditable(True)
+        self.shared_folder_edit.setInsertPolicy(qt.QComboBox.NoInsert)
+        self.shared_folder_edit.setMaxVisibleItems(RECENT_SHARED_FOLDER_LIMIT)
+        self.shared_folder_edit.addItems(recent_shared_folders)
+        self.shared_folder_edit.setCurrentIndex(-1)
+        self.shared_folder_edit.setEditText(default_shared_folder)
+        self.shared_folder_edit.lineEdit().setPlaceholderText(
+            r"e.g. P:\LiveSegmentation or \\server\share"
+        )
+        self.shared_folder_edit.setToolTip(
+            "Choose a recently successful shared folder or enter a new path. "
+            "The field always starts empty and the saved list is not accessed until you join."
+        )
         self.shared_folder_button = qt.QPushButton("Browse…")
         self.shared_folder_button.clicked.connect(self.choose_shared_folder)
+        self.shared_folder_clear_button = qt.QPushButton("Clear list")
+        self.shared_folder_clear_button.setToolTip(
+            "Forget the locally stored recent shared-folder paths"
+        )
+        self.shared_folder_clear_button.clicked.connect(self.clear_recent_shared_folders)
         shared_folder_layout.addWidget(self.shared_folder_edit, 1)
         shared_folder_layout.addWidget(self.shared_folder_button)
+        shared_folder_layout.addWidget(self.shared_folder_clear_button)
         identity_layout.addRow(self.shared_folder_label, self.shared_folder_widget)
         layout.addLayout(identity_layout)
 
@@ -3196,8 +3261,12 @@ class LiveCollaborationController:
 
     @staticmethod
     def _text(widget):
-        value = widget.text
-        return str(value() if callable(value) else value).strip()
+        for attribute in ("currentText", "text"):
+            if not hasattr(widget, attribute):
+                continue
+            value = getattr(widget, attribute)
+            return str(value() if callable(value) else value).strip()
+        return ""
 
     def _transport_mode(self):
         index = self.transport_combo.currentIndex
@@ -3231,7 +3300,36 @@ class LiveCollaborationController:
             "",
         )
         if selected:
-            self.shared_folder_edit.setText(str(selected))
+            self.shared_folder_edit.setEditText(str(selected))
+
+    def clear_recent_shared_folders(self, checked=False):
+        del checked
+        import qt
+
+        self.shared_folder_edit.clear()
+        self.shared_folder_edit.setCurrentIndex(-1)
+        self.shared_folder_edit.setEditText("")
+        settings = qt.QSettings()
+        settings.remove(self.SETTINGS_PREFIX + "recentSharedFolders")
+        settings.sync()
+
+    def _remember_recent_shared_folder(self, path):
+        import qt
+
+        settings = qt.QSettings()
+        recent = update_recent_shared_folders(
+            settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]"),
+            path,
+        )
+        settings.setValue(
+            self.SETTINGS_PREFIX + "recentSharedFolders",
+            json.dumps(recent, ensure_ascii=False),
+        )
+        settings.sync()
+        self.shared_folder_edit.clear()
+        self.shared_folder_edit.addItems(recent)
+        self.shared_folder_edit.setCurrentIndex(0 if recent else -1)
+        self.shared_folder_edit.setEditText(recent[0] if recent else "")
 
     def toggle_connection(self, checked=False):
         del checked
@@ -3292,7 +3390,8 @@ class LiveCollaborationController:
         shared_folder_session = isinstance(self.client, SharedFolderRoomClient)
         self.leave(notify_remote=False)
         if shared_folder_session:
-            self.shared_folder_edit.clear()
+            self.shared_folder_edit.setCurrentIndex(-1)
+            self.shared_folder_edit.setEditText("")
         self._show_error(
             f"{message} The live session was reset locally; choose a reachable "
             "shared folder or server and join again.",
@@ -3876,7 +3975,7 @@ class LiveCollaborationController:
             self.room_edit.setText(invitation["room_name"])
             if invitation["transport"] == "shared-folder":
                 self.transport_combo.setCurrentIndex(0)
-                self.shared_folder_edit.setText(invitation["location"])
+                self.shared_folder_edit.setEditText(invitation["location"])
             else:
                 self.transport_combo.setCurrentIndex(1)
                 self.server_edit.setText(invitation["location"])
@@ -3894,6 +3993,7 @@ class LiveCollaborationController:
         self.transport_combo.enabled = enabled
         self.shared_folder_edit.enabled = enabled
         self.shared_folder_button.enabled = enabled
+        self.shared_folder_clear_button.enabled = enabled
         self.server_edit.enabled = enabled
         self.api_key_edit.enabled = enabled
 
@@ -4146,6 +4246,8 @@ class LiveCollaborationController:
             settings.sync()
             self._set_connection_inputs_enabled(False)
             shared_folder_room = isinstance(client, SharedFolderRoomClient)
+            if shared_folder_room:
+                self._remember_recent_shared_folder(str(client.shared_folder))
             self.backup_enabled_checkbox.enabled = shared_folder_room
             self._on_backup_settings_changed()
             self.owner.set_live_inputs_enabled(False)
@@ -4288,6 +4390,7 @@ class LiveCollaborationController:
         self.transport_combo.enabled = True
         self.shared_folder_edit.enabled = True
         self.shared_folder_button.enabled = True
+        self.shared_folder_clear_button.enabled = True
         self.server_edit.enabled = True
         self.api_key_edit.enabled = True
         self.backup_enabled_checkbox.enabled = True
@@ -4354,7 +4457,8 @@ class LiveCollaborationController:
                 settings.remove(self.SETTINGS_PREFIX + key)
             settings.sync()
             self.room_edit.clear()
-            self.shared_folder_edit.clear()
+            self.shared_folder_edit.setCurrentIndex(-1)
+            self.shared_folder_edit.setEditText("")
             self.server_edit.setText("http://127.0.0.1:8000")
             self.transport_combo.setCurrentIndex(0)
         except Exception:
