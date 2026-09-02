@@ -1,4 +1,30 @@
-# Live Segmentation 0.11.3
+# Live Segmentation 0.11.4
+
+Version 0.11.4 prevents slow but reachable institutional SMB shares from being
+reported as offline during connection setup or a brief live-session stall.
+
+## Network-latency tolerance
+
+- The non-blocking connection watchdog now allows 15 seconds instead of four.
+  The status line displays elapsed time while the background attempt is pending,
+  and **Cancel connection** remains available throughout.
+- Active shared-folder sessions now allow 10 seconds for a completed live-sync
+  request or read/write validation instead of disconnecting after three seconds.
+- All waits remain confined to daemon background lanes. The longer tolerance
+  therefore does not reintroduce the Slicer startup, folder-switching, shutdown,
+  or interface freezes fixed in version 0.11.3.
+- Timeout messages are generated from the configured watchdog values so the UI
+  cannot show stale hard-coded durations after future tuning.
+
+## Verification
+
+- Automated tests, Ruff, Python compilation, release-archive validation, and a
+  real Slicer connection-watchdog smoke test cover the longer deadlines while
+  retaining immediate local cancellation and shutdown.
+
+---
+
+# Previous release: Live Segmentation 0.11.3
 
 Version 0.11.3 prevents an unavailable SMB/UNC collaboration folder from
 freezing Slicer's interface, folder switching, or application shutdown.

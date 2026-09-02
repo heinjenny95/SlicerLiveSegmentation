@@ -54,6 +54,11 @@ def operation_payload(segment_id, previous, current, replace=False, operation_id
     }
 
 
+def test_shared_folder_watchdogs_allow_institutional_smb_latency():
+    assert collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS == 15.0
+    assert collaboration_module.SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS == 10.0
+
+
 def deletion_payload(segment_id, shape, operation_id="delete-segment-1"):
     return {
         "client_operation_id": operation_id,

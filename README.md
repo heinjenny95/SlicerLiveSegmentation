@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.3.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.4.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.3`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.4`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -67,6 +67,13 @@ replica from the Slicer scene. The user can immediately select another location
 or close Slicer even if Windows continues waiting on the old network path in a
 background daemon thread.
 
+Version 0.11.4 accommodates the cold-start latency of institutional SMB shares.
+The non-blocking connection watchdog now allows 15 seconds and shows elapsed
+time while connecting. Active shared-folder sessions allow 10 seconds for a
+live-sync or read/write-health response, preventing a single brief network stall
+from being mistaken for an outage while keeping the UI responsive and locally
+cancellable throughout.
+
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
 subdirectory containing room metadata, ordered voxel operations, and expiring
@@ -80,7 +87,7 @@ to the same voxel, the operation ordered later by the shared transport wins.
 ## Collaboration controls
 
 - **Connection monitoring:** every active room is checked continuously. Failed
-  shared-folder validation is reported and reset locally within three seconds;
+  shared-folder validation is reported and reset locally within ten seconds;
   the UI remains responsive and never silently reconnects at the next launch.
   Round trips of 2.5 seconds or more are marked as a slow connection. **Sync
   now** immediately requests participants, edits, chat, locks, and a health

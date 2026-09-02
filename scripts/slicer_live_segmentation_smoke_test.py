@@ -189,6 +189,44 @@ def run_probe():
             controller.shared_folder_edit.setText(shared_folder)
             controller.user_edit.setText(user_name)
             controller.room_edit.setText(room_name)
+
+        delayed_join_probe = None
+        delayed_join_seconds = float(
+            os.environ.get("LIVE_SEGMENTATION_SMOKE_DELAYED_JOIN_SECONDS", "0")
+        )
+        if transport == "shared-folder" and delayed_join_seconds > 0:
+            import LiveSegmentationLib.collaboration as collaboration_module
+
+            original_join = collaboration_module.SharedFolderRoomClient.join
+            delayed_room_name = f"{room_name}-delayed-join"
+            controller.room_edit.setText(delayed_room_name)
+
+            def delayed_join(client, delayed_room_name, delayed_signature):
+                time.sleep(delayed_join_seconds)
+                return original_join(client, delayed_room_name, delayed_signature)
+
+            collaboration_module.SharedFolderRoomClient.join = delayed_join
+            try:
+                started = time.monotonic()
+                controller.join()
+                wait_for_connection(controller, timeout=delayed_join_seconds + 8.0)
+                elapsed = time.monotonic() - started
+                if elapsed < delayed_join_seconds:
+                    raise RuntimeError("Delayed join completed before its simulated delay")
+                if elapsed >= collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS:
+                    raise RuntimeError("Delayed join exceeded the configured join watchdog")
+                delayed_join_probe = {
+                    "simulated_delay_seconds": delayed_join_seconds,
+                    "connected_after_seconds": round(elapsed, 3),
+                    "accepted_after_old_four_second_limit": delayed_join_seconds > 4.0,
+                    "ui_responsive": True,
+                }
+            finally:
+                collaboration_module.SharedFolderRoomClient.join = original_join
+            controller.leave()
+            controller.shared_folder_edit.setText(shared_folder)
+            controller.user_edit.setText(user_name)
+            controller.room_edit.setText(room_name)
         controller.join()
         wait_for_connection(controller)
         segmentation = controller._segmentation_node()
@@ -1099,6 +1137,7 @@ def run_probe():
             "deletion_sync": deletion_sync,
             "startup_reset": bool(startup_reset_probe),
             "async_timeout": async_timeout_probe,
+            "delayed_join": delayed_join_probe,
             "async_leave": async_leave_probe,
         }
     except Exception as exc:

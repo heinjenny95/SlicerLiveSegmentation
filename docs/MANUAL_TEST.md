@@ -1,5 +1,15 @@
 # Manual two-user acceptance test
 
+## Slow first network access
+
+1. Disconnect an existing Windows connection to the test share or use a UNC
+   path that has not yet been opened in the current Windows session.
+2. Start joining and verify that the interface remains responsive,
+   **Cancel connection** remains available, and the status line shows elapsed
+   seconds.
+3. A response after more than four but less than 15 seconds must still open the
+   room. Only 15 seconds without a response may cancel the local attempt.
+
 ## Preparation
 
 1. Create an empty folder in a shared location writable by both test users.

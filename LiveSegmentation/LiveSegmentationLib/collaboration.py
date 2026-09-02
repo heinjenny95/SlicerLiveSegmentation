@@ -68,8 +68,12 @@ RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
 SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
-SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 4.0
-SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 3.0
+# Institutional SMB shares may need several seconds for a cold DNS, VPN,
+# authentication, or Windows redirector reconnect.  Both deadlines are hard
+# watchdogs around background work, so increasing them never blocks Slicer's
+# GUI thread.
+SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 15.0
+SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 10.0
 
 
 class LiveCollaborationError(RuntimeError):
@@ -2744,6 +2748,7 @@ class LiveCollaborationController:
         self._join_worker = None
         self._joining = False
         self._join_started_at = 0.0
+        self._join_status_second = -1
         self._join_context = None
         self._worker_results = queue.Queue()
         self._last_presence_send = 0.0
@@ -3903,6 +3908,7 @@ class LiveCollaborationController:
         self._session_token += 1
         self._joining = False
         self._join_started_at = 0.0
+        self._join_status_second = -1
         self._join_context = None
         self._join_worker = None
         self.connection_healthy = False
@@ -3985,6 +3991,7 @@ class LiveCollaborationController:
             }
             self._joining = True
             self._join_started_at = time.monotonic()
+            self._join_status_second = -1
             self.connection_healthy = False
             self._worker_results = queue.Queue()
             self._set_connection_inputs_enabled(False)
@@ -4002,6 +4009,9 @@ class LiveCollaborationController:
             self._join_worker.start()
         except Exception as exc:
             self._joining = False
+            self._join_started_at = 0.0
+            self._join_status_second = -1
+            self._join_context = None
             self.connection_healthy = False
             self._set_connection_inputs_enabled(True)
             self.owner.set_live_inputs_enabled(True)
@@ -4020,6 +4030,7 @@ class LiveCollaborationController:
 
             self._joining = False
             self._join_started_at = 0.0
+            self._join_status_second = -1
             self._join_worker = None
             self._join_context = None
             self.client = client
@@ -4161,6 +4172,8 @@ class LiveCollaborationController:
         except Exception as exc:
             self._leave_client_in_background(client, room.get("id"))
             self._joining = False
+            self._join_started_at = 0.0
+            self._join_status_second = -1
             self.connected = False
             self.connection_healthy = False
             self._join_context = None
@@ -4182,6 +4195,7 @@ class LiveCollaborationController:
         segmentation_node_id = self.segmentation_node_id
         self._joining = False
         self._join_started_at = 0.0
+        self._join_status_second = -1
         self._join_context = None
         self._join_worker = None
         self.connected = False
@@ -4940,13 +4954,25 @@ class LiveCollaborationController:
         self._drain_worker_results()
         monotonic_now = time.monotonic()
         if self._joining:
+            elapsed = (
+                monotonic_now - self._join_started_at
+                if self._join_started_at
+                else 0.0
+            )
+            elapsed_second = max(0, int(elapsed))
+            if elapsed_second != self._join_status_second:
+                self._join_status_second = elapsed_second
+                self.status_label.setText(
+                    "● Connecting in background… "
+                    f"{elapsed_second} / {int(SHARED_FOLDER_JOIN_TIMEOUT_SECONDS)} s"
+                )
             if (
                 self._join_started_at
-                and monotonic_now - self._join_started_at
-                >= SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
+                and elapsed >= SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
             ):
                 self._cancel_join(
-                    "The collaboration location did not respond within 4 seconds. "
+                    "The collaboration location did not respond within "
+                    f"{int(SHARED_FOLDER_JOIN_TIMEOUT_SECONDS)} seconds. "
                     "The connection attempt was cancelled locally and will not be "
                     "retried automatically."
                 )
@@ -4960,7 +4986,8 @@ class LiveCollaborationController:
             >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS
         ):
             self._disconnect_for_connection_loss(
-                "The shared folder did not answer any live-sync request within 3 seconds."
+                "The shared folder did not answer any live-sync request within "
+                f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
             )
             return
         if (
@@ -4971,7 +4998,8 @@ class LiveCollaborationController:
             >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS
         ):
             self._disconnect_for_connection_loss(
-                "The shared folder could not pass a read/write health check within 3 seconds."
+                "The shared folder could not pass a read/write health check within "
+                f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
             )
             return
         self._probe_selected_segment_revision()
