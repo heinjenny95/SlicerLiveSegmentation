@@ -68,6 +68,8 @@ RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
 SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
+SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 4.0
+SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 3.0
 
 
 class LiveCollaborationError(RuntimeError):
@@ -1284,7 +1286,14 @@ class SharedFolderRoomClient:
             _write_json_atomic(metadata_path, metadata)
             schema_version = SHARED_FOLDER_SCHEMA_VERSION
         if schema_version != SHARED_FOLDER_SCHEMA_VERSION:
-            raise LiveCollaborationError("Unsupported shared-room format")
+            minimum_version = str(
+                metadata.get("minimum_plugin_version") or "a newer version"
+            )
+            raise LiveCollaborationError(
+                "This room uses a newer Live Segmentation format and requires "
+                f"plugin version {minimum_version} or newer. Update the plugin on "
+                "every computer before joining this room."
+            )
         self._room_id = room_key
         self._room_path = room_path
         self._segment_owners_cache = {}
@@ -2732,6 +2741,10 @@ class LiveCollaborationController:
         self._lock_set_worker = None
         self._lock_pull_worker = None
         self._maintenance_worker = None
+        self._join_worker = None
+        self._joining = False
+        self._join_started_at = 0.0
+        self._join_context = None
         self._worker_results = queue.Queue()
         self._last_presence_send = 0.0
         self._last_metadata_fetch = 0.0
@@ -2742,9 +2755,11 @@ class LiveCollaborationController:
         self._last_backup_check = 0.0
         self._last_error = None
         self._last_transport_warning = None
+        self._last_transport_result_at = 0.0
         self._session_token = 0
         self.connection_healthy = False
         self._connection_validation_pending = False
+        self._connection_validation_started_at = 0.0
         self._connection_error_popup_shown = False
         self._connection_error_dialog = None
         self._force_sync_refresh = False
@@ -2789,16 +2804,17 @@ class LiveCollaborationController:
 
         settings = qt.QSettings()
         default_user = str(settings.value(self.SETTINGS_PREFIX + "user", getpass.getuser()))
-        default_room = str(settings.value(self.SETTINGS_PREFIX + "room", ""))
-        default_transport = str(
-            settings.value(self.SETTINGS_PREFIX + "transport", "shared-folder")
-        )
-        default_shared_folder = str(
-            settings.value(self.SETTINGS_PREFIX + "sharedFolder", "")
-        )
-        default_server = str(
-            settings.value(self.SETTINGS_PREFIX + "server", "http://127.0.0.1:8000")
-        )
+        # Connection targets are deliberately session-only.  In particular, do
+        # not even copy a stale UNC path into a widget during startup: Windows
+        # and Qt may synchronously probe such a path while restoring UI state.
+        # Clearing legacy values here also makes crash recovery deterministic.
+        for key in ("room", "transport", "sharedFolder", "server"):
+            settings.remove(self.SETTINGS_PREFIX + key)
+        settings.sync()
+        default_room = ""
+        default_transport = "shared-folder"
+        default_shared_folder = ""
+        default_server = "http://127.0.0.1:8000"
 
         self.group = qt.QGroupBox("Live collaboration")
         layout = qt.QVBoxLayout(self.group)
@@ -3192,18 +3208,19 @@ class LiveCollaborationController:
         import qt
         import slicer
 
-        current = self._text(self.shared_folder_edit)
         selected = qt.QFileDialog.getExistingDirectory(
             slicer.util.mainWindow(),
             "Select shared/network folder",
-            current,
+            "",
         )
         if selected:
             self.shared_folder_edit.setText(str(selected))
 
     def toggle_connection(self, checked=False):
         del checked
-        if self.connected:
+        if self._joining:
+            self._cancel_join()
+        elif self.connected:
             self.leave()
         else:
             self.join()
@@ -3252,6 +3269,18 @@ class LiveCollaborationController:
         self.status_label.setText("● Syncing live state…")
         self.status_label.setStyleSheet("color: #b26a00;")
         self.on_timer()
+
+    def _disconnect_for_connection_loss(self, message):
+        message = str(message or "The collaboration location stopped responding")
+        shared_folder_session = isinstance(self.client, SharedFolderRoomClient)
+        self.leave(notify_remote=False)
+        if shared_folder_session:
+            self.shared_folder_edit.clear()
+        self._show_error(
+            f"{message} The live session was reset locally; choose a reachable "
+            "shared folder or server and join again.",
+            popup=True,
+        )
 
     def _setup_chat_dock(self):
         import qt
@@ -3841,11 +3870,84 @@ class LiveCollaborationController:
         except Exception as exc:
             self._show_error(f"Could not import invitation: {exc}", popup=True)
 
+    def _set_connection_inputs_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.user_edit.enabled = enabled
+        self.room_edit.enabled = enabled
+        self.transport_combo.enabled = enabled
+        self.shared_folder_edit.enabled = enabled
+        self.shared_folder_button.enabled = enabled
+        self.server_edit.enabled = enabled
+        self.api_key_edit.enabled = enabled
+
+    @staticmethod
+    def _leave_client_in_background(client, room_id):
+        if client is None or not room_id:
+            return
+
+        def leave_client():
+            try:
+                client.leave(room_id)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=leave_client,
+            name="LiveSegmentation-leave",
+            daemon=True,
+        ).start()
+
+    def _cancel_join(self, message=None):
+        if not self._joining:
+            return
+        self._session_token += 1
+        self._joining = False
+        self._join_started_at = 0.0
+        self._join_context = None
+        self._join_worker = None
+        self.connection_healthy = False
+        self._set_connection_inputs_enabled(True)
+        self.owner.set_live_inputs_enabled(True)
+        self.owner.set_live_session_active(False)
+        self.join_button.setText("Join live room")
+        if hasattr(self, "timer"):
+            self.timer.stop()
+        if message:
+            self._show_error(message, popup=True)
+        else:
+            self.status_label.setText("● Offline")
+            self.status_label.setStyleSheet("color: #777;")
+
+    def _join_lane(self, session_token, client, room_name, signature):
+        started = time.monotonic()
+        try:
+            room = client.join(room_name, signature)
+            client.health_check(room["id"])
+            self._worker_results.put(
+                {
+                    "lane": "join",
+                    "session_token": session_token,
+                    "client": client,
+                    "room": room,
+                    "duration": time.monotonic() - started,
+                }
+            )
+        except Exception as exc:
+            self._worker_results.put(
+                {
+                    "lane": "join",
+                    "session_token": session_token,
+                    "client": client,
+                    "error": str(exc),
+                    "duration": time.monotonic() - started,
+                }
+            )
+
     def join(self):
-        import qt
         import slicer
 
-        client = None
+        if self._joining:
+            return
         try:
             self._session_token += 1
             self._stop_shared_folder_watcher()
@@ -3875,21 +3977,57 @@ class LiveCollaborationController:
                     user_name,
                     self._text(self.api_key_edit),
                 )
-            self.status_label.setText("● Connecting…")
+            self._join_context = {
+                "user_name": user_name,
+                "room_name": room_name,
+                "transport_mode": transport_mode,
+                "volume_shape": tuple(int(value) for value in volume_array.shape),
+            }
+            self._joining = True
+            self._join_started_at = time.monotonic()
+            self.connection_healthy = False
+            self._worker_results = queue.Queue()
+            self._set_connection_inputs_enabled(False)
+            self.owner.set_live_inputs_enabled(False)
+            self.join_button.setText("Cancel connection")
+            self.status_label.setText("● Connecting in background…")
             self.status_label.setStyleSheet("color: #b26a00;")
-            slicer.app.processEvents()
-            room = client.join(room_name, signature)
-            client.health_check(room["id"])
+            self.timer.start()
+            self._join_worker = threading.Thread(
+                target=self._join_lane,
+                args=(self._session_token, client, room_name, signature),
+                name="LiveSegmentation-join",
+                daemon=True,
+            )
+            self._join_worker.start()
+        except Exception as exc:
+            self._joining = False
+            self.connection_healthy = False
+            self._set_connection_inputs_enabled(True)
+            self.owner.set_live_inputs_enabled(True)
+            self.owner.set_live_session_active(False)
+            self.join_button.setText("Join live room")
+            self._show_error(exc, popup=True)
+
+    def _finish_join(self, client, room):
+        import qt
+
+        context = dict(self._join_context or {})
+        try:
             segmentation_node = self.owner.prepare_shared_segmentation(room)
             if segmentation_node is None:
                 raise ValueError("Could not create the shared segmentation")
 
+            self._joining = False
+            self._join_started_at = 0.0
+            self._join_worker = None
+            self._join_context = None
             self.client = client
             self.room_id = room["id"]
             self.room_name = str(room["name"])
-            self.user_name = user_name
+            self.user_name = context["user_name"]
             self.segmentation_node_id = segmentation_node.GetID()
-            self.volume_shape = tuple(int(value) for value in volume_array.shape)
+            self.volume_shape = tuple(context["volume_shape"])
             self.last_sequence = 0
             self.initial_sequence = int(room.get("latest_sequence", 0))
             self.initial_sync_complete = self.initial_sequence == 0
@@ -3932,7 +4070,6 @@ class LiveCollaborationController:
             self._snapshot_requested = False
             self._snapshot_label = ""
             self._restoring_sequence = None
-            self._worker_results = queue.Queue()
             self._worker = None
             self._realtime_worker = None
             self._edit_push_worker = None
@@ -3956,23 +4093,20 @@ class LiveCollaborationController:
             self._force_advanced_refresh = True
             self._connection_error_popup_shown = False
             self._connection_validation_pending = False
+            self._connection_validation_started_at = 0.0
             self._last_transport_warning = None
+            self._last_transport_result_at = time.monotonic()
             self.connection_healthy = True
             self.connected = True
             self._observe_segmentation(segmentation_node)
-            self._arm_shared_folder_watcher()
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
             for segment_id in self._known_segment_ids:
                 self._remember_segment_metadata(segmentation_node, segment_id)
             if self.initial_sync_complete:
-                self._initialize_baselines_and_seed(
-                    seed=bool(room.get("created"))
-                )
+                self._initialize_baselines_and_seed(seed=bool(room.get("created")))
 
             settings = qt.QSettings()
-            settings.setValue(self.SETTINGS_PREFIX + "user", user_name)
-            settings.setValue(self.SETTINGS_PREFIX + "room", room_name)
-            settings.setValue(self.SETTINGS_PREFIX + "transport", transport_mode)
+            settings.setValue(self.SETTINGS_PREFIX + "user", self.user_name)
             settings.setValue(
                 self.SETTINGS_PREFIX + "automaticBackups",
                 bool(self.backup_enabled_checkbox.checked),
@@ -3985,19 +4119,8 @@ class LiveCollaborationController:
                 self.SETTINGS_PREFIX + "backupRetention",
                 int(self.backup_retention_spin.value),
             )
-            if transport_mode == "shared-folder":
-                settings.setValue(
-                    self.SETTINGS_PREFIX + "sharedFolder", str(client.shared_folder)
-                )
-            else:
-                settings.setValue(self.SETTINGS_PREFIX + "server", client.server_url)
-            self.user_edit.enabled = False
-            self.room_edit.enabled = False
-            self.transport_combo.enabled = False
-            self.shared_folder_edit.enabled = False
-            self.shared_folder_button.enabled = False
-            self.server_edit.enabled = False
-            self.api_key_edit.enabled = False
+            settings.sync()
+            self._set_connection_inputs_enabled(False)
             shared_folder_room = isinstance(client, SharedFolderRoomClient)
             self.backup_enabled_checkbox.enabled = shared_folder_room
             self._on_backup_settings_changed()
@@ -4035,41 +4158,46 @@ class LiveCollaborationController:
             self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
             self._update_presence(room.get("presence") or [])
             self.timer.start()
-            self.on_timer()
         except Exception as exc:
+            self._leave_client_in_background(client, room.get("id"))
+            self._joining = False
             self.connected = False
             self.connection_healthy = False
-            if client is not None:
-                try:
-                    if getattr(client, "_room_id", None):
-                        client.leave(getattr(client, "_room_id"))
-                except Exception:
-                    pass
+            self._join_context = None
+            self._set_connection_inputs_enabled(True)
+            self.owner.set_live_inputs_enabled(True)
+            self.owner.set_live_session_active(False)
+            self.join_button.setText("Join live room")
+            if hasattr(self, "timer"):
+                self.timer.stop()
             try:
                 self.owner.clear_live_segmentation()
             except Exception:
                 pass
-            self.owner.set_live_inputs_enabled(True)
-            self.owner.set_live_session_active(False)
             self._show_error(exc, popup=True)
 
-    def leave(self):
+    def leave(self, notify_remote=True):
         client = self.client
         room_id = self.room_id
         segmentation_node_id = self.segmentation_node_id
+        self._joining = False
+        self._join_started_at = 0.0
+        self._join_context = None
+        self._join_worker = None
         self.connected = False
         self.connection_healthy = False
         self._connection_validation_pending = False
+        self._connection_validation_started_at = 0.0
         self._session_token += 1
         if hasattr(self, "timer"):
             self.timer.stop()
         self._stop_shared_folder_watcher()
         self._unobserve_segmentation()
-        if client is not None and room_id:
-            try:
-                client.leave(room_id)
-            except Exception:
-                pass
+        if notify_remote:
+            # An unreachable SMB share may keep a filesystem call blocked for
+            # minutes.  Local teardown must always finish immediately; the
+            # courtesy presence/audit cleanup is best-effort on a daemon lane.
+            self._leave_client_in_background(client, room_id)
         self.client = None
         self.room_id = None
         self.room_name = None
@@ -4122,6 +4250,7 @@ class LiveCollaborationController:
         self._force_health_check = False
         self._force_advanced_refresh = False
         self._connection_error_popup_shown = False
+        self._last_transport_result_at = 0.0
         try:
             self.owner.clear_live_segmentation(segmentation_node_id)
         except Exception:
@@ -4189,6 +4318,19 @@ class LiveCollaborationController:
 
     def cleanup(self):
         self.leave()
+        try:
+            import qt
+
+            settings = qt.QSettings()
+            for key in ("room", "transport", "sharedFolder", "server"):
+                settings.remove(self.SETTINGS_PREFIX + key)
+            settings.sync()
+            self.room_edit.clear()
+            self.shared_folder_edit.clear()
+            self.server_edit.setText("http://127.0.0.1:8000")
+            self.transport_combo.setCurrentIndex(0)
+        except Exception:
+            pass
         if self.chat_dock is not None:
             self.chat_dock.setParent(None)
             self.chat_dock.deleteLater()
@@ -4349,41 +4491,22 @@ class LiveCollaborationController:
             return
         try:
             watcher.blockSignals(True)
-            paths = list(watcher.files()) + list(watcher.directories())
-            if paths:
-                watcher.removePaths(paths)
+            # Querying or removing a dead UNC path can block Qt's GUI thread.
+            # Destroying the watcher drops all registrations without touching
+            # the remote filesystem again.
             watcher.deleteLater()
         except Exception:
             pass
 
     def _arm_shared_folder_watcher(self):
-        """Watch the atomic hot feed and room directory for immediate SMB wakeups."""
-        if not isinstance(self.client, SharedFolderRoomClient) or not self.room_id:
-            return
-        try:
-            import qt
+        """Keep all shared-folder probing away from Qt's GUI thread.
 
-            if self._shared_folder_watcher is None:
-                watcher = qt.QFileSystemWatcher()
-                watcher.fileChanged.connect(self._on_shared_folder_changed)
-                watcher.directoryChanged.connect(self._on_shared_folder_changed)
-                self._shared_folder_watcher = watcher
-            watcher = self._shared_folder_watcher
-            room_path = Path(self.client._require_room(self.room_id))
-            candidates = [room_path, room_path / "sequence-state.json"]
-            watched = set(
-                str(path)
-                for path in list(watcher.files()) + list(watcher.directories())
-            )
-            missing = [
-                str(path)
-                for path in candidates
-                if path.exists() and str(path) not in watched
-            ]
-            if missing:
-                watcher.addPaths(missing)
-        except Exception:
-            return
+        QFileSystemWatcher can synchronously touch a disconnected SMB/UNC path
+        both when arming and when removing a watch.  The 75 ms timer already
+        drives background pull lanes, so a watcher is unnecessary for latency
+        and unsafe for application startup/shutdown.
+        """
+        self._stop_shared_folder_watcher()
 
     def _on_shared_folder_changed(self, path=None):
         del path
@@ -4814,12 +4937,46 @@ class LiveCollaborationController:
         return result
 
     def on_timer(self):
+        self._drain_worker_results()
+        monotonic_now = time.monotonic()
+        if self._joining:
+            if (
+                self._join_started_at
+                and monotonic_now - self._join_started_at
+                >= SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
+            ):
+                self._cancel_join(
+                    "The collaboration location did not respond within 4 seconds. "
+                    "The connection attempt was cancelled locally and will not be "
+                    "retried automatically."
+                )
+            return
         if not self.connected:
             return
-        self._drain_worker_results()
+        if (
+            isinstance(self.client, SharedFolderRoomClient)
+            and self._last_transport_result_at
+            and monotonic_now - self._last_transport_result_at
+            >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS
+        ):
+            self._disconnect_for_connection_loss(
+                "The shared folder did not answer any live-sync request within 3 seconds."
+            )
+            return
+        if (
+            isinstance(self.client, SharedFolderRoomClient)
+            and self._connection_validation_pending
+            and self._connection_validation_started_at
+            and monotonic_now - self._connection_validation_started_at
+            >= SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS
+        ):
+            self._disconnect_for_connection_loss(
+                "The shared folder could not pass a read/write health check within 3 seconds."
+            )
+            return
         self._probe_selected_segment_revision()
         now = time.time()
-        self._queue_due_segment_verifications(time.monotonic())
+        self._queue_due_segment_verifications(monotonic_now)
 
         force_sync = bool(self._force_sync_refresh)
         force_realtime = bool(self._force_realtime_refresh)
@@ -5602,12 +5759,33 @@ class LiveCollaborationController:
                 result = self._worker_results.get_nowait()
             except queue.Empty:
                 return
-            if (
-                result.get("session_token") != self._session_token
-                or not self.connected
-            ):
+            if result.get("lane") == "join":
+                if (
+                    result.get("session_token") != self._session_token
+                    or not self._joining
+                ):
+                    room = result.get("room") or {}
+                    self._leave_client_in_background(
+                        result.get("client"), room.get("id")
+                    )
+                    continue
+                if "error" in result:
+                    self._cancel_join(result["error"])
+                else:
+                    self._finish_join(result["client"], result["room"])
                 continue
+            if result.get("session_token") != self._session_token or not self.connected:
+                continue
+            self._last_transport_result_at = time.monotonic()
             if "error" in result:
+                if (
+                    isinstance(self.client, SharedFolderRoomClient)
+                    and result.get("lane") == "maintenance"
+                    and result.get("health_checked")
+                    and not result.get("health_ok")
+                ):
+                    self._disconnect_for_connection_loss(result["error"])
+                    return
                 if result.get("lane") == "maintenance" and (
                     result.get("health_ok") or not result.get("health_checked")
                 ):
@@ -5632,11 +5810,15 @@ class LiveCollaborationController:
                         "lane": str(result.get("lane") or "unknown"),
                         "observed_at": _utc_iso(),
                     }
+                    if not self._connection_validation_pending:
+                        self._connection_validation_started_at = time.monotonic()
                     self._connection_validation_pending = True
                     self._force_health_check = True
                     self._force_sync_refresh = True
                     self._force_realtime_refresh = True
                     continue
+                if not self._connection_validation_pending:
+                    self._connection_validation_started_at = time.monotonic()
                 self._connection_validation_pending = True
                 self._force_health_check = True
                 show_popup = not self._connection_error_popup_shown
@@ -5648,6 +5830,7 @@ class LiveCollaborationController:
             )
             if health_confirmed:
                 self._connection_validation_pending = False
+                self._connection_validation_started_at = 0.0
                 self.connection_healthy = True
                 self._connection_error_popup_shown = False
                 if self._connection_error_dialog is not None:

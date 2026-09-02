@@ -22,6 +22,17 @@ def pump_events(seconds):
         time.sleep(0.03)
 
 
+def wait_for_connection(controller, timeout=12.0):
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        pump_events(0.08)
+        controller.on_timer()
+        if controller.connected or not getattr(controller, "_joining", False):
+            break
+    if not controller.connected:
+        raise RuntimeError(controller._last_error or "Live room did not connect")
+
+
 def controller_workers(controller):
     return tuple(
         getattr(controller, name, None)
@@ -56,6 +67,17 @@ def run_probe():
                 bool(settings.contains(key)),
                 settings.value(key),
             )
+        startup_reset_probe = (
+            os.environ.get("LIVE_SEGMENTATION_SMOKE_STARTUP_RESET", "0") == "1"
+        )
+        if startup_reset_probe:
+            settings.setValue(
+                "LiveSegmentation/collaboration/sharedFolder",
+                r"\\offline.invalid\stale-share",
+            )
+            settings.setValue("LiveSegmentation/collaboration/room", "stale-room")
+            settings.setValue("LiveSegmentation/collaboration/transport", "shared-folder")
+            settings.sync()
 
         volume = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLScalarVolumeNode", "Live Segmentation smoke volume"
@@ -76,6 +98,18 @@ def run_probe():
         controller = widget.live_collaboration
         if controller is None or not hasattr(controller, "group"):
             raise RuntimeError("Live collaboration UI was not created")
+        if startup_reset_probe:
+            if controller._text(controller.shared_folder_edit) or controller._text(
+                controller.room_edit
+            ):
+                raise RuntimeError("Startup restored stale shared-folder session fields")
+            for key in (
+                "LiveSegmentation/collaboration/sharedFolder",
+                "LiveSegmentation/collaboration/room",
+                "LiveSegmentation/collaboration/transport",
+            ):
+                if settings.contains(key):
+                    raise RuntimeError(f"Startup kept stale connection setting: {key}")
         controller.backup_enabled_checkbox.checked = False
 
         widget.source_volume_selector.setCurrentNode(volume)
@@ -109,9 +143,54 @@ def run_probe():
             widget.segmentation_selector.setCurrentNode(None)
         controller.user_edit.setText(user_name)
         controller.room_edit.setText(room_name)
+        async_timeout_probe = None
+        if (
+            transport == "shared-folder"
+            and os.environ.get("LIVE_SEGMENTATION_SMOKE_ASYNC_TIMEOUT", "0") == "1"
+        ):
+            import LiveSegmentationLib.collaboration as collaboration_module
+
+            original_join = collaboration_module.SharedFolderRoomClient.join
+            original_timeout = collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
+            blocked_seconds = float(
+                os.environ.get("LIVE_SEGMENTATION_SMOKE_BLOCK_SECONDS", "2")
+            )
+
+            def blocked_join(_client, _room_name, _signature):
+                time.sleep(blocked_seconds)
+                raise RuntimeError("simulated blocked shared folder")
+
+            collaboration_module.SharedFolderRoomClient.join = blocked_join
+            collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 0.35
+            try:
+                started = time.monotonic()
+                controller.join()
+                returned_after = time.monotonic() - started
+                if returned_after >= 0.25:
+                    raise RuntimeError(
+                        f"Shared-folder join blocked the Slicer UI for {returned_after:.3f}s"
+                    )
+                deadline = time.time() + 1.2
+                while time.time() < deadline and controller._joining:
+                    pump_events(0.06)
+                    controller.on_timer()
+                if controller._joining or controller.connected:
+                    raise RuntimeError("Blocked shared-folder join was not cancelled locally")
+                if "cancelled locally" not in controller.status_label.text:
+                    raise RuntimeError("Join timeout did not produce a clear connection error")
+                async_timeout_probe = {
+                    "join_return_seconds": round(returned_after, 4),
+                    "cancelled_locally": True,
+                    "ui_responsive": True,
+                }
+            finally:
+                collaboration_module.SharedFolderRoomClient.join = original_join
+                collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = original_timeout
+            controller.shared_folder_edit.setText(shared_folder)
+            controller.user_edit.setText(user_name)
+            controller.room_edit.setText(room_name)
         controller.join()
-        if not controller.connected:
-            raise RuntimeError(controller._last_error or "Live room did not connect")
+        wait_for_connection(controller)
         segmentation = controller._segmentation_node()
         if segmentation is None:
             raise RuntimeError("The room did not provide a shared segmentation node")
@@ -615,6 +694,9 @@ def run_probe():
             if controller._connection_validation_pending or not controller.connection_healthy:
                 raise RuntimeError("A successful health probe did not confirm the live room")
             room_path = Path(controller.client._room_path)
+            shared_root = str(controller.client.shared_folder)
+            reconnect_room = str(controller.room_name)
+            reconnect_user = str(controller.user_name)
             unavailable_path = room_path.with_name(room_path.name + ".offline-test")
             # QFileSystemWatcher keeps a Windows directory handle open. The
             # interruption probe relies on renaming that directory, so use the
@@ -627,10 +709,10 @@ def run_probe():
                 deadline = time.time() + 8
                 while time.time() < deadline:
                     pump_events(0.15)
-                    if not controller.connection_healthy:
+                    if not controller.connected:
                         break
-                if controller.connection_healthy or "Connection problem" not in controller.status_label.text:
-                    raise RuntimeError("Interrupted share was still shown as online")
+                if controller.connected or "Connection problem" not in controller.status_label.text:
+                    raise RuntimeError("Interrupted share was not reset locally")
             finally:
                 controller.timer.stop()
                 deadline = time.time() + 5
@@ -645,20 +727,20 @@ def run_probe():
                 # Windows. Copying the probe room back avoids making that
                 # platform detail part of the connection-recovery assertion.
                 shutil.copytree(unavailable_path, room_path, dirs_exist_ok=True)
-                controller._arm_shared_folder_watcher()
-                controller.timer.start()
-            controller.refresh_now()
-            deadline = time.time() + 8
-            while time.time() < deadline:
-                pump_events(0.15)
-                if controller.connection_healthy and "Connection problem" not in controller.status_label.text:
-                    break
-            if not controller.connection_healthy:
-                raise RuntimeError("Connection did not recover after manual refresh")
+            controller.transport_combo.setCurrentIndex(0)
+            controller.shared_folder_edit.setText(shared_root)
+            controller.user_edit.setText(reconnect_user)
+            controller.room_edit.setText(reconnect_room)
+            controller.join()
+            wait_for_connection(controller)
+            segmentation = controller._segmentation_node()
+            if segmentation is None:
+                raise RuntimeError("Manual rejoin did not recreate the shared segmentation")
             connection_recovery = {
                 "transient_read_tolerated": True,
                 "offline_detected": True,
-                "manual_recovery": True,
+                "session_reset_locally": True,
+                "manual_rejoin": True,
             }
 
         backup = None
@@ -823,11 +905,7 @@ def run_probe():
                 raise RuntimeError("Leaving did not clear Segment Editor label fields")
 
             controller.join()
-            if not controller.connected:
-                raise RuntimeError(
-                    "Rejoining the live room failed: "
-                    f"{controller._last_error or controller.status_label.text}"
-                )
+            wait_for_connection(controller)
             deadline = time.time() + 20
             rejoined_voxels = 0
             while time.time() < deadline:
@@ -964,6 +1042,36 @@ def run_probe():
                 f"Incremental removal kept {patch_voxels} voxels instead of 56"
             )
 
+        async_leave_probe = None
+        if (
+            controller.connected
+            and os.environ.get("LIVE_SEGMENTATION_SMOKE_ASYNC_LEAVE", "0") == "1"
+        ):
+            leave_client = controller.client
+
+            def blocked_leave(_room_id):
+                time.sleep(
+                    float(os.environ.get("LIVE_SEGMENTATION_SMOKE_BLOCK_SECONDS", "2"))
+                )
+                return {"left": True}
+
+            leave_client.leave = blocked_leave
+            started = time.monotonic()
+            controller.leave()
+            leave_returned_after = time.monotonic() - started
+            if leave_returned_after >= 0.25:
+                raise RuntimeError(
+                    "Leaving an unreachable shared folder blocked Slicer for "
+                    f"{leave_returned_after:.3f}s"
+                )
+            if controller.connected or controller._segmentation_node() is not None:
+                raise RuntimeError("Local leave did not immediately reset the live session")
+            async_leave_probe = {
+                "leave_return_seconds": round(leave_returned_after, 4),
+                "session_reset_locally": True,
+                "ui_responsive": True,
+            }
+
         return {
             "ok": True,
             "module_path": slicer.util.modulePath("LiveSegmentation"),
@@ -989,6 +1097,9 @@ def run_probe():
             "advanced_features": advanced_features,
             "connection_recovery": connection_recovery,
             "deletion_sync": deletion_sync,
+            "startup_reset": bool(startup_reset_probe),
+            "async_timeout": async_timeout_probe,
+            "async_leave": async_leave_probe,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}

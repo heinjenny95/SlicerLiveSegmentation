@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.2.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.3.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.2`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.3`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -56,6 +56,17 @@ state. All participants in a shared-folder room must update to 0.11.2; joining
 an older room upgrades its protocol metadata so earlier clients fail clearly
 instead of silently retaining deleted labels.
 
+Version 0.11.3 makes network failure safe for Slicer itself. Room names,
+shared-folder paths, and server targets are session-only; a launch starts with
+blank room/shared-folder fields and the neutral local-server default. Joining,
+leaving, and health checks never wait for an SMB
+or UNC path on the GUI thread. A connection attempt that does not answer within
+four seconds is cancelled locally; an active shared-folder session with no
+usable response for three seconds is reset locally, including removal of its
+replica from the Slicer scene. The user can immediately select another location
+or close Slicer even if Windows continues waiting on the old network path in a
+background daemon thread.
+
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
 subdirectory containing room metadata, ordered voxel operations, and expiring
@@ -68,11 +79,12 @@ to the same voxel, the operation ordered later by the shared transport wins.
 
 ## Collaboration controls
 
-- **Connection monitoring:** every active room is checked continuously. A failed
-  server or network-folder access immediately changes the status from green to
-  red and shows a clear error. Round trips of 2.5 seconds or more are marked as
-  a slow connection. **Sync now** immediately requests participants, edits,
-  chat, locks, and a health check without rescanning history or backups.
+- **Connection monitoring:** every active room is checked continuously. Failed
+  shared-folder validation is reported and reset locally within three seconds;
+  the UI remains responsive and never silently reconnects at the next launch.
+  Round trips of 2.5 seconds or more are marked as a slow connection. **Sync
+  now** immediately requests participants, edits, chat, locks, and a health
+  check without rescanning history or backups.
 - **Permanent room chat:** messages are stored in the room and reappear after
   leaving, restarting Slicer, or joining from another computer. Messages can
   carry a Slicer crosshair/slice location and jump collaborators directly there.
@@ -183,7 +195,7 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 42 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
+- 43 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel
@@ -194,7 +206,7 @@ legacy shared API key does not verify individual identities.
 - Two simultaneous Slicer processes on a 256×256×256 volume converged on 35/35
   voxels after a bidirectional edit and received all 24/24 voxels from three
   rapid disconnected additions to the same label.
-- A separate two-Slicer round trip through the real LSDF share published the
+- A separate two-Slicer round trip through an institutional SMB share published the
   sender edit in 0.343 seconds and applied it remotely in 0.448 seconds.
 - A joining client starts without a Segmentation node, receives the room node
   automatically, and the built-in Segment Editor edits that exact node.

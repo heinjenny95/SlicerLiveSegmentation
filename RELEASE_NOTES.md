@@ -1,4 +1,57 @@
-# Live Segmentation 0.11.2
+# Live Segmentation 0.11.3
+
+Version 0.11.3 prevents an unavailable SMB/UNC collaboration folder from
+freezing Slicer's interface, folder switching, or application shutdown.
+
+## Non-blocking connection lifecycle
+
+- Shared-folder and server joins now run on a daemon background lane. The Join
+  button returns immediately and becomes **Cancel connection** while the request
+  is pending.
+- A collaboration location that does not answer within four seconds is cancelled
+  locally. No blocked Windows filesystem call can hold Slicer's GUI thread.
+- Leaving a room clears the shared MRML replica, fields, chat, locks, and UI state
+  immediately. The optional remote presence/audit cleanup runs best-effort in a
+  daemon thread, so even an indefinitely blocked UNC call cannot prevent Slicer
+  from closing.
+- QFileSystemWatcher is no longer armed on shared folders. Its UNC registration
+  and removal methods could synchronously enter Windows networking code; the
+  existing 75 ms timer and independent background pull lanes retain live latency
+  without that risk.
+
+## Fast failure and clean restart
+
+- An active shared-folder room with no completed live request for three seconds
+  is declared unavailable and reset locally. A pending read/write validation
+  also has a three-second deadline even if another cached read still succeeds.
+- Room name, transport, shared-folder path, and server target are session-only.
+  Setup removes connection values saved by earlier releases and starts with blank
+  room/shared-folder fields plus the neutral local-server default, so Slicer never
+  probes or reconnects to the previous network path during startup. User name and
+  backup preferences remain saved.
+- The folder browser always opens from a local default instead of receiving the
+  previous UNC path as its initial directory.
+- Newer room schemas now explain the required minimum plugin version and state
+  explicitly that every participating computer must update. A 0.11.1 client will
+  still show its older generic text for a schema-2 room; installing 0.11.2 or
+  newer resolves that expected compatibility rejection.
+
+## Verification
+
+- 43 automated tests, Ruff, and Python compilation pass, including a new
+  future-room compatibility-message regression.
+- The complete Slicer 5.12.3 resilience run verifies startup removal of a stale
+  UNC setting, an immediately returning blocked join, cancellation by watchdog,
+  fast outage reset, manual rejoin, chat, locks, history, backups, deletion in
+  both directions, 24/24 rapid components, and exact 50/50-voxel leave/rejoin.
+- A dedicated shutdown run held both a join call and a leave call in simulated
+  60-second network waits. Join returned immediately, local leave completed in
+  0.015 seconds, the Slicer process exited after producing the test result, and
+  no new Slicer process remained.
+
+---
+
+# Previous release: Live Segmentation 0.11.2
 
 Version 0.11.2 synchronizes deletion of complete Slicer labels. Removing a
 segment on one participant now removes that MRML segment for every participant

@@ -619,6 +619,23 @@ def test_shared_folder_upgrades_old_room_before_deletion_capability_is_used(tmp_
     assert "segment-deletion-tombstone-v1" in upgraded["capabilities"]
 
 
+def test_shared_folder_newer_room_explains_that_every_client_must_update(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    alice.join("future room", "a" * 64)
+    metadata_path = alice._room_path / "room.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = 3
+    metadata["minimum_plugin_version"] = "0.12.0"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    with pytest.raises(
+        LiveCollaborationError,
+        match=r"requires plugin version 0\.12\.0 or newer.*every computer",
+    ):
+        bob.join("future room", "a" * 64)
+
+
 def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
     signature = "f" * 64
     clients = [SharedFolderRoomClient(tmp_path, f"user-{index}") for index in range(4)]
