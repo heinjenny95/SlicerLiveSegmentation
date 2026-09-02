@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import traceback
 import uuid
@@ -582,8 +583,43 @@ def run_probe():
                     raise RuntimeError("Synchronization worker did not become idle")
                 pump_events(0.1)
             controller._drain_worker_results()
+            transient_message = (
+                "Could not read shared file transient-probe.json: "
+                "temporary SMB sharing violation"
+            )
+            controller._worker_results.put(
+                {
+                    "lane": "edit-pull",
+                    "session_token": controller._session_token,
+                    "error": transient_message,
+                    "duration": 0.01,
+                }
+            )
+            controller._drain_worker_results()
+            if (
+                not controller.connection_healthy
+                or "Connection problem" in controller.status_label.text
+                or not controller._connection_validation_pending
+            ):
+                raise RuntimeError("A single transient SMB read flashed the room offline")
+            controller._worker_results.put(
+                {
+                    "lane": "maintenance",
+                    "session_token": controller._session_token,
+                    "health_checked": True,
+                    "health_ok": True,
+                    "duration": 0.01,
+                }
+            )
+            controller._drain_worker_results()
+            if controller._connection_validation_pending or not controller.connection_healthy:
+                raise RuntimeError("A successful health probe did not confirm the live room")
             room_path = Path(controller.client._room_path)
             unavailable_path = room_path.with_name(room_path.name + ".offline-test")
+            # QFileSystemWatcher keeps a Windows directory handle open. The
+            # interruption probe relies on renaming that directory, so use the
+            # controller's 100-ms polling fallback until the path is restored.
+            controller._stop_shared_folder_watcher()
             os.replace(room_path, unavailable_path)
             controller.timer.start()
             try:
@@ -605,7 +641,11 @@ def run_probe():
                     if time.time() >= deadline:
                         raise RuntimeError("Offline workers did not become idle")
                     pump_events(0.1)
-                os.replace(unavailable_path, room_path)
+                # The watcher handle may follow the renamed directory on
+                # Windows. Copying the probe room back avoids making that
+                # platform detail part of the connection-recovery assertion.
+                shutil.copytree(unavailable_path, room_path, dirs_exist_ok=True)
+                controller._arm_shared_folder_watcher()
                 controller.timer.start()
             controller.refresh_now()
             deadline = time.time() + 8
@@ -616,6 +656,7 @@ def run_probe():
             if not controller.connection_healthy:
                 raise RuntimeError("Connection did not recover after manual refresh")
             connection_recovery = {
+                "transient_read_tolerated": True,
                 "offline_detected": True,
                 "manual_recovery": True,
             }

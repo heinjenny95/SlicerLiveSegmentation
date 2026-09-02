@@ -1,4 +1,31 @@
-# Live Segmentation 0.11.0
+# Live Segmentation 0.11.1
+
+Version 0.11.1 prevents a recoverable Windows/SMB read gap from briefly flashing
+an otherwise healthy shared-folder room offline.
+
+## Stable shared-folder health reporting
+
+- Shared JSON reads retry short access-denied, visibility, and incomplete-read
+  windows for up to 0.42 seconds before reporting a failure.
+- One exhausted live-lane read no longer changes the connection indicator by
+  itself. The affected feeds are retried immediately and a dedicated room health
+  check decides whether the shared location is actually unavailable.
+- Real outages remain visible: the health probe still marks the room offline and
+  manual refresh confirms recovery when the shared location returns.
+- Diagnostics retain the most recent transient transport warning, including the
+  lane and UTC timestamp, so a message does not need to be captured by screenshot.
+
+## Verification
+
+- Two retry-focused regression tests increase the automated suite to 38 tests.
+- The complete Slicer 5.12.3 advanced smoke test confirms that one simulated SMB
+  read gap stays online, a removed room is detected as offline, and the room
+  recovers after restoration. Rapid components, exact 50/50-voxel leave/rejoin,
+  chat, locks, history, snapshots, diagnostics, and a valid MRB backup also pass.
+
+---
+
+# Previous release: Live Segmentation 0.11.0
 
 Version 0.11.0 makes live collaboration practical on very large biological
 image volumes without retaining one source-volume-sized mask copy per label.

@@ -25,6 +25,8 @@ from collaboration import (  # noqa: E402
     LiveCollaborationError,
     SharedFolderRoomClient,
     _atomic_temporary_path,
+    _is_transient_shared_read_error,
+    _read_json_file,
     apply_mask_delta,
     encode_chunked_mask_snapshot,
     encode_mask_crop_delta,
@@ -58,6 +60,46 @@ def test_atomic_temporary_name_stays_short_for_long_operation_names(tmp_path):
     assert temporary.name.startswith(".tmp-")
     assert len(temporary.name) <= 26
     assert destination.name not in temporary.name
+
+
+def test_shared_json_read_retries_short_smb_visibility_gap(tmp_path, monkeypatch):
+    path = tmp_path / "room.json"
+    path.write_text('{"room_id":"retry-room"}\n', encoding="utf-8")
+    original_open = Path.open
+    attempts = {"count": 0}
+
+    def flaky_open(candidate, *args, **kwargs):
+        if candidate == path and attempts["count"] < 2:
+            attempts["count"] += 1
+            raise PermissionError("temporary SMB sharing violation")
+        attempts["count"] += 1
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+    monkeypatch.setattr(collaboration_module.time, "sleep", lambda _delay: None)
+
+    assert _read_json_file(path) == {"room_id": "retry-room"}
+    assert attempts["count"] == 3
+
+
+def test_shared_json_read_failure_is_classified_for_health_confirmation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "room.json"
+    attempts = {"count": 0}
+
+    def unavailable_open(_candidate, *args, **kwargs):
+        del args, kwargs
+        attempts["count"] += 1
+        raise OSError("network path unavailable")
+
+    monkeypatch.setattr(Path, "open", unavailable_open)
+    monkeypatch.setattr(collaboration_module.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(LiveCollaborationError) as captured:
+        _read_json_file(path)
+    assert attempts["count"] == len(collaboration_module.SHARED_JSON_READ_RETRY_DELAYS) + 1
+    assert _is_transient_shared_read_error(str(captured.value))
 
 
 def test_mask_deltas_preserve_independent_edits_and_order_overlaps():

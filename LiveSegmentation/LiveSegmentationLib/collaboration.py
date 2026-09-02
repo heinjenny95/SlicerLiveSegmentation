@@ -66,6 +66,7 @@ MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
+SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 
 
 class LiveCollaborationError(RuntimeError):
@@ -100,11 +101,32 @@ def _safe_file_component(value, fallback="item", max_length=48):
 
 
 def _read_json_file(path):
-    try:
-        with Path(path).open("r", encoding="utf-8") as source:
-            return json.load(source)
-    except (OSError, ValueError) as exc:
-        raise LiveCollaborationError(f"Could not read shared file {path}: {exc}") from exc
+    """Read shared JSON while tolerating short Windows/SMB visibility gaps.
+
+    Atomic rename prevents readers from observing a partially written document,
+    but a network share may still deny or temporarily hide the destination while
+    its directory cache catches up. These sub-second conditions are recoverable
+    and must not make an otherwise healthy live room flash offline.
+    """
+    shared_path = Path(path)
+    last_error = None
+    for attempt in range(len(SHARED_JSON_READ_RETRY_DELAYS) + 1):
+        try:
+            with shared_path.open("r", encoding="utf-8") as source:
+                return json.load(source)
+        except (OSError, ValueError) as exc:
+            last_error = exc
+            if attempt >= len(SHARED_JSON_READ_RETRY_DELAYS):
+                break
+            time.sleep(SHARED_JSON_READ_RETRY_DELAYS[attempt])
+    raise LiveCollaborationError(
+        f"Could not read shared file {shared_path}: {last_error}"
+    ) from last_error
+
+
+def _is_transient_shared_read_error(message):
+    """Return whether a failed live lane should be confirmed by a health probe."""
+    return str(message or "").startswith("Could not read shared file ")
 
 
 def _parallel_map(function, items, max_workers=MAX_PARALLEL_IO_WORKERS):
@@ -2701,8 +2723,10 @@ class LiveCollaborationController:
         self._last_health_check = 0.0
         self._last_backup_check = 0.0
         self._last_error = None
+        self._last_transport_warning = None
         self._session_token = 0
         self.connection_healthy = False
+        self._connection_validation_pending = False
         self._connection_error_popup_shown = False
         self._connection_error_dialog = None
         self._force_sync_refresh = False
@@ -3911,6 +3935,8 @@ class LiveCollaborationController:
             self._force_health_check = True
             self._force_advanced_refresh = True
             self._connection_error_popup_shown = False
+            self._connection_validation_pending = False
+            self._last_transport_warning = None
             self.connection_healthy = True
             self.connected = True
             self._observe_segmentation(segmentation_node)
@@ -4011,6 +4037,7 @@ class LiveCollaborationController:
         segmentation_node_id = self.segmentation_node_id
         self.connected = False
         self.connection_healthy = False
+        self._connection_validation_pending = False
         self._session_token += 1
         if hasattr(self, "timer"):
             self.timer.stop()
@@ -5490,15 +5517,48 @@ class LiveCollaborationController:
                         f"Live collaboration maintenance warning: {result['error']}", 6000
                     )
                     continue
+                if (
+                    isinstance(self.client, SharedFolderRoomClient)
+                    and _is_transient_shared_read_error(result["error"])
+                    and result.get("lane") != "maintenance"
+                ):
+                    # One SMB read may fail while an atomic replacement becomes
+                    # visible. Keep the room live, retry the affected feeds, and
+                    # let the dedicated read/write health probe decide whether
+                    # this is a real outage. This avoids a red offline message
+                    # that disappears as soon as another parallel lane succeeds.
+                    self._last_transport_warning = {
+                        "message": str(result["error"]),
+                        "lane": str(result.get("lane") or "unknown"),
+                        "observed_at": _utc_iso(),
+                    }
+                    self._connection_validation_pending = True
+                    self._force_health_check = True
+                    self._force_sync_refresh = True
+                    self._force_realtime_refresh = True
+                    continue
+                self._connection_validation_pending = True
+                self._force_health_check = True
                 show_popup = not self._connection_error_popup_shown
                 self._connection_error_popup_shown = True
                 self._show_error(result["error"], popup=show_popup)
                 continue
-            self.connection_healthy = True
-            self._connection_error_popup_shown = False
-            if self._connection_error_dialog is not None:
-                self._connection_error_dialog.close()
-                self._connection_error_dialog = None
+            health_confirmed = bool(
+                result.get("health_checked") and result.get("health_ok")
+            )
+            if health_confirmed:
+                self._connection_validation_pending = False
+                self.connection_healthy = True
+                self._connection_error_popup_shown = False
+                if self._connection_error_dialog is not None:
+                    self._connection_error_dialog.close()
+                    self._connection_error_dialog = None
+            elif not self._connection_validation_pending:
+                self.connection_healthy = True
+                self._connection_error_popup_shown = False
+                if self._connection_error_dialog is not None:
+                    self._connection_error_dialog.close()
+                    self._connection_error_dialog = None
             if result.get("lane") in {
                 "sync",
                 "realtime",
@@ -5711,6 +5771,7 @@ class LiveCollaborationController:
                         "dirty_segments": len(self.dirty_segments),
                         "pending_chat_messages": len(self.pending_chat),
                         "connection_healthy": bool(self.connection_healthy),
+                        "last_transport_warning": self._last_transport_warning,
                         "baseline_storage": {
                             "mode": "sparse-64-cubed-chunks",
                             "labels": len(chunked_baselines),
