@@ -49,6 +49,48 @@
    not deleted or modified. The shortcut arguments must contain
    `--disable-settings --ignore-slicerrc`.
 
+## Direct LAN, invitation, and fallback
+
+1. On participant A choose **Direct LAN + shared-folder fallback**, select a
+   writable shared folder, enable local hosting, and click **Start LAN host**.
+2. Export a `.livesegroom` invitation and open it by double-click on participant
+   B. Verify Slicer opens Live Segmentation and fills room, relay URL, session
+   code, and fallback folder without automatically joining.
+3. Load the matching source volume on B and join. Paint in both directions and
+   verify the status says direct LAN and edits remain sub-second on a suitable
+   local network.
+4. Stop the LAN host while both clients remain able to access the shared folder.
+   Verify subsequent requests use the fallback and the activity/metrics counters
+   record it without freezing Slicer.
+5. Repeat with an incorrect session code and verify the join is rejected. Never
+   expose the unencrypted relay outside a trusted LAN or approved VPN.
+
+## Version 0.12 collaboration enhancements
+
+1. Send an ordinary message and a spatial comment. Verify both appear
+   permanently, the comment jumps to its stored label/view, and resolution is
+   visible to both clients after reconnecting.
+2. Keep Segment Editor open and verify remote edits appear in the activity dock
+   and as temporary colored voxel highlights.
+3. Run **Benchmark** and verify health/live-feed minimum, median, p95 and maximum
+   are displayed without creating an edit. Confirm live timing lists publish,
+   receive, apply/render, chat, and edit roundtrip separately.
+4. Make an edit, let the other user edit a different voxel in the same label,
+   and run **Undo my last shared edit**. Verify the first edit is inverted as a
+   new history sequence while the later collaborator voxel remains.
+5. Select an earlier history row and **Compare with current**. Verify a separate
+   display-only segmentation shows green Added and red Removed voxels and does
+   not enter the shared history.
+6. Set labels to ready-for-review, changes-requested, and approved; verify the
+   review queue order, notes, and approved-label lock.
+7. Run segmentation quality checks on synthetic empty, disconnected, tiny, and
+   overlapping labels. Verify every issue is reported and no voxel changes.
+8. Disconnect before a queued edit is acknowledged, close Slicer, rejoin the
+   exact same context, and recover it. Verify replay is idempotent. An explicit
+   **Leave live room** must clear the journal.
+9. Export research metrics and verify the JSON contains aggregate timings and
+   counts but no user, room, URL, path, image, or segmentation payload.
+
 ## Preparation
 
 1. Create an empty folder in a shared location writable by both test users.
@@ -169,8 +211,9 @@
    and confirm an administrator can resolve an abandoned lock.
 7. Publish a material template with names, colors, and terminology. Join from a
    clean scene and verify missing labels appear without replacing voxel data.
-8. Export and import a `.liveseg` invitation. Verify it contains no API key and
-   rejects a different source volume.
+8. Export and import a `.livesegroom` invitation. Verify it contains no API key,
+   treats a direct-LAN session code as sensitive, and rejects a different source
+   volume. Legacy `.liveseg` import remains compatible.
 9. Create a checkpoint and confirm older loose operations move into a ZIP
    archive. A fresh client must reconstruct the same segmentation, and the
    timeline must restore a pre-checkpoint revision.

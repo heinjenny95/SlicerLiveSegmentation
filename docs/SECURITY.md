@@ -16,6 +16,23 @@ trusted internal networks.
 - bounded server request fields and payload sizes;
 - release allowlist excluding databases, image data, virtual environments, and
   secrets.
+- direct-LAN requests restricted to an allowlisted collaboration API and
+  protected by constant-time comparison of a temporary session code;
+- anonymized metrics export excludes identities, room names, connection
+  locations, images, and voxel payloads;
+- crash-recovery journals are stored locally and loaded only for an exact
+  context match.
+
+## Direct-LAN responsibilities
+
+The one-click relay uses plain HTTP and a bearer-like temporary session code; it
+does not provide TLS, institutional identity, or protection against another
+authorized participant. Use it only on a trusted institutional LAN or inside an
+approved VPN. Do not expose its port to the public internet. A `.livesegroom`
+invitation for direct LAN contains that session code, so distribute it through a
+private approved channel and replace it for later sessions. Use the FastAPI
+server behind TLS with per-user tokens when stronger transport and identity
+controls are required.
 
 ## Shared-folder responsibilities
 

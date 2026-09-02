@@ -159,8 +159,15 @@ def run_probe():
                 raise RuntimeError("LIVE_SEGMENTATION_SMOKE_SHARED_FOLDER is required")
             controller.transport_combo.setCurrentIndex(0)
             controller.shared_folder_edit.setEditText(shared_folder)
-        elif transport == "server":
+        elif transport == "direct-lan":
+            shared_folder = os.environ.get("LIVE_SEGMENTATION_SMOKE_SHARED_FOLDER", "")
             controller.transport_combo.setCurrentIndex(1)
+            controller.shared_folder_edit.setEditText(shared_folder)
+            controller.lan_access_code_edit.setText("slicer-smoke-session-code")
+            controller.lan_host_checkbox.checked = True
+            controller.lan_port_spin.value = 0
+        elif transport == "server":
+            controller.transport_combo.setCurrentIndex(2)
             controller.server_edit.setText("http://127.0.0.1:8000")
         else:
             raise RuntimeError(f"Unsupported smoke-test transport: {transport}")
@@ -1176,6 +1183,97 @@ def run_probe():
                 f"Incremental removal kept {patch_voxels} voxels instead of 56"
             )
 
+        enhancements = None
+        if (
+            controller.connected
+            and os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_ENHANCEMENTS", "0")
+            == "1"
+        ):
+
+            def wait_until(predicate, timeout=8.0):
+                deadline = time.time() + float(timeout)
+                while time.time() < deadline:
+                    controller.on_timer()
+                    pump_events(0.08)
+                    if predicate():
+                        return True
+                return False
+
+            required_widgets = (
+                controller.benchmark_button,
+                controller.comment_tree,
+                controller.review_queue_tree,
+                controller.run_quality_button,
+                controller.recover_edits_button,
+                controller.undo_shared_button,
+            )
+            if any(widget is None for widget in required_widgets):
+                raise RuntimeError("An enhancement UI control is missing")
+
+            controller.comment_input.setText("Check this insect structure")
+            controller.add_spatial_comment()
+            if not wait_until(lambda: not controller.pending_chat):
+                raise RuntimeError("Spatial comment was not synchronized")
+            if not controller.comments:
+                raise RuntimeError("Spatial comment thread did not appear")
+
+            controller.run_quality_checks()
+            if not wait_until(lambda: controller.last_quality_report is not None):
+                raise RuntimeError("Segmentation quality checks did not finish")
+
+            controller.run_connection_benchmark()
+            if not wait_until(lambda: controller.last_benchmark is not None, timeout=12.0):
+                raise RuntimeError("Connection benchmark did not finish")
+
+            controller._queue_action(
+                "review_state",
+                segment_id=segment_id,
+                state="ready_for_review",
+                note="Slicer smoke review",
+            )
+            controller._force_advanced_refresh = True
+            if not wait_until(
+                lambda: (
+                    controller.review_states_state.get(segment_id, {}).get("state")
+                    == "ready_for_review"
+                ),
+                timeout=10.0,
+            ):
+                raise RuntimeError("Review queue did not refresh")
+
+            if not controller.history_records:
+                controller.refresh_advanced_state()
+                if not wait_until(lambda: bool(controller.history_records)):
+                    raise RuntimeError("History was unavailable for comparison")
+            history_item = controller.history_tree.topLevelItem(
+                controller.history_tree.topLevelItemCount - 1
+            )
+            controller.history_tree.setCurrentItem(history_item)
+            controller.compare_selected_revision()
+            if not wait_until(lambda: controller._comparison_node_id is not None):
+                raise RuntimeError("Revision comparison overlay was not created")
+
+            sequence_before_undo = controller.last_sequence
+            controller.undo_last_shared_edit()
+            if not wait_until(
+                lambda: controller.last_sequence > sequence_before_undo,
+                timeout=10.0,
+            ):
+                raise RuntimeError("Collaborative undo did not synchronize")
+
+            metrics = controller.session_metrics.summary()
+            if "edit_roundtrip" not in metrics.get("stages", {}):
+                raise RuntimeError("End-to-end edit latency was not recorded")
+            enhancements = {
+                "comment_count": len(controller.comments),
+                "quality_issue_count": controller.last_quality_report["issue_count"],
+                "benchmark_rating": controller.last_benchmark["rating"],
+                "review_queue_count": controller.review_queue_tree.topLevelItemCount,
+                "comparison_node": bool(controller._comparison_node_id),
+                "undo_sequence": controller.last_sequence,
+                "metrics_stages": sorted(metrics.get("stages", {})),
+            }
+
         async_leave_probe = None
         if (
             controller.connected
@@ -1237,6 +1335,7 @@ def run_probe():
             "slow_watchdog": slow_watchdog_probe,
             "recent_shared_folders": recent_folders_result,
             "async_leave": async_leave_probe,
+            "enhancements": enhancements,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}

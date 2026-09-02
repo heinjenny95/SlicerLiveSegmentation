@@ -35,6 +35,7 @@ class LiveOperationCreate(BaseModel):
     system_snapshot: bool = False
     snapshot_label: str | None = Field(default=None, max_length=200)
     segment_deleted: bool = False
+    undo_of_sequence: int | None = Field(default=None, ge=1)
 
     @field_validator("color_hex")
     @classmethod

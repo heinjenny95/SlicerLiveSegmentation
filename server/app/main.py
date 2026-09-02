@@ -100,7 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Live Segmentation Server",
-        version="0.11.6",
+        version="0.12.0",
         description="Optional relay for the Live Segmentation 3D Slicer extension.",
         lifespan=lifespan,
     )
@@ -355,10 +355,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         voxel_bbox, encoding, payload, base_sequence,
                         snapshot_group_id, snapshot_group_index,
                         snapshot_group_count, system_snapshot, snapshot_label,
-                        segment_deleted,
+                        segment_deleted, undo_of_sequence,
                         changed_voxels,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -380,6 +380,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         int(payload.system_snapshot),
                         payload.snapshot_label,
                         int(payload.segment_deleted),
+                        payload.undo_of_sequence,
                         changed_voxels,
                         iso_now(),
                     ),

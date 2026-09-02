@@ -12,11 +12,14 @@ from __future__ import annotations
 import base64
 import getpass
 import hashlib
+import hmac
+import http.server
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -37,11 +40,14 @@ try:
     from .features import (
         REVIEW_STATES,
         ROOM_ROLES,
+        PendingOperationJournal,
+        SessionMetrics,
         build_invitation,
         operation_overlap_count,
         operation_summary,
         parse_invitation,
         reconstruct_snapshot_operations,
+        segmentation_quality_report,
         sha256_file,
         stable_user_color,
         validate_material_template,
@@ -50,11 +56,14 @@ except ImportError:  # regular-Python transport tests import this file directly
     from features import (  # type: ignore
         REVIEW_STATES,
         ROOM_ROLES,
+        PendingOperationJournal,
+        SessionMetrics,
         build_invitation,
         operation_overlap_count,
         operation_summary,
         parse_invitation,
         reconstruct_snapshot_operations,
+        segmentation_quality_report,
         sha256_file,
         stable_user_color,
         validate_material_template,
@@ -2752,6 +2761,481 @@ class SharedFolderRoomClient:
         }
 
 
+LAN_RELAY_METHODS = {
+    "join",
+    "push_operation",
+    "operations",
+    "presence",
+    "health_check",
+    "leave",
+    "send_chat",
+    "chat_messages",
+    "segment_locks",
+    "set_segment_lock",
+    "room_history",
+    "snapshot_manifests",
+    "state_at_sequence",
+    "publish_room_snapshot",
+    "room_conflicts",
+    "resolve_conflict",
+    "room_roles",
+    "set_room_role",
+    "review_states",
+    "set_review_state",
+    "request_segment_access",
+    "segment_access_requests",
+    "transfer_segment_owner",
+    "get_material_template",
+    "set_material_template",
+    "audit_events",
+    "diagnostics",
+}
+
+
+class LanRelayServer:
+    """One-click stdlib LAN relay backed by the normal room store."""
+
+    def __init__(self, storage_folder, access_code=None, host="0.0.0.0", port=0):
+        self.storage_folder = normalize_shared_folder(storage_folder)
+        self.access_code = str(access_code or uuid.uuid4().hex)
+        self.host = str(host or "0.0.0.0")
+        self.port = int(port or 0)
+        self._httpd = None
+        self._thread = None
+        self._clients = {}
+        self._clients_lock = threading.Lock()
+
+    @staticmethod
+    def _advertised_host():
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("8.8.8.8", 80))
+                return str(probe.getsockname()[0])
+            finally:
+                probe.close()
+        except OSError:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except OSError:
+                return "127.0.0.1"
+
+    @property
+    def url(self):
+        if self._httpd is None:
+            return None
+        return f"http://{self._advertised_host()}:{self._httpd.server_address[1]}"
+
+    def _client(self, user_name):
+        user_name = str(user_name or "").strip()
+        if not user_name:
+            raise LiveCollaborationError("LAN request is missing the user name")
+        with self._clients_lock:
+            client = self._clients.get(user_name)
+            if client is None:
+                client = SharedFolderRoomClient(self.storage_folder, user_name)
+                self._clients[user_name] = client
+            return client
+
+    def _dispatch(self, payload):
+        if not hmac.compare_digest(
+            str(payload.get("access_code") or ""), self.access_code
+        ):
+            raise LiveCollaborationError("The LAN session code is invalid")
+        method = str(payload.get("method") or "")
+        if method not in LAN_RELAY_METHODS:
+            raise LiveCollaborationError("Unsupported LAN collaboration request")
+        client = self._client(payload.get("user"))
+        args = payload.get("args") or []
+        kwargs = payload.get("kwargs") or {}
+        return getattr(client, method)(*args, **kwargs)
+
+    def start(self):
+        if self._httpd is not None:
+            return self.url
+        relay = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _send(self, status, payload):
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+                self.send_response(int(status))
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._send(200, {"status": "ok", "transport": "direct-lan"})
+                else:
+                    self._send(404, {"error": "Not found"})
+
+            def do_POST(self):
+                if self.path != "/rpc":
+                    self._send(404, {"error": "Not found"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 64 * 1024 * 1024:
+                        raise LiveCollaborationError("Invalid LAN request size")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    self._send(200, {"result": relay._dispatch(payload)})
+                except Exception as exc:
+                    self._send(400, {"error": str(exc)})
+
+            def log_message(self, format, *args):
+                del format, args
+
+        self._httpd = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
+        self._httpd.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="LiveSegmentation-LAN-relay",
+            daemon=True,
+        )
+        self._thread.start()
+        return self.url
+
+    def stop(self):
+        httpd = self._httpd
+        self._httpd = None
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except OSError:
+                pass
+        self._thread = None
+        self._clients = {}
+
+
+class LanRoomClient:
+    """Dependency-free client for a one-click LAN relay."""
+
+    def __init__(self, server_url, user_name, access_code, timeout_seconds=3.0):
+        self.server_url = normalize_server_url(server_url)
+        self.user_name = str(user_name or "").strip()
+        self.access_code = str(access_code or "").strip()
+        self.timeout_seconds = float(timeout_seconds)
+        if not self.user_name:
+            raise ValueError("Enter your display name")
+        if not self.access_code:
+            raise ValueError("Enter or import the LAN session code")
+
+    def _rpc(self, method, *args, **kwargs):
+        payload = json.dumps(
+            {
+                "user": self.user_name,
+                "access_code": self.access_code,
+                "method": str(method),
+                "args": list(args),
+                "kwargs": kwargs,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.server_url}/rpc",
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("error")
+            except Exception:
+                detail = str(exc)
+            raise LiveCollaborationError(f"Direct LAN request failed: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise LiveCollaborationError(f"Direct LAN connection failed: {exc}") from exc
+        if not isinstance(result, dict) or "result" not in result:
+            raise LiveCollaborationError("The LAN relay returned an invalid response")
+        return result["result"]
+
+    def __getattr__(self, name):
+        if name not in LAN_RELAY_METHODS:
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self._rpc(name, *args, **kwargs)
+
+
+class HybridRoomClient:
+    """Prefer direct LAN requests and fall back to the identical shared store."""
+
+    MIRRORED_METHODS = {
+        "push_operation",
+        "send_chat",
+        "set_segment_lock",
+        "set_room_role",
+        "set_review_state",
+        "request_segment_access",
+        "transfer_segment_owner",
+        "set_material_template",
+        "publish_room_snapshot",
+    }
+
+    def __init__(self, lan_client, fallback_client=None, retry_seconds=5.0):
+        self.lan_client = lan_client
+        self.fallback_client = fallback_client
+        self.retry_seconds = max(1.0, float(retry_seconds))
+        self._retry_primary_after = 0.0
+        self._last_primary_error = None
+        self.fallback_count = 0
+        self.user_name = lan_client.user_name
+        self.server_url = lan_client.server_url
+        self.shared_folder = (
+            fallback_client.shared_folder if fallback_client is not None else None
+        )
+        self._primary_room = None
+        self._fallback_room = None
+        self._fallback_join_done = threading.Event()
+        self._fallback_join_error = None
+        self._reconcile_lock = threading.Lock()
+
+    def _mirror_in_background(self, method, args, kwargs):
+        if self.fallback_client is None or self._fallback_room is None:
+            return
+
+        def mirror():
+            try:
+                mirrored_args = list(args)
+                if mirrored_args:
+                    mirrored_args[0] = self._fallback_room["id"]
+                getattr(self.fallback_client, method)(*mirrored_args, **kwargs)
+            except Exception as exc:
+                self._fallback_join_error = str(exc)
+
+        threading.Thread(
+            target=mirror,
+            name=f"LiveSegmentation-LAN-mirror-{method}",
+            daemon=True,
+        ).start()
+
+    def _reconcile_rooms(self):
+        if self._primary_room is None or self._fallback_room is None:
+            return
+        if not self._reconcile_lock.acquire(blocking=False):
+            return
+        try:
+            primary_sequence = int(self._primary_room.get("latest_sequence", 0))
+            fallback_sequence = int(self._fallback_room.get("latest_sequence", 0))
+            if primary_sequence == fallback_sequence:
+                return
+            if fallback_sequence > primary_sequence:
+                state = self.fallback_client.state_at_sequence(
+                    self._fallback_room["id"], fallback_sequence
+                )
+                if state:
+                    self.lan_client.publish_room_snapshot(
+                        self._primary_room["id"],
+                        state,
+                        compact=False,
+                        label="Recovered from shared-folder fallback",
+                    )
+            else:
+                state = self.lan_client.state_at_sequence(
+                    self._primary_room["id"], primary_sequence
+                )
+                if state:
+                    self.fallback_client.publish_room_snapshot(
+                        self._fallback_room["id"],
+                        state,
+                        compact=False,
+                        label="Mirrored from direct LAN",
+                    )
+        except Exception as exc:
+            self._fallback_join_error = str(exc)
+        finally:
+            self._reconcile_lock.release()
+
+    def _start_fallback_join(self, room_name, signature):
+        if self.fallback_client is None:
+            self._fallback_join_done.set()
+            return
+
+        def join_fallback():
+            try:
+                self._fallback_room = self.fallback_client.join(room_name, signature)
+                self._fallback_join_error = None
+                self._reconcile_rooms()
+            except Exception as exc:
+                self._fallback_join_error = str(exc)
+            finally:
+                self._fallback_join_done.set()
+
+        threading.Thread(
+            target=join_fallback,
+            name="LiveSegmentation-fallback-join",
+            daemon=True,
+        ).start()
+
+    def _call(self, method, *args, **kwargs):
+        if time.monotonic() >= self._retry_primary_after:
+            try:
+                value = getattr(self.lan_client, method)(*args, **kwargs)
+                self._last_primary_error = None
+                self._retry_primary_after = 0.0
+                if method in self.MIRRORED_METHODS:
+                    self._mirror_in_background(method, args, kwargs)
+                return value
+            except Exception as exc:
+                self._last_primary_error = str(exc)
+                self._retry_primary_after = time.monotonic() + self.retry_seconds
+                if self.fallback_client is None:
+                    raise
+        if self.fallback_client is None or self._fallback_room is None:
+            raise LiveCollaborationError(self._last_primary_error or "Direct LAN unavailable")
+        self.fallback_count += 1
+        fallback_args = list(args)
+        if fallback_args:
+            fallback_args[0] = self._fallback_room["id"]
+        return getattr(self.fallback_client, method)(*fallback_args, **kwargs)
+
+    def join(self, room_name, signature):
+        self._start_fallback_join(room_name, signature)
+        primary_room = None
+        primary_error = None
+        try:
+            primary_room = self.lan_client.join(room_name, signature)
+        except Exception as exc:
+            primary_error = exc
+        self._primary_room = primary_room
+        if primary_room is not None:
+            # A slow or offline institutional share must not delay a healthy
+            # direct-LAN join. The fallback continues joining on its daemon lane.
+            self._fallback_join_done.wait(1.0)
+            if self._fallback_room is not None:
+                self._reconcile_rooms()
+            return primary_room
+        self._fallback_join_done.wait(14.0)
+        if self._fallback_room is None:
+            raise primary_error or LiveCollaborationError("No collaboration transport is available")
+        self._last_primary_error = str(primary_error)
+        self._retry_primary_after = time.monotonic() + self.retry_seconds
+        self.fallback_count += 1
+        return self._fallback_room
+
+    def leave(self, room_id):
+        result = None
+        for client in (self.lan_client, self.fallback_client):
+            if client is None:
+                continue
+            try:
+                result = client.leave(room_id)
+            except Exception:
+                pass
+        return result or {"left": True}
+
+    def reserve_project_backup(self, room_id, interval_seconds, force=False):
+        if self.fallback_client is None:
+            return None
+        return self.fallback_client.reserve_project_backup(
+            room_id, interval_seconds, force=force
+        )
+
+    def diagnostics(self, room_id):
+        started = time.monotonic()
+        primary_ok = True
+        try:
+            primary = self.lan_client.diagnostics(room_id)
+        except Exception as exc:
+            primary_ok = False
+            primary = {"status": "unavailable", "error": str(exc)}
+        fallback = None
+        if self.fallback_client is not None and self._fallback_room is not None:
+            try:
+                fallback = self.fallback_client.diagnostics(
+                    self._fallback_room["id"]
+                )
+            except Exception as exc:
+                fallback = {"status": "unavailable", "error": str(exc)}
+        return {
+            "status": "ok" if primary_ok or fallback else "unavailable",
+            "transport": "direct-lan-with-shared-folder-fallback",
+            "latency_seconds": round(time.monotonic() - started, 4),
+            "direct_lan": primary,
+            "fallback": fallback,
+            "fallback_count": int(self.fallback_count),
+        }
+
+    def __getattr__(self, name):
+        if name in {
+            "list_project_backups",
+            "set_backup_pinned",
+            "verify_project_backup",
+            "prune_project_backups",
+        } and self.fallback_client is not None:
+            return getattr(self.fallback_client, name)
+        if name not in LAN_RELAY_METHODS:
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self._call(name, *args, **kwargs)
+
+
+def _uses_shared_folder(client):
+    return isinstance(client, SharedFolderRoomClient) or (
+        isinstance(client, HybridRoomClient) and client.fallback_client is not None
+    )
+
+
+def benchmark_room_transport(client, room_id, after_sequence=0, samples=5):
+    """Measure non-destructive health and live-feed reads for the active room."""
+    samples = max(2, min(int(samples), 20))
+    health = []
+    feed = []
+    errors = []
+    for _ in range(samples):
+        started = time.monotonic()
+        try:
+            client.health_check(room_id)
+            health.append(time.monotonic() - started)
+        except Exception as exc:
+            errors.append(str(exc))
+        started = time.monotonic()
+        try:
+            client.operations(room_id, int(after_sequence), limit=1)
+            feed.append(time.monotonic() - started)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    def stats(values):
+        if not values:
+            return None
+        ordered = sorted(values)
+        p95_index = min(len(ordered) - 1, max(0, int(round(0.95 * len(ordered) - 1))))
+        return {
+            "minimum_ms": round(ordered[0] * 1000.0, 2),
+            "median_ms": round(ordered[len(ordered) // 2] * 1000.0, 2),
+            "p95_ms": round(ordered[p95_index] * 1000.0, 2),
+            "maximum_ms": round(ordered[-1] * 1000.0, 2),
+        }
+
+    combined = health + feed
+    maximum = max(combined) if combined else float("inf")
+    if errors and not combined:
+        rating = "unavailable"
+    elif errors or maximum >= 2.5:
+        rating = "unstable"
+    elif maximum >= 0.75:
+        rating = "slow"
+    elif maximum >= 0.2:
+        rating = "good"
+    else:
+        rating = "excellent"
+    return {
+        "format": "live-segmentation-connection-benchmark-v1",
+        "rating": rating,
+        "sample_count": samples,
+        "health": stats(health),
+        "live_feed": stats(feed),
+        "error_count": len(errors),
+        "errors": errors[:3],
+    }
+
+
 class LiveCollaborationController:
     """Synchronize a standard Slicer segmentation node with a live room."""
 
@@ -2847,6 +3331,8 @@ class LiveCollaborationController:
         self.material_template_state = None
         self.backup_records = []
         self.last_diagnostics = None
+        self.last_benchmark = None
+        self.last_quality_report = None
         self.pending_actions = []
         self._last_advanced_fetch = 0.0
         self._last_snapshot_sequence = 0
@@ -2858,6 +3344,18 @@ class LiveCollaborationController:
         self.chat_dock_input = None
         self.chat_dock_send_button = None
         self.chat_dock_anchor_checkbox = None
+        self.activity_dock = None
+        self.activity_dock_text = None
+        self.comments = {}
+        self.resolved_comment_ids = set()
+        self.session_metrics = SessionMetrics()
+        self._last_metrics_display = 0.0
+        self._operation_journal = None
+        self._journal_context = None
+        self._journal_recovery = []
+        self._comparison_node_id = None
+        self.lan_server = None
+        self._last_hybrid_fallback_count = 0
 
     def setup(self):
         import ctk
@@ -2896,8 +3394,9 @@ class LiveCollaborationController:
         self.room_edit.setPlaceholderText("e.g. specimen-01")
         self.transport_combo = qt.QComboBox()
         self.transport_combo.addItem("Shared/network folder")
+        self.transport_combo.addItem("Direct LAN + shared-folder fallback")
         self.transport_combo.addItem("Collaboration server")
-        self.transport_combo.setCurrentIndex(1 if default_transport == "server" else 0)
+        self.transport_combo.setCurrentIndex(2 if default_transport == "server" else 0)
         identity_layout.addRow("Name", self.user_edit)
         identity_layout.addRow("Room", self.room_edit)
         identity_layout.addRow("Connection", self.transport_combo)
@@ -2946,6 +3445,13 @@ class LiveCollaborationController:
         self.refresh_button.enabled = False
         self.refresh_button.clicked.connect(self.refresh_now)
         connection_actions.addWidget(self.refresh_button)
+        self.benchmark_button = qt.QPushButton("Benchmark")
+        self.benchmark_button.setToolTip(
+            "Measure non-destructive health and live-feed round trips for this room"
+        )
+        self.benchmark_button.enabled = False
+        self.benchmark_button.clicked.connect(self.run_connection_benchmark)
+        connection_actions.addWidget(self.benchmark_button)
         layout.addLayout(connection_actions)
 
         self.status_label = qt.QLabel("● Offline")
@@ -2965,9 +3471,12 @@ class LiveCollaborationController:
         self.jump_to_user_button = qt.QPushButton("Jump to user")
         self.jump_to_user_button.enabled = False
         self.jump_to_user_button.clicked.connect(self.jump_to_selected_user)
+        self.open_activity_dock_button = qt.QPushButton("Open activity")
+        self.open_activity_dock_button.clicked.connect(self.show_activity_dock)
         presence_actions.addWidget(self.collaborator_combo, 1)
         presence_actions.addWidget(self.follow_checkbox)
         presence_actions.addWidget(self.jump_to_user_button)
+        presence_actions.addWidget(self.open_activity_dock_button)
         layout.addLayout(presence_actions)
 
         label_management_layout = qt.QFormLayout()
@@ -3072,6 +3581,33 @@ class LiveCollaborationController:
         chat_location_layout.addWidget(self.jump_to_chat_button)
         chat_location_layout.addWidget(self.open_chat_dock_button)
         chat_layout.addLayout(chat_location_layout)
+        comment_layout = qt.QHBoxLayout()
+        self.comment_input = qt.QLineEdit()
+        self.comment_input.setPlaceholderText("Comment on selected label/current position…")
+        self.comment_input.enabled = False
+        self.comment_button = qt.QPushButton("Add comment")
+        self.comment_button.enabled = False
+        self.comment_button.clicked.connect(self.add_spatial_comment)
+        comment_layout.addWidget(self.comment_input, 1)
+        comment_layout.addWidget(self.comment_button)
+        chat_layout.addLayout(comment_layout)
+        self.comment_tree = qt.QTreeWidget()
+        self.comment_tree.setHeaderLabels(["Status", "Time", "Author", "Label / comment"])
+        self.comment_tree.setMaximumHeight(120)
+        self.comment_tree.itemDoubleClicked.connect(
+            lambda _item, _column: self.jump_to_selected_comment()
+        )
+        chat_layout.addWidget(self.comment_tree)
+        comment_actions = qt.QHBoxLayout()
+        self.jump_to_comment_button = qt.QPushButton("Jump to comment")
+        self.jump_to_comment_button.enabled = False
+        self.jump_to_comment_button.clicked.connect(self.jump_to_selected_comment)
+        self.resolve_comment_button = qt.QPushButton("Resolve selected comment")
+        self.resolve_comment_button.enabled = False
+        self.resolve_comment_button.clicked.connect(self.resolve_selected_comment)
+        comment_actions.addWidget(self.jump_to_comment_button)
+        comment_actions.addWidget(self.resolve_comment_button)
+        chat_layout.addLayout(comment_actions)
         layout.addWidget(chat_group)
         self._setup_chat_dock()
 
@@ -3156,6 +3692,10 @@ class LiveCollaborationController:
         self.refresh_history_button.clicked.connect(self.refresh_advanced_state)
         self.restore_revision_button = qt.QPushButton("Restore selected revision")
         self.restore_revision_button.clicked.connect(self.restore_selected_revision)
+        self.compare_revision_button = qt.QPushButton("Compare with current")
+        self.compare_revision_button.clicked.connect(self.compare_selected_revision)
+        self.undo_shared_button = qt.QPushButton("Undo my last shared edit")
+        self.undo_shared_button.clicked.connect(self.undo_last_shared_edit)
         self.create_snapshot_button = qt.QPushButton("Snapshot + compact now")
         self.create_snapshot_button.clicked.connect(self.request_room_snapshot)
         self.snapshot_label_edit = qt.QLineEdit()
@@ -3164,6 +3704,8 @@ class LiveCollaborationController:
         for button in (
             self.refresh_history_button,
             self.restore_revision_button,
+            self.compare_revision_button,
+            self.undo_shared_button,
             self.create_snapshot_button,
         ):
             button.enabled = False
@@ -3193,6 +3735,13 @@ class LiveCollaborationController:
             button.enabled = False
             conflict_buttons.addWidget(button)
         history_layout.addLayout(conflict_buttons)
+        self.review_queue_tree = qt.QTreeWidget()
+        self.review_queue_tree.setHeaderLabels(["Review state", "Label", "Updated by", "Note"])
+        self.review_queue_tree.setMaximumHeight(120)
+        self.review_queue_tree.itemDoubleClicked.connect(
+            self.select_review_queue_label
+        )
+        history_layout.addWidget(self.review_queue_tree)
         layout.addWidget(history_group)
 
         project_group = ctk.ctkCollapsibleButton()
@@ -3202,7 +3751,8 @@ class LiveCollaborationController:
         privacy = qt.QLabel(
             "Privacy: room names, chat, diagnostics, invitations, and complete MRB backups "
             "must not contain patient-identifying information unless your approved storage and "
-            "governance explicitly permit it. Invitation files never contain API keys."
+            "governance explicitly permit it. Invitation files never contain API keys. "
+            "Direct-LAN invitations do contain the temporary session code; share them privately."
         )
         privacy.setWordWrap(True)
         privacy.setStyleSheet("color: #8a4b00;")
@@ -3211,14 +3761,36 @@ class LiveCollaborationController:
         self.diagnostics_text.setReadOnly(True)
         self.diagnostics_text.setMaximumHeight(130)
         project_layout.addWidget(self.diagnostics_text)
+        self.performance_label = qt.QLabel("No live performance samples yet")
+        self.performance_label.setWordWrap(True)
+        project_layout.addWidget(self.performance_label)
         diagnostic_buttons = qt.QHBoxLayout()
         self.run_diagnostics_button = qt.QPushButton("Run diagnostics")
         self.run_diagnostics_button.clicked.connect(self.run_room_diagnostics)
         self.export_diagnostics_button = qt.QPushButton("Export sanitized report")
         self.export_diagnostics_button.clicked.connect(self.export_diagnostics)
+        self.export_metrics_button = qt.QPushButton("Export research metrics")
+        self.export_metrics_button.clicked.connect(self.export_session_metrics)
         diagnostic_buttons.addWidget(self.run_diagnostics_button)
         diagnostic_buttons.addWidget(self.export_diagnostics_button)
+        diagnostic_buttons.addWidget(self.export_metrics_button)
         project_layout.addLayout(diagnostic_buttons)
+        quality_layout = qt.QHBoxLayout()
+        self.quality_min_component_spin = qt.QSpinBox()
+        self.quality_min_component_spin.minimum = 1
+        self.quality_min_component_spin.maximum = 1000000
+        self.quality_min_component_spin.value = 20
+        self.run_quality_button = qt.QPushButton("Run segmentation quality checks")
+        self.run_quality_button.clicked.connect(self.run_quality_checks)
+        quality_layout.addWidget(qt.QLabel("Small component <"))
+        quality_layout.addWidget(self.quality_min_component_spin)
+        quality_layout.addWidget(qt.QLabel("voxels"))
+        quality_layout.addWidget(self.run_quality_button, 1)
+        project_layout.addLayout(quality_layout)
+        self.quality_text = qt.QPlainTextEdit()
+        self.quality_text.setReadOnly(True)
+        self.quality_text.setMaximumHeight(110)
+        project_layout.addWidget(self.quality_text)
         template_buttons = qt.QHBoxLayout()
         self.publish_template_button = qt.QPushButton("Publish labels as room template")
         self.publish_template_button.clicked.connect(self.publish_material_template)
@@ -3228,7 +3800,7 @@ class LiveCollaborationController:
         template_buttons.addWidget(self.apply_template_button)
         project_layout.addLayout(template_buttons)
         invite_buttons = qt.QHBoxLayout()
-        self.export_invite_button = qt.QPushButton("Export .liveseg invitation")
+        self.export_invite_button = qt.QPushButton("Export .livesegroom invitation")
         self.export_invite_button.clicked.connect(self.export_invitation)
         self.import_invite_button = qt.QPushButton("Import invitation")
         self.import_invite_button.clicked.connect(self.import_invitation)
@@ -3236,6 +3808,35 @@ class LiveCollaborationController:
         invite_buttons.addWidget(self.import_invite_button)
         project_layout.addLayout(invite_buttons)
         layout.addWidget(project_group)
+
+        recovery_group = ctk.ctkCollapsibleButton()
+        recovery_group.text = "Crash recovery"
+        recovery_group.collapsed = True
+        recovery_layout = qt.QVBoxLayout(recovery_group)
+        self.recovery_enabled_checkbox = qt.QCheckBox(
+            "Keep a local crash-recovery journal for unacknowledged edits"
+        )
+        self.recovery_enabled_checkbox.checked = str(
+            settings.value(self.SETTINGS_PREFIX + "crashRecovery", "true")
+        ).lower() not in {"0", "false", "no"}
+        self.recovery_enabled_checkbox.toggled.connect(
+            self._on_recovery_setting_changed
+        )
+        recovery_layout.addWidget(self.recovery_enabled_checkbox)
+        self.recovery_status_label = qt.QLabel("No recoverable edits for the active room")
+        self.recovery_status_label.setWordWrap(True)
+        recovery_layout.addWidget(self.recovery_status_label)
+        recovery_buttons = qt.QHBoxLayout()
+        self.recover_edits_button = qt.QPushButton("Recover pending edits")
+        self.discard_recovery_button = qt.QPushButton("Discard recovery")
+        self.recover_edits_button.enabled = False
+        self.discard_recovery_button.enabled = False
+        self.recover_edits_button.clicked.connect(self.recover_pending_edits)
+        self.discard_recovery_button.clicked.connect(self.discard_pending_recovery)
+        recovery_buttons.addWidget(self.recover_edits_button)
+        recovery_buttons.addWidget(self.discard_recovery_button)
+        recovery_layout.addLayout(recovery_buttons)
+        layout.addWidget(recovery_group)
 
         self.server_settings = ctk.ctkCollapsibleButton()
         self.server_settings.text = "Server settings"
@@ -3248,10 +3849,42 @@ class LiveCollaborationController:
         advanced_layout.addRow("API key (optional)", self.api_key_edit)
         layout.addWidget(self.server_settings)
 
+        self.lan_settings = ctk.ctkCollapsibleButton()
+        self.lan_settings.text = "Direct LAN session"
+        self.lan_settings.collapsed = False
+        lan_form = qt.QFormLayout(self.lan_settings)
+        self.lan_url_edit = qt.QLineEdit()
+        self.lan_url_edit.setPlaceholderText("e.g. http://192.168.1.20:8765")
+        self.lan_access_code_edit = qt.QLineEdit()
+        self.lan_access_code_edit.setPlaceholderText("Imported or generated session code")
+        self.lan_access_code_edit.echoMode = qt.QLineEdit.PasswordEchoOnEdit
+        self.lan_host_checkbox = qt.QCheckBox("Host the LAN relay on this computer")
+        self.lan_port_spin = qt.QSpinBox()
+        self.lan_port_spin.minimum = 0
+        self.lan_port_spin.maximum = 65535
+        self.lan_port_spin.value = 0
+        self.lan_port_spin.specialValueText = "Automatic"
+        self.lan_host_button = qt.QPushButton("Start LAN host")
+        self.lan_host_button.clicked.connect(self.toggle_lan_host)
+        self.lan_status_label = qt.QLabel(
+            "Direct LAN keeps its hot state locally; the selected shared folder is an optional "
+            "background mirror and fallback. "
+            "Use this unencrypted relay only on a trusted institutional LAN or VPN."
+        )
+        self.lan_status_label.setWordWrap(True)
+        lan_form.addRow("LAN relay URL", self.lan_url_edit)
+        lan_form.addRow("Session code", self.lan_access_code_edit)
+        lan_form.addRow(self.lan_host_checkbox)
+        lan_form.addRow("Host port", self.lan_port_spin)
+        lan_form.addRow(self.lan_host_button)
+        lan_form.addRow(self.lan_status_label)
+        layout.addWidget(self.lan_settings)
+
         self.transport_combo.currentIndexChanged.connect(self._update_transport_fields)
         self._update_transport_fields()
 
         self.owner.layout.addWidget(self.group)
+        self._setup_activity_dock()
 
         self.timer = qt.QTimer()
         # Watchers handle the normal hot path. This short timer remains the
@@ -3271,23 +3904,93 @@ class LiveCollaborationController:
     def _transport_mode(self):
         index = self.transport_combo.currentIndex
         index = index() if callable(index) else index
-        return "shared-folder" if int(index) == 0 else "server"
+        return {0: "shared-folder", 1: "direct-lan", 2: "server"}.get(
+            int(index), "shared-folder"
+        )
 
     def _live_status_text(self):
-        transport = "shared folder" if isinstance(self.client, SharedFolderRoomClient) else "server"
+        if isinstance(self.client, HybridRoomClient):
+            transport = (
+                "direct LAN / shared-folder fallback"
+                if self.client.fallback_client is not None
+                else "direct LAN"
+            )
+        elif isinstance(self.client, LanRoomClient):
+            transport = "direct LAN"
+        elif isinstance(self.client, SharedFolderRoomClient):
+            transport = "shared folder"
+        else:
+            transport = "server"
         node = self._segmentation_node()
         node_name = node.GetName() if node is not None else "shared segmentation"
         return f"● Live via {transport} in room “{self.room_name}” — editing “{node_name}”"
 
     def _update_transport_fields(self, index=None):
         del index
-        shared = self._transport_mode() == "shared-folder"
+        mode = self._transport_mode()
+        shared = mode in {"shared-folder", "direct-lan"}
+        direct = mode == "direct-lan"
+        self.shared_folder_label.setText(
+            "Fallback folder (optional)" if direct else "Shared folder"
+        )
         self.shared_folder_label.setVisible(shared)
         self.shared_folder_widget.setVisible(shared)
-        self.server_settings.setVisible(not shared)
+        self.server_settings.setVisible(mode == "server")
+        self.lan_settings.setVisible(direct)
         self.backup_group.setVisible(shared)
         if hasattr(self, "backup_enabled_checkbox"):
             self._on_backup_settings_changed()
+
+    def toggle_lan_host(self, checked=False):
+        del checked
+        import qt
+
+        if self.lan_server is not None:
+            self.lan_server.stop()
+            self.lan_server = None
+            self.lan_host_button.setText("Start LAN host")
+            self.lan_status_label.setText("LAN host stopped")
+            return
+        try:
+            shared_folder = self._text(self.shared_folder_edit)
+            access_code = self._text(self.lan_access_code_edit) or uuid.uuid4().hex
+            port = self.lan_port_spin.value
+            port = port() if callable(port) else port
+            local_root = Path(
+                str(
+                    qt.QStandardPaths.writableLocation(
+                        qt.QStandardPaths.AppLocalDataLocation
+                    )
+                )
+            )
+            relay_identity = hashlib.sha256(
+                f"{shared_folder}\0{access_code}".encode()
+            ).hexdigest()[:24]
+            relay_storage = (
+                local_root
+                / "LiveSegmentation"
+                / "direct-lan-rooms"
+                / relay_identity
+            )
+            self.lan_server = LanRelayServer(
+                relay_storage,
+                access_code=access_code,
+                port=int(port),
+            )
+            url = self.lan_server.start()
+            self.lan_url_edit.setText(url)
+            self.lan_access_code_edit.setText(access_code)
+            self.lan_host_checkbox.checked = True
+            self.lan_host_button.setText("Stop LAN host")
+            self.lan_status_label.setText(
+                f"LAN host ready at {url}. Local live state is mirrored to the "
+                "optional shared-folder fallback. Export a .livesegroom invitation."
+            )
+        except Exception as exc:
+            if self.lan_server is not None:
+                self.lan_server.stop()
+                self.lan_server = None
+            self._show_error(f"Could not start the LAN host: {exc}", popup=True)
 
     def choose_shared_folder(self, checked=False):
         del checked
@@ -3330,6 +4033,195 @@ class LiveCollaborationController:
         self.shared_folder_edit.addItems(recent)
         self.shared_folder_edit.setCurrentIndex(0 if recent else -1)
         self.shared_folder_edit.setEditText(recent[0] if recent else "")
+
+    def _journal_for_context(self, context):
+        import qt
+
+        root = str(
+            qt.QStandardPaths.writableLocation(qt.QStandardPaths.AppLocalDataLocation)
+        )
+        identity = json.dumps(dict(context or {}), sort_keys=True, separators=(",", ":"))
+        file_name = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24] + ".json"
+        return PendingOperationJournal(
+            Path(root) / "LiveSegmentation" / "recovery" / file_name
+        )
+
+    def _on_recovery_setting_changed(self, enabled):
+        import qt
+
+        settings = qt.QSettings()
+        settings.setValue(self.SETTINGS_PREFIX + "crashRecovery", bool(enabled))
+        settings.sync()
+        self._sync_operation_journal()
+
+    def _sync_operation_journal(self):
+        if self._operation_journal is None or self._journal_context is None:
+            return
+        enabled = self.recovery_enabled_checkbox.checked
+        enabled = enabled() if callable(enabled) else enabled
+        if not enabled:
+            self._operation_journal.clear()
+            return
+        pending = []
+        seen = set()
+        for operation in [*self.outgoing, *self.awaiting_echo]:
+            operation_id = str(operation.get("client_operation_id") or "")
+            if operation_id and operation_id not in seen:
+                pending.append(dict(operation))
+                seen.add(operation_id)
+        self._operation_journal.write(self._journal_context, pending)
+        if pending:
+            self.recovery_status_label.setText(
+                f"Crash journal contains {len(pending)} unacknowledged edit(s)."
+            )
+        elif not self._journal_recovery:
+            self.recovery_status_label.setText("No recoverable edits for the active room")
+
+    def recover_pending_edits(self, checked=False):
+        del checked
+        existing = {
+            str(item.get("client_operation_id") or "")
+            for item in [*self.outgoing, *self.awaiting_echo]
+        }
+        recovered = 0
+        for operation in self._journal_recovery:
+            operation_id = str(operation.get("client_operation_id") or "")
+            if not operation_id or operation_id in existing:
+                continue
+            self.outgoing.append(dict(operation))
+            existing.add(operation_id)
+            recovered += 1
+            self.session_metrics.operation_queued(operation_id)
+        self._journal_recovery = []
+        self.recover_edits_button.enabled = False
+        self.discard_recovery_button.enabled = False
+        self.recovery_status_label.setText(
+            f"Queued {recovered} recovered edit(s) for idempotent synchronization."
+        )
+        self._sync_operation_journal()
+        self._force_sync_refresh = True
+        self.on_timer()
+
+    def discard_pending_recovery(self, checked=False):
+        del checked
+        self._journal_recovery = []
+        if self._operation_journal is not None:
+            self._operation_journal.clear()
+        self.recover_edits_button.enabled = False
+        self.discard_recovery_button.enabled = False
+        self.recovery_status_label.setText("Recovery was discarded for this room")
+
+    def _update_performance_label(self):
+        summary = self.session_metrics.summary()
+        stages = summary.get("stages") or {}
+        preferred = []
+        for key, label in (
+            ("edit_roundtrip", "edit roundtrip"),
+            ("edit-push", "publish"),
+            ("edit-pull", "receive poll"),
+            ("apply", "apply/render"),
+            ("chat-send", "chat send"),
+        ):
+            if key in stages:
+                preferred.append(f"{label}: {stages[key]['last_ms']:.0f} ms")
+        if self.last_benchmark:
+            preferred.append(f"connection: {self.last_benchmark.get('rating', 'unknown')}")
+        self.performance_label.setText(
+            "Live performance — " + " · ".join(preferred)
+            if preferred
+            else "No live performance samples yet"
+        )
+
+    def run_connection_benchmark(self, checked=False):
+        del checked
+        if not self.connected:
+            self._show_error("Join a live room before running a benchmark", popup=True)
+            return
+        self.benchmark_button.enabled = False
+        self.performance_label.setText("Running non-destructive connection benchmark…")
+        self._queue_action("benchmark", after_sequence=int(self.last_sequence))
+
+    def export_session_metrics(self, checked=False):
+        del checked
+        import qt
+        import slicer
+
+        if not self.connected:
+            self._show_error("Join a live room before exporting session metrics", popup=True)
+            return
+        path = qt.QFileDialog.getSaveFileName(
+            slicer.util.mainWindow(),
+            "Export anonymized Live Segmentation metrics",
+            "live-segmentation-session-metrics.json",
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        payload = self.session_metrics.summary()
+        payload["connection_benchmark"] = (
+            {
+                key: value
+                for key, value in self.last_benchmark.items()
+                if key != "errors"
+            }
+            if self.last_benchmark
+            else None
+        )
+        payload["quality_summary"] = (
+            {
+                "issue_count": self.last_quality_report.get("issue_count", 0),
+                "label_count": len(self.last_quality_report.get("labels") or {}),
+            }
+            if self.last_quality_report
+            else None
+        )
+        Path(str(path)).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        slicer.util.showStatusMessage("Anonymized research metrics exported", 3000)
+
+    def run_quality_checks(self, checked=False):
+        del checked
+        if not self.connected:
+            self._show_error("Join a live room before checking segmentation quality", popup=True)
+            return
+        node = self._segmentation_node()
+        masks = {
+            str(segment_id): self._read_mask(node, segment_id)
+            for segment_id in node.GetSegmentation().GetSegmentIDs()
+        }
+        threshold = self.quality_min_component_spin.value
+        threshold = threshold() if callable(threshold) else threshold
+        self.run_quality_button.enabled = False
+        self.quality_text.setPlainText("Analyzing empty labels, components, and overlaps…")
+
+        def analyze():
+            started = time.monotonic()
+            try:
+                report = segmentation_quality_report(masks, int(threshold))
+                self._worker_results.put(
+                    {
+                        "lane": "local-quality",
+                        "session_token": self._session_token,
+                        "quality": report,
+                        "duration": time.monotonic() - started,
+                    }
+                )
+            except Exception as exc:
+                self._worker_results.put(
+                    {
+                        "lane": "local-quality",
+                        "session_token": self._session_token,
+                        "error": str(exc),
+                        "duration": time.monotonic() - started,
+                    }
+                )
+
+        threading.Thread(
+            target=analyze,
+            name="LiveSegmentation-quality-check",
+            daemon=True,
+        ).start()
 
     def toggle_connection(self, checked=False):
         del checked
@@ -3387,7 +4279,7 @@ class LiveCollaborationController:
 
     def _disconnect_for_connection_loss(self, message):
         message = str(message or "The collaboration location stopped responding")
-        shared_folder_session = isinstance(self.client, SharedFolderRoomClient)
+        shared_folder_session = _uses_shared_folder(self.client)
         self.leave(notify_remote=False)
         if shared_folder_session:
             self.shared_folder_edit.setCurrentIndex(-1)
@@ -3436,6 +4328,39 @@ class LiveCollaborationController:
         main_window.addDockWidget(qt.Qt.RightDockWidgetArea, self.chat_dock)
         self.chat_dock.hide()
 
+    def _setup_activity_dock(self):
+        import qt
+        import slicer
+
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        self.activity_dock = qt.QDockWidget("Live Segmentation Activity", main_window)
+        self.activity_dock.setObjectName("LiveSegmentationActivityDock")
+        self.activity_dock.setToolTip(
+            "Remote edits remain visible while Segment Editor or another module is active"
+        )
+        self.activity_dock_text = qt.QPlainTextEdit()
+        self.activity_dock_text.setReadOnly(True)
+        self.activity_dock_text.setPlaceholderText("Remote label changes appear here")
+        self.activity_dock.setWidget(self.activity_dock_text)
+        main_window.addDockWidget(qt.Qt.RightDockWidgetArea, self.activity_dock)
+        self.activity_dock.hide()
+
+    def show_activity_dock(self, checked=False):
+        del checked
+        if self.activity_dock is not None:
+            self.activity_dock.show()
+            self.activity_dock.raise_()
+
+    def _append_activity(self, text):
+        if self.activity_dock_text is None:
+            return
+        self.activity_dock_text.appendPlainText(
+            f"[{datetime.now().strftime('%H:%M:%S')}] {str(text)}"
+        )
+        self._scroll_chat_to_end(self.activity_dock_text)
+
     def show_chat_dock(self, checked=False):
         del checked
         if self.chat_dock is not None:
@@ -3458,7 +4383,7 @@ class LiveCollaborationController:
         self._scroll_chat_to_end(self.chat_history)
         self._scroll_chat_to_end(self.chat_dock_history)
 
-    def _queue_chat_message(self, text, anchor_enabled):
+    def _queue_chat_message(self, text, anchor_enabled, anchor_metadata=None):
         if not self.connected:
             self._show_error("Join a live room before sending a message", popup=True)
             return
@@ -3466,9 +4391,17 @@ class LiveCollaborationController:
         if not text:
             return
         message = {"client_message_id": str(uuid.uuid4()), "text": text}
-        if anchor_enabled:
-            message["anchor"] = self._current_location()
+        if anchor_enabled or anchor_metadata:
+            message["anchor"] = self._current_location() if anchor_enabled else {}
+            message["anchor"].update(dict(anchor_metadata or {}))
+            if message["anchor"].get("message_kind") == "comment":
+                message["anchor"]["comment_id"] = message["client_message_id"]
         self.pending_chat.append(message)
+        self.session_metrics.increment(
+            "comments_queued"
+            if (message.get("anchor") or {}).get("message_kind") == "comment"
+            else "chat_messages_queued"
+        )
         self.optimistic_chat_ids.add(message["client_message_id"])
         marker = " 📍" if message.get("anchor") else ""
         self._append_chat_line(
@@ -3479,6 +4412,7 @@ class LiveCollaborationController:
         )
         self._force_realtime_refresh = True
         self.on_timer()
+        return message
 
     def send_chat_message(self):
         anchor_enabled = self.chat_anchor_checkbox.checked
@@ -3493,6 +4427,112 @@ class LiveCollaborationController:
         anchor_enabled = anchor_enabled() if callable(anchor_enabled) else anchor_enabled
         self._queue_chat_message(self._text(self.chat_dock_input), bool(anchor_enabled))
         self.chat_dock_input.clear()
+
+    def add_spatial_comment(self, checked=False):
+        del checked
+        text = self._text(self.comment_input)
+        if not text:
+            return
+        segment_id = self._selected_segment_id()
+        node = self._segmentation_node()
+        segment = (
+            node.GetSegmentation().GetSegment(segment_id)
+            if node is not None and segment_id
+            else None
+        )
+        message = self._queue_chat_message(
+            text,
+            True,
+            {
+                "message_kind": "comment",
+                "segment_id": segment_id,
+                "segment_name": segment.GetName() if segment is not None else "",
+            },
+        )
+        if message:
+            self._register_comment(
+                {
+                    "sequence": 0,
+                    "client_message_id": message["client_message_id"],
+                    "author": self.user_name,
+                    "text": text,
+                    "created_at": _utc_iso(),
+                    "anchor": message.get("anchor"),
+                }
+            )
+        self.comment_input.clear()
+
+    def _register_comment(self, message):
+        anchor = message.get("anchor") or {}
+        comment_id = str(
+            anchor.get("comment_id") or message.get("client_message_id") or ""
+        )
+        if not comment_id:
+            return
+        record = dict(message)
+        record["resolved"] = comment_id in self.resolved_comment_ids
+        self.comments[comment_id] = record
+        self._refresh_comment_tree()
+
+    def _refresh_comment_tree(self):
+        import qt
+
+        selected_id = None
+        selected = self.comment_tree.currentItem()
+        if selected is not None:
+            selected_id = str(selected.data(0, 32) or "")
+        self.comment_tree.clear()
+        for comment_id, record in sorted(
+            self.comments.items(),
+            key=lambda item: int(item[1].get("sequence", 0)),
+            reverse=True,
+        ):
+            anchor = record.get("anchor") or {}
+            label = str(anchor.get("segment_name") or anchor.get("segment_id") or "view")
+            item = qt.QTreeWidgetItem(
+                [
+                    "resolved" if record.get("resolved") else "open",
+                    self._local_clock_text(record.get("created_at")),
+                    str(record.get("author") or ""),
+                    f"{label}: {str(record.get('text') or '')}",
+                ]
+            )
+            item.setData(0, 32, comment_id)
+            self.comment_tree.addTopLevelItem(item)
+            if comment_id == selected_id:
+                self.comment_tree.setCurrentItem(item)
+        has_comments = bool(self.comments)
+        self.jump_to_comment_button.enabled = has_comments
+        self.resolve_comment_button.enabled = has_comments
+
+    def _selected_comment_id(self):
+        item = self.comment_tree.currentItem()
+        return str(item.data(0, 32) or "") if item is not None else ""
+
+    def jump_to_selected_comment(self, checked=False):
+        del checked
+        record = self.comments.get(self._selected_comment_id()) or {}
+        anchor = record.get("anchor")
+        if isinstance(anchor, dict):
+            self._apply_location(anchor)
+
+    def resolve_selected_comment(self, checked=False):
+        del checked
+        comment_id = self._selected_comment_id()
+        if not comment_id:
+            return
+        self.resolved_comment_ids.add(comment_id)
+        if comment_id in self.comments:
+            self.comments[comment_id]["resolved"] = True
+        self._refresh_comment_tree()
+        self._queue_chat_message(
+            "Resolved a spatial comment",
+            False,
+            {
+                "message_kind": "comment-resolution",
+                "target_comment_id": comment_id,
+            },
+        )
 
     def toggle_selected_segment_lock(self, checked=False):
         del checked
@@ -3584,7 +4624,10 @@ class LiveCollaborationController:
         interval = interval() if callable(interval) else interval
         retention = self.backup_retention_spin.value
         retention = retention() if callable(retention) else retention
-        shared = self._transport_mode() == "shared-folder"
+        shared = self._transport_mode() == "shared-folder" or (
+            self._transport_mode() == "direct-lan"
+            and bool(self._text(self.shared_folder_edit))
+        )
         self.backup_interval_spin.enabled = bool(shared and enabled)
         self.backup_retention_spin.enabled = bool(shared and enabled)
         settings = qt.QSettings()
@@ -3607,7 +4650,7 @@ class LiveCollaborationController:
 
     def create_backup_now(self, checked=False):
         del checked
-        if not self.connected or not isinstance(self.client, SharedFolderRoomClient):
+        if not self.connected or not _uses_shared_folder(self.client):
             self._show_error("Join a shared-folder room before creating a backup", popup=True)
             return
         self.backup_status_label.setText("Creating a complete project backup…")
@@ -3714,6 +4757,20 @@ class LiveCollaborationController:
             note=self._text(self.review_note_edit),
         )
 
+    def select_review_queue_label(self, item=None, column=0):
+        del column
+        item = item or self.review_queue_tree.currentItem()
+        if item is None:
+            return
+        segment_id = str(item.data(0, 32) or "")
+        if not segment_id:
+            return
+        for index in range(self.label_combo.count):
+            if str(self.label_combo.itemData(index) or "") == segment_id:
+                self.label_combo.setCurrentIndex(index)
+                break
+        self.owner.select_segment_in_editor(segment_id)
+
     def set_selected_user_role(self, checked=False):
         del checked
         target = self._combo_current_text(self.collaborator_combo)
@@ -3767,6 +4824,39 @@ class LiveCollaborationController:
             return
         self._restoring_sequence = sequence
         self._queue_action("restore_revision", sequence=sequence)
+        self.on_timer()
+
+    def compare_selected_revision(self, checked=False):
+        del checked
+        sequence = self._selected_history_sequence()
+        if sequence is None:
+            self._show_error("Select a revision in the timeline first", popup=True)
+            return
+        self.compare_revision_button.enabled = False
+        self._queue_action("compare_revision", sequence=sequence)
+        self.on_timer()
+
+    def undo_last_shared_edit(self, checked=False):
+        del checked
+        target = next(
+            (
+                record
+                for record in sorted(
+                    self.history_records,
+                    key=lambda item: int(item.get("sequence", 0)),
+                    reverse=True,
+                )
+                if str(record.get("author") or "") == self.user_name
+                and not record.get("system_snapshot")
+            ),
+            None,
+        )
+        if target is None:
+            self._show_error("No shared edit by this user is available to undo", popup=True)
+            return
+        self.undo_shared_button.enabled = False
+        self._queue_action("undo_operation", sequence=int(target["sequence"]))
+        self.on_timer()
 
     def _selected_conflict(self):
         item = self.conflict_tree.currentItem()
@@ -3938,20 +5028,34 @@ class LiveCollaborationController:
 
         try:
             transport = self._transport_mode()
-            location = (
-                self._text(self.shared_folder_edit)
-                if transport == "shared-folder"
-                else self._text(self.server_edit)
-            )
+            if transport == "shared-folder":
+                location = self._text(self.shared_folder_edit)
+            elif transport == "direct-lan":
+                location = self._text(self.lan_url_edit)
+            else:
+                location = self._text(self.server_edit)
             payload = build_invitation(
                 transport,
                 self._text(self.room_edit),
                 self._current_volume_signature(),
                 location,
                 getattr(self, "material_template_state", None),
+                fallback_shared_folder=(
+                    self._text(self.shared_folder_edit)
+                    if transport == "direct-lan"
+                    else None
+                ),
+                access_code=(
+                    self._text(self.lan_access_code_edit)
+                    if transport == "direct-lan"
+                    else None
+                ),
             )
             path = qt.QFileDialog.getSaveFileName(
-                slicer.util.mainWindow(), "Export room invitation", "LiveSegmentation-room.liveseg", "Live Segmentation (*.liveseg)"
+                slicer.util.mainWindow(),
+                "Export room invitation",
+                "LiveSegmentation-room.livesegroom",
+                "Live Segmentation room (*.livesegroom)",
             )
             if path:
                 Path(str(path)).write_text(
@@ -3966,18 +5070,35 @@ class LiveCollaborationController:
         import slicer
 
         path = qt.QFileDialog.getOpenFileName(
-            slicer.util.mainWindow(), "Import room invitation", "", "Live Segmentation (*.liveseg);;JSON (*.json)"
+            slicer.util.mainWindow(),
+            "Import room invitation",
+            "",
+            "Live Segmentation room (*.livesegroom *.liveseg);;JSON (*.json)",
         )
         if not path:
             return
+        self.import_invitation_path(path)
+
+    def import_invitation_path(self, path):
+        """Load an invitation from the UI or the registered file association."""
+        import slicer
+
         try:
             invitation = parse_invitation(Path(str(path)).read_text(encoding="utf-8"))
             self.room_edit.setText(invitation["room_name"])
             if invitation["transport"] == "shared-folder":
                 self.transport_combo.setCurrentIndex(0)
                 self.shared_folder_edit.setEditText(invitation["location"])
-            else:
+            elif invitation["transport"] == "direct-lan":
                 self.transport_combo.setCurrentIndex(1)
+                self.lan_url_edit.setText(invitation["location"])
+                self.lan_access_code_edit.setText(invitation.get("access_code") or "")
+                self.shared_folder_edit.setEditText(
+                    invitation.get("fallback_shared_folder") or ""
+                )
+                self.lan_host_checkbox.checked = False
+            else:
+                self.transport_combo.setCurrentIndex(2)
                 self.server_edit.setText(invitation["location"])
             self.invitation_volume_signature = invitation["volume_signature"]
             self.material_template_state = invitation.get("material_template")
@@ -3996,6 +5117,11 @@ class LiveCollaborationController:
         self.shared_folder_clear_button.enabled = enabled
         self.server_edit.enabled = enabled
         self.api_key_edit.enabled = enabled
+        self.lan_url_edit.enabled = enabled
+        self.lan_access_code_edit.enabled = enabled
+        self.lan_host_checkbox.enabled = enabled
+        self.lan_port_spin.enabled = enabled
+        self.lan_host_button.enabled = enabled
 
     @staticmethod
     def _leave_client_in_background(client, room_id):
@@ -4089,17 +5215,47 @@ class LiveCollaborationController:
                     self._text(self.shared_folder_edit),
                     user_name,
                 )
+                connection_location = self._text(self.shared_folder_edit)
+            elif transport_mode == "direct-lan":
+                host_locally = self.lan_host_checkbox.checked
+                host_locally = (
+                    host_locally() if callable(host_locally) else host_locally
+                )
+                if host_locally and self.lan_server is None:
+                    self.toggle_lan_host()
+                    if self.lan_server is None:
+                        raise ValueError("The local LAN relay could not be started")
+                lan_client = LanRoomClient(
+                    self._text(self.lan_url_edit),
+                    user_name,
+                    self._text(self.lan_access_code_edit),
+                )
+                shared_folder = self._text(self.shared_folder_edit)
+                fallback_client = (
+                    SharedFolderRoomClient(shared_folder, user_name)
+                    if shared_folder
+                    else None
+                )
+                client = HybridRoomClient(lan_client, fallback_client)
+                connection_location = "\0".join(
+                    (self._text(self.lan_url_edit), shared_folder)
+                )
             else:
                 client = LiveRoomClient(
                     self._text(self.server_edit),
                     user_name,
                     self._text(self.api_key_edit),
                 )
+                connection_location = self._text(self.server_edit)
             self._join_context = {
                 "user_name": user_name,
                 "room_name": room_name,
                 "transport_mode": transport_mode,
                 "volume_shape": tuple(int(value) for value in volume_array.shape),
+                "volume_signature": signature,
+                "connection_identity": hashlib.sha256(
+                    connection_location.encode("utf-8")
+                ).hexdigest()[:24],
             }
             self._joining = True
             self._join_started_at = time.monotonic()
@@ -4187,6 +5343,19 @@ class LiveCollaborationController:
             self.conflicts_state.clear()
             self.backup_records.clear()
             self.last_diagnostics = None
+            self.last_benchmark = None
+            self.last_quality_report = None
+            self.session_metrics = SessionMetrics()
+            self._last_hybrid_fallback_count = int(
+                client.fallback_count if isinstance(client, HybridRoomClient) else 0
+            )
+            self.comments.clear()
+            self.resolved_comment_ids.clear()
+            self.comment_tree.clear()
+            self.review_queue_tree.clear()
+            self.quality_text.clear()
+            if self.activity_dock_text is not None:
+                self.activity_dock_text.clear()
             self.pending_actions.clear()
             self._last_advanced_fetch = 0.0
             self._last_snapshot_sequence = 0
@@ -4245,9 +5414,30 @@ class LiveCollaborationController:
             )
             settings.sync()
             self._set_connection_inputs_enabled(False)
-            shared_folder_room = isinstance(client, SharedFolderRoomClient)
+            shared_folder_room = _uses_shared_folder(client)
             if shared_folder_room:
                 self._remember_recent_shared_folder(str(client.shared_folder))
+            self._journal_context = {
+                "user_name": self.user_name,
+                "room_name": self.room_name,
+                "transport_mode": context["transport_mode"],
+                "volume_signature": context["volume_signature"],
+                "connection_identity": context["connection_identity"],
+            }
+            self._operation_journal = self._journal_for_context(
+                self._journal_context
+            )
+            self._journal_recovery = self._operation_journal.read(
+                self._journal_context
+            )
+            has_recovery = bool(self._journal_recovery)
+            self.recover_edits_button.enabled = has_recovery
+            self.discard_recovery_button.enabled = has_recovery
+            self.recovery_status_label.setText(
+                f"Found {len(self._journal_recovery)} unacknowledged edit(s) from a previous session."
+                if has_recovery
+                else "No recoverable edits for the active room"
+            )
             self.backup_enabled_checkbox.enabled = shared_folder_room
             self._on_backup_settings_changed()
             self.owner.set_live_inputs_enabled(False)
@@ -4256,6 +5446,8 @@ class LiveCollaborationController:
             self.refresh_button.enabled = True
             self.chat_input.enabled = True
             self.chat_send_button.enabled = True
+            self.comment_input.enabled = True
+            self.comment_button.enabled = True
             if self.chat_dock_input is not None:
                 self.chat_dock_input.enabled = True
                 self.chat_dock_send_button.enabled = True
@@ -4265,8 +5457,14 @@ class LiveCollaborationController:
             self.lock_expiry_spin.enabled = True
             self.refresh_history_button.enabled = True
             self.restore_revision_button.enabled = True
+            self.compare_revision_button.enabled = True
+            self.undo_shared_button.enabled = True
             self.create_snapshot_button.enabled = True
             self.run_diagnostics_button.enabled = True
+            self.export_diagnostics_button.enabled = True
+            self.export_metrics_button.enabled = True
+            self.run_quality_button.enabled = True
+            self.benchmark_button.enabled = True
             self.export_invite_button.enabled = True
             self.publish_template_button.enabled = True
             self.apply_template_button.enabled = True
@@ -4283,6 +5481,10 @@ class LiveCollaborationController:
             self.status_label.setText(self._live_status_text())
             self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
             self._update_presence(room.get("presence") or [])
+            self._append_activity(
+                f"Joined room {self.room_name} via {context['transport_mode']}"
+            )
+            self.show_activity_dock()
             self.timer.start()
         except Exception as exc:
             self._leave_client_in_background(client, room.get("id"))
@@ -4308,6 +5510,11 @@ class LiveCollaborationController:
         client = self.client
         room_id = self.room_id
         segmentation_node_id = self.segmentation_node_id
+        if notify_remote:
+            if self._operation_journal is not None:
+                self._operation_journal.clear()
+        else:
+            self._sync_operation_journal()
         self._joining = False
         self._join_started_at = 0.0
         self._join_status_second = -1
@@ -4368,6 +5575,8 @@ class LiveCollaborationController:
         self.material_template_state = None
         self.backup_records.clear()
         self.last_diagnostics = None
+        self.last_benchmark = None
+        self.last_quality_report = None
         self.pending_actions.clear()
         self._last_snapshot_sequence = 0
         self._snapshot_requested = False
@@ -4381,6 +5590,18 @@ class LiveCollaborationController:
         self._connection_error_popup_shown = False
         self._last_transport_result_at = 0.0
         self._transport_stall_status_second = -1
+        self.comments.clear()
+        self.resolved_comment_ids.clear()
+        self._journal_recovery = []
+        self._journal_context = None
+        self._operation_journal = None
+        self._remove_comparison_node()
+        if self.lan_server is not None:
+            self.lan_server.stop()
+            self.lan_server = None
+            self.lan_host_button.setText("Start LAN host")
+            self.lan_host_checkbox.checked = False
+            self.lan_status_label.setText("LAN host stopped")
         try:
             self.owner.clear_live_segmentation(segmentation_node_id)
         except Exception:
@@ -4402,6 +5623,12 @@ class LiveCollaborationController:
         self.refresh_button.enabled = False
         self.chat_input.enabled = False
         self.chat_send_button.enabled = False
+        self.comment_input.enabled = False
+        self.comment_button.enabled = False
+        self.comment_input.clear()
+        self.comment_tree.clear()
+        self.jump_to_comment_button.enabled = False
+        self.resolve_comment_button.enabled = False
         self.chat_history.clear()
         self.chat_input.clear()
         if self.chat_dock_history is not None:
@@ -4417,8 +5644,18 @@ class LiveCollaborationController:
         self.label_combo.enabled = False
         self.history_tree.clear()
         self.conflict_tree.clear()
+        self.review_queue_tree.clear()
         self.backup_tree.clear()
         self.diagnostics_text.clear()
+        self.quality_text.clear()
+        self.performance_label.setText("No live performance samples yet")
+        if self.activity_dock_text is not None:
+            self.activity_dock_text.clear()
+        if self.activity_dock is not None:
+            self.activity_dock.hide()
+        self.recover_edits_button.enabled = False
+        self.discard_recovery_button.enabled = False
+        self.recovery_status_label.setText("No recoverable edits for the active room")
         self.lock_button.enabled = False
         self.lock_button.setText("Lock selected label")
         self.lock_status_label.setText("Select a label after joining to manage its lock")
@@ -4431,12 +5668,22 @@ class LiveCollaborationController:
         for button in (
             self.refresh_history_button,
             self.restore_revision_button,
+            self.compare_revision_button,
+            self.undo_shared_button,
             self.create_snapshot_button,
             self.backup_now_button,
             self.refresh_backups_button,
             self.pin_backup_button,
             self.verify_backup_button,
             self.restore_backup_button,
+        ):
+            button.enabled = False
+        for button in (
+            self.benchmark_button,
+            self.run_diagnostics_button,
+            self.export_diagnostics_button,
+            self.export_metrics_button,
+            self.run_quality_button,
         ):
             button.enabled = False
         try:
@@ -4448,7 +5695,9 @@ class LiveCollaborationController:
         self.users_label.setText("Nobody else is connected")
 
     def cleanup(self):
-        self.leave()
+        # Preserve unacknowledged edits if Slicer exits or the module is
+        # destroyed unexpectedly. An explicit Leave remains the clean discard.
+        self.leave(notify_remote=False)
         try:
             import qt
 
@@ -4471,6 +5720,11 @@ class LiveCollaborationController:
             self.chat_dock_input = None
             self.chat_dock_send_button = None
             self.chat_dock_anchor_checkbox = None
+        if self.activity_dock is not None:
+            self.activity_dock.setParent(None)
+            self.activity_dock.deleteLater()
+            self.activity_dock = None
+            self.activity_dock_text = None
 
     def _segmentation_node(self):
         import slicer
@@ -4912,6 +6166,10 @@ class LiveCollaborationController:
 
         if not self.initial_sync_complete:
             return
+        existing_operation_ids = {
+            str(operation.get("client_operation_id") or "")
+            for operation in self.outgoing
+        }
         node = self._segmentation_node()
         for segment_id, metadata in list(self.pending_segment_deletions.items()):
             key = (self.segmentation_node_id, segment_id)
@@ -5015,6 +6273,12 @@ class LiveCollaborationController:
             self.outgoing_keys.add(key)
             self.dirty_segments.discard(key)
             self.force_snapshots.discard(key)
+        for operation in self.outgoing:
+            operation_id = str(operation.get("client_operation_id") or "")
+            if operation_id and operation_id not in existing_operation_ids:
+                self.session_metrics.operation_queued(operation_id)
+                self.session_metrics.increment("edits_queued")
+        self._sync_operation_journal()
 
     def _active_presence(self):
         details = self._current_location()
@@ -5097,7 +6361,7 @@ class LiveCollaborationController:
             return
         if not self.connected:
             return
-        if isinstance(self.client, SharedFolderRoomClient) and self._last_transport_result_at:
+        if _uses_shared_folder(self.client) and self._last_transport_result_at:
             response_silence = monotonic_now - self._last_transport_result_at
             response_state = shared_folder_response_state(response_silence)
             if response_state == "offline":
@@ -5120,7 +6384,7 @@ class LiveCollaborationController:
                     )
                 self._force_health_check = True
         if (
-            isinstance(self.client, SharedFolderRoomClient)
+            _uses_shared_folder(self.client)
             and self._connection_validation_pending
             and self._connection_validation_started_at
             and monotonic_now - self._connection_validation_started_at
@@ -5276,7 +6540,7 @@ class LiveCollaborationController:
         backup_enabled = backup_enabled() if callable(backup_enabled) else backup_enabled
         backup_check = (
             bool(backup_enabled)
-            and isinstance(self.client, SharedFolderRoomClient)
+            and _uses_shared_folder(self.client)
             and self.initial_sync_complete
             and not self.outgoing
             and not self.dirty_segments
@@ -5337,7 +6601,7 @@ class LiveCollaborationController:
                 result = {"ids": [], "rejected": [], "conflicts": [], "errors": []}
                 for operation in group:
                     try:
-                        if isinstance(client, SharedFolderRoomClient):
+                        if _uses_shared_folder(client):
                             pushed = client.push_operation(
                                 room_id, operation, defer_conflicts=True
                             )
@@ -5835,6 +7099,38 @@ class LiveCollaborationController:
                         value = client.set_material_template(room_id, action["template"])
                     elif kind == "restore_revision":
                         value = client.state_at_sequence(room_id, action["sequence"])
+                    elif kind == "compare_revision":
+                        value = client.state_at_sequence(room_id, action["sequence"])
+                    elif kind == "undo_operation":
+                        sequence = int(action["sequence"])
+                        operations = client.operations(
+                            room_id, max(0, sequence - 1), limit=1
+                        )
+                        target = next(
+                            (
+                                operation
+                                for operation in operations
+                                if int(operation.get("sequence", 0)) == sequence
+                            ),
+                            None,
+                        )
+                        if target is None:
+                            raise LiveCollaborationError(
+                                "The selected edit is no longer available for undo"
+                            )
+                        value = {
+                            "target": target,
+                            "before": client.state_at_sequence(
+                                room_id, max(0, sequence - 1)
+                            ),
+                        }
+                    elif kind == "benchmark":
+                        value = benchmark_room_transport(
+                            client,
+                            room_id,
+                            action.get("after_sequence", 0),
+                            samples=5,
+                        )
                     elif kind == "resolve_conflict":
                         state = None
                         if action["resolution"] in {"other", "union"}:
@@ -5854,6 +7150,14 @@ class LiveCollaborationController:
                 except Exception as exc:
                     action_ids.append(action["id"])
                     command_errors.append(str(exc))
+                    action_results.append(
+                        {
+                            "id": action["id"],
+                            "action": action.get("action"),
+                            "error": str(exc),
+                            "request": action,
+                        }
+                    )
             advanced = None
             if fetch_advanced:
                 advanced_fetches = [
@@ -5933,10 +7237,54 @@ class LiveCollaborationController:
                 continue
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
+            lane = str(result.get("lane") or "sync")
+            self.session_metrics.record(lane, float(result.get("duration", 0.0)))
+            if isinstance(self.client, HybridRoomClient):
+                fallback_count = int(self.client.fallback_count)
+                if fallback_count > self._last_hybrid_fallback_count:
+                    difference = fallback_count - self._last_hybrid_fallback_count
+                    self.session_metrics.increment("shared_folder_fallbacks", difference)
+                    self._append_activity(
+                        "Direct LAN was unavailable; used shared-folder fallback "
+                        f"for {difference} request(s)"
+                    )
+                self._last_hybrid_fallback_count = fallback_count
+            if lane == "local-quality":
+                self.run_quality_button.enabled = True
+                if "error" in result:
+                    self.quality_text.setPlainText(
+                        f"Quality analysis failed: {result['error']}"
+                    )
+                else:
+                    self.last_quality_report = dict(result.get("quality") or {})
+                    issues = self.last_quality_report.get("issues") or []
+                    lines = [
+                        f"Checked {len(self.last_quality_report.get('labels') or {})} labels — "
+                        f"{len(issues)} issue(s)."
+                    ]
+                    for issue in issues[:30]:
+                        issue_type = str(issue.get("type") or "issue")
+                        if issue_type == "overlap":
+                            lines.append(
+                                f"• overlap: {' / '.join(issue.get('segments') or [])} — "
+                                f"{issue.get('voxels', 0)} voxels"
+                            )
+                        else:
+                            label = issue.get("segment_id") or "label"
+                            detail = ", ".join(
+                                f"{key}={value}"
+                                for key, value in issue.items()
+                                if key not in {"type", "segment_id"}
+                            )
+                            lines.append(f"• {issue_type}: {label} ({detail})")
+                    self.quality_text.setPlainText("\n".join(lines))
+                    self.session_metrics.increment("quality_issues", len(issues))
+                self._update_performance_label()
+                continue
             self._last_transport_result_at = time.monotonic()
             if "error" in result:
                 if (
-                    isinstance(self.client, SharedFolderRoomClient)
+                    _uses_shared_folder(self.client)
                     and result.get("lane") == "maintenance"
                     and result.get("health_checked")
                     and not result.get("health_ok")
@@ -5953,7 +7301,7 @@ class LiveCollaborationController:
                     )
                     continue
                 if (
-                    isinstance(self.client, SharedFolderRoomClient)
+                    _uses_shared_folder(self.client)
                     and _is_transient_shared_read_error(result["error"])
                     and result.get("lane") != "maintenance"
                 ):
@@ -6039,6 +7387,7 @@ class LiveCollaborationController:
                     elif operation_id not in awaiting_ids:
                         self.awaiting_echo.append(operation)
                         awaiting_ids.add(operation_id)
+                self._sync_operation_journal()
             sent_chat_ids = set(result.get("chat_ids") or [])
             if sent_chat_ids:
                 self.pending_chat = [
@@ -6088,6 +7437,9 @@ class LiveCollaborationController:
                     f"Concurrent edits overlapped in {overlap} voxels. Review the conflict panel."
                 )
                 self._force_advanced_refresh = True
+                self.session_metrics.increment(
+                    "conflicts_detected", len(result["conflicts_detected"])
+                )
             for segment_id in result.get("rejected_segments") or []:
                 if self.segmentation_node_id:
                     self.dirty_segments.add((self.segmentation_node_id, segment_id))
@@ -6118,6 +7470,9 @@ class LiveCollaborationController:
                     )
                 self._last_error = None
             self._update_lock_controls()
+            if time.monotonic() - self._last_metrics_display >= 0.5:
+                self._last_metrics_display = time.monotonic()
+                self._update_performance_label()
             # Applying a received voxel patch to MRML can itself take several
             # seconds on a large volume.  Refresh the transport timestamp after
             # all local result processing so that CPU/rendering time is never
@@ -6138,6 +7493,153 @@ class LiveCollaborationController:
                 "base_sequence": int(self.last_sequence),
             }
             self.outgoing.append(queued)
+            self.session_metrics.operation_queued(queued["client_operation_id"])
+            self.session_metrics.increment("snapshot_edits_queued")
+        self._sync_operation_journal()
+
+    def _remove_comparison_node(self):
+        if not self._comparison_node_id:
+            return
+        try:
+            import slicer
+
+            node = slicer.mrmlScene.GetNodeByID(self._comparison_node_id)
+            if node is not None:
+                slicer.mrmlScene.RemoveNode(node)
+        except Exception:
+            pass
+        self._comparison_node_id = None
+
+    def _show_revision_comparison(self, historical_operations, sequence):
+        """Overlay voxels added/removed since a historical room sequence."""
+        import slicer
+
+        node = self._segmentation_node()
+        if node is None:
+            raise LiveCollaborationError("The shared segmentation is unavailable")
+        shape = tuple(int(value) for value in self.volume_shape)
+        added = np.zeros(shape, dtype=bool)
+        removed = np.zeros(shape, dtype=bool)
+        historical = {}
+        for operation in historical_operations or []:
+            segment_id = str(operation.get("segment_id") or "")
+            if segment_id:
+                historical[segment_id] = apply_mask_delta(
+                    np.zeros(shape, dtype=np.uint8), operation
+                ).astype(bool)
+        current_ids = set(node.GetSegmentation().GetSegmentIDs())
+        for segment_id in current_ids | set(historical):
+            current = (
+                self._read_mask(node, segment_id).astype(bool)
+                if segment_id in current_ids
+                else np.zeros(shape, dtype=bool)
+            )
+            previous = historical.get(segment_id)
+            if previous is None:
+                previous = np.zeros(shape, dtype=bool)
+            added |= current & ~previous
+            removed |= previous & ~current
+
+        self._remove_comparison_node()
+        comparison = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", f"Live comparison — revision {int(sequence)}"
+        )
+        comparison.SetAttribute("LiveSegmentation.RevisionComparison", "1")
+        comparison.CreateDefaultDisplayNodes()
+        comparison.SetReferenceImageGeometryParameterFromVolumeNode(
+            self.owner.get_volume_node()
+        )
+        for segment_id, name, color, mask in (
+            ("Added", "Added since revision", (0.1, 0.9, 0.2), added),
+            ("Removed", "Removed since revision", (0.95, 0.15, 0.15), removed),
+        ):
+            segment = slicer.vtkSegment()
+            segment.SetName(name)
+            segment.SetColor(*color)
+            comparison.GetSegmentation().AddSegment(segment, segment_id)
+            self.owner.update_segment_binary_labelmap_from_array(
+                mask.astype(np.uint8),
+                comparison,
+                segment_id,
+                self.owner.get_volume_node(),
+            )
+        self._comparison_node_id = comparison.GetID()
+        display = comparison.GetDisplayNode()
+        if display is not None:
+            for segment_id in ("Added", "Removed"):
+                display.SetSegmentOpacity2DFill(segment_id, 0.25)
+                display.SetSegmentOpacity2DOutline(segment_id, 1.0)
+        self._append_activity(
+            f"Opened comparison: revision {int(sequence)} versus current state"
+        )
+        slicer.util.showStatusMessage(
+            f"Comparison ready: {int(np.count_nonzero(added))} added and "
+            f"{int(np.count_nonzero(removed))} removed voxels",
+            5000,
+        )
+
+    def _queue_collaborative_undo(self, value, sequence):
+        target = dict((value or {}).get("target") or {})
+        segment_id = str(target.get("segment_id") or "")
+        if not segment_id:
+            raise LiveCollaborationError("The edit selected for undo has no label")
+        before_operation = next(
+            (
+                operation
+                for operation in (value or {}).get("before") or []
+                if str(operation.get("segment_id") or "") == segment_id
+            ),
+            None,
+        )
+        if target.get("segment_deleted"):
+            if before_operation is None:
+                raise LiveCollaborationError(
+                    "The deleted label did not exist before this edit"
+                )
+            self._queue_snapshot_operations(
+                [{**before_operation, "undo_of_sequence": int(sequence)}]
+            )
+            return
+
+        node = self._segmentation_node()
+        if node is None or node.GetSegmentation().GetSegment(segment_id) is None:
+            raise LiveCollaborationError(
+                "The label no longer exists; restore a revision instead"
+            )
+        current = self._read_mask(node, segment_id)
+        previous = (
+            apply_mask_delta(np.zeros_like(current), before_operation)
+            if before_operation is not None
+            else np.zeros_like(current)
+        )
+        changed, target_values = decode_mask_delta(target)
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in target["voxel_bbox"]]
+        current_region = current[z0:z1, y0:y1, x0:x1]
+        previous_region = previous[z0:z1, y0:y1, x0:x1]
+        # Only revert voxels that still carry the value written by the target
+        # operation. Later edits by collaborators are preserved.
+        restore = changed & (current_region == target_values)
+        desired = current.copy()
+        desired_region = desired[z0:z1, y0:y1, x0:x1]
+        desired_region[restore] = previous_region[restore]
+        encoded = encode_mask_delta(current, desired, replace=False)
+        if encoded is None:
+            raise LiveCollaborationError(
+                "Nothing can be undone because all affected voxels changed later"
+            )
+        queued = {
+            "client_operation_id": str(uuid.uuid4()),
+            "segment_id": segment_id,
+            "segment_name": target.get("segment_name") or segment_id,
+            "color_hex": target.get("color_hex") or "#4A90E2",
+            "base_sequence": int(self.last_sequence),
+            "undo_of_sequence": int(sequence),
+            **encoded,
+        }
+        self.outgoing.append(queued)
+        self.session_metrics.operation_queued(queued["client_operation_id"])
+        self.session_metrics.increment("collaborative_undo_queued")
+        self._sync_operation_journal()
 
     def _handle_action_results(self, results):
         import slicer
@@ -6146,6 +7648,18 @@ class LiveCollaborationController:
             action = result.get("action")
             value = result.get("value")
             request = result.get("request") or {}
+            if result.get("error"):
+                if action == "compare_revision":
+                    self.compare_revision_button.enabled = True
+                elif action == "undo_operation":
+                    self.undo_shared_button.enabled = True
+                elif action == "benchmark":
+                    self.benchmark_button.enabled = True
+                self._show_error(
+                    f"{str(action or 'Collaboration action').replace('_', ' ')} failed: "
+                    f"{result['error']}"
+                )
+                continue
             if action == "restore_revision":
                 self._queue_snapshot_operations(value)
                 self._restoring_sequence = None
@@ -6232,6 +7746,24 @@ class LiveCollaborationController:
                         },
                     }
                 )
+            elif action == "compare_revision":
+                self._show_revision_comparison(value or [], request.get("sequence", 0))
+                self.compare_revision_button.enabled = True
+            elif action == "undo_operation":
+                self._queue_collaborative_undo(value, request.get("sequence", 0))
+                self.undo_shared_button.enabled = True
+                self._force_sync_refresh = True
+                slicer.util.showStatusMessage(
+                    f"Collaborative undo queued for sequence {request.get('sequence')}",
+                    4000,
+                )
+            elif action == "benchmark":
+                self.last_benchmark = dict(value or {})
+                self.benchmark_button.enabled = True
+                self._update_performance_label()
+                self.diagnostics_text.setPlainText(
+                    json.dumps(self.last_benchmark, ensure_ascii=False, indent=2)
+                )
                 self.diagnostics_text.setPlainText(
                     json.dumps(self.last_diagnostics, ensure_ascii=False, indent=2)
                 )
@@ -6292,6 +7824,12 @@ class LiveCollaborationController:
                 activity_type = "checkpoint"
                 if record.get("snapshot_label"):
                     action += f" “{record.get('snapshot_label')}”"
+            elif record.get("undo_of_sequence"):
+                action = (
+                    f"{author} undid sequence {record.get('undo_of_sequence')} "
+                    f"on label “{segment_name}”"
+                )
+                activity_type = "collaborative undo"
             elif record.get("segment_deleted"):
                 action = f"{author} deleted label “{segment_name}”"
                 activity_type = "label deleted"
@@ -6364,6 +7902,37 @@ class LiveCollaborationController:
         self.review_states_state = {
             str(item.get("segment_id")): item for item in advanced.get("reviews") or []
         }
+        self.review_queue_tree.clear()
+        review_order = {
+            "changes_requested": 0,
+            "ready_for_review": 1,
+            "in_progress": 2,
+            "draft": 3,
+            "approved": 4,
+        }
+        for segment_id, review in sorted(
+            self.review_states_state.items(),
+            key=lambda item: (
+                review_order.get(str(item[1].get("state") or "draft"), 9),
+                str(item[0]).casefold(),
+            ),
+        ):
+            node = self._segmentation_node()
+            segment = (
+                node.GetSegmentation().GetSegment(segment_id)
+                if node is not None
+                else None
+            )
+            item = qt.QTreeWidgetItem(
+                [
+                    str(review.get("state") or "draft").replace("_", " "),
+                    segment.GetName() if segment is not None else segment_id,
+                    str(review.get("updated_by") or ""),
+                    str(review.get("note") or ""),
+                ]
+            )
+            item.setData(0, 32, segment_id)
+            self.review_queue_tree.addTopLevelItem(item)
         self.access_requests_state = list(advanced.get("access_requests") or [])
         self.material_template_state = advanced.get("material_template")
         snapshots = advanced.get("snapshots") or []
@@ -6381,6 +7950,11 @@ class LiveCollaborationController:
             author = str(message.get("author") or "Unknown")
             text = str(message.get("text") or "")
             anchor = message.get("anchor")
+            message_kind = (
+                str(anchor.get("message_kind") or "chat")
+                if isinstance(anchor, dict)
+                else "chat"
+            )
             client_message_id = str(message.get("client_message_id") or "")
             message_key = (
                 f"{author}\0{client_message_id}"
@@ -6398,6 +7972,15 @@ class LiveCollaborationController:
                         f"[{clock_text}] {author}: {text[:60]}", sequence
                     )
                     self.jump_to_chat_button.enabled = True
+            if message_kind == "comment":
+                self._register_comment(message)
+            elif message_kind == "comment-resolution":
+                target_comment_id = str(anchor.get("target_comment_id") or "")
+                if target_comment_id:
+                    self.resolved_comment_ids.add(target_comment_id)
+                    if target_comment_id in self.comments:
+                        self.comments[target_comment_id]["resolved"] = True
+                    self._refresh_comment_tree()
             self.optimistic_chat_ids.discard(client_message_id)
             self.displayed_chat_ids.add(message_key)
             self.displayed_chat_sequences.add(sequence)
@@ -6480,6 +8063,13 @@ class LiveCollaborationController:
         self.set_role_button.enabled = role == "admin" and bool(self.presence_by_user)
         current_review = self.review_states_state.get(segment_id) or {}
         review_state = str(current_review.get("state") or "draft")
+        review_note = str(current_review.get("note") or "").strip()
+        current_status = self.lock_status_label.text
+        current_status = current_status() if callable(current_status) else current_status
+        self.lock_status_label.setText(
+            f"{current_status} · review: {review_state.replace('_', ' ')}"
+            + (f" — {review_note}" if review_note else "")
+        )
         for index in range(self.review_state_combo.count):
             if str(self.review_state_combo.itemData(index)) == review_state:
                 self.review_state_combo.setCurrentIndex(index)
@@ -6531,7 +8121,7 @@ class LiveCollaborationController:
             )
             retention = self.backup_retention_spin.value
             retention = retention() if callable(retention) else retention
-            if isinstance(self.client, SharedFolderRoomClient):
+            if _uses_shared_folder(self.client):
                 self.client.prune_project_backups(self.room_id, int(retention))
                 self._queue_action("list_backups")
             self.backup_status_label.setText(
@@ -6600,10 +8190,14 @@ class LiveCollaborationController:
             # result is drained. Remember that ordering so the sent operation
             # is not re-added to awaiting_echo.
             self._applied_local_operation_ids.add(operation_id)
+        self.session_metrics.operation_acknowledged(operation_id)
+        self._sync_operation_journal()
 
     def _apply_operations(self, operations):
         import slicer
 
+        apply_started = time.monotonic()
+        applied_count = 0
         node = self._segmentation_node()
         if node is None:
             self._show_error("The shared segmentation node no longer exists")
@@ -6640,6 +8234,10 @@ class LiveCollaborationController:
                     self.review_states_state.pop(segment_id, None)
                     node.Modified()
                     if operation.get("author") != self.user_name:
+                        self._append_activity(
+                            f"{operation.get('author') or 'Collaborator'} deleted label "
+                            f"{operation.get('segment_name') or segment_id}"
+                        )
                         slicer.util.showStatusMessage(
                             f"Live: {operation.get('author')} deleted label "
                             f"{operation.get('segment_name') or segment_id}",
@@ -6648,6 +8246,7 @@ class LiveCollaborationController:
                     else:
                         self._acknowledge_local_operation(operation)
                     self.last_sequence = sequence
+                    applied_count += 1
                     continue
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
@@ -6766,6 +8365,10 @@ class LiveCollaborationController:
                 self._remember_segment_revision(node, segment_id)
                 self._set_segment_collaboration_tags(segment_id)
                 if operation.get("author") != self.user_name:
+                    self._append_activity(
+                        f"{operation.get('author') or 'Collaborator'} updated label "
+                        f"{operation.get('segment_name') or segment_id} · sequence {sequence}"
+                    )
                     highlight_changed = changed
                     if (
                         operation.get("operation_kind") == "snapshot"
@@ -6800,11 +8403,15 @@ class LiveCollaborationController:
                     self._acknowledge_local_operation(operation)
                     self._schedule_segment_verification(key, duration=0.8)
                 self.last_sequence = sequence
+                applied_count += 1
             except Exception as exc:
                 self._show_error(f"Could not apply live edit {sequence}: {exc}")
                 return
             finally:
                 self._applying_remote = False
+        if applied_count:
+            self.session_metrics.record("apply", time.monotonic() - apply_started)
+            self.session_metrics.increment("operations_applied", applied_count)
 
     def _update_presence(self, users):
         others = [entry for entry in users if entry.get("user") != self.user_name]

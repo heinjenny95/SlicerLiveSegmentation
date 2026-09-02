@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,210 @@ REVIEW_STATES = (
     "approved",
 )
 INVITATION_FORMAT = "live-segmentation-invitation-v1"
+INVITATION_FORMAT_V2 = "live-segmentation-room-v2"
+
+
+class SessionMetrics:
+    """Small in-memory latency/counter collector with sanitized export."""
+
+    def __init__(self, sample_limit=200):
+        self.sample_limit = max(10, int(sample_limit))
+        self.started_at_epoch = time.time()
+        self.samples = {}
+        self.counters = {}
+        self.bytes = {}
+        self._queued_operations = {}
+
+    def record(self, stage, duration_seconds, byte_count=0):
+        stage = str(stage or "unknown")
+        duration = max(0.0, float(duration_seconds or 0.0))
+        values = self.samples.setdefault(stage, [])
+        values.append(duration)
+        del values[: max(0, len(values) - self.sample_limit)]
+        self.counters[stage] = int(self.counters.get(stage, 0)) + 1
+        self.bytes[stage] = int(self.bytes.get(stage, 0)) + max(0, int(byte_count or 0))
+
+    def increment(self, name, amount=1):
+        name = str(name or "unknown")
+        self.counters[name] = int(self.counters.get(name, 0)) + int(amount)
+
+    def operation_queued(self, operation_id, started=None):
+        operation_id = str(operation_id or "")
+        if operation_id:
+            self._queued_operations[operation_id] = float(started or time.monotonic())
+
+    def operation_acknowledged(self, operation_id, finished=None):
+        operation_id = str(operation_id or "")
+        started = self._queued_operations.pop(operation_id, None)
+        if started is None:
+            return None
+        duration = max(0.0, float(finished or time.monotonic()) - started)
+        self.record("edit_roundtrip", duration)
+        return duration
+
+    def summary(self):
+        stages = {}
+        for stage, values in sorted(self.samples.items()):
+            if not values:
+                continue
+            ordered = sorted(values)
+            p95_index = min(len(ordered) - 1, max(0, int(round(0.95 * len(ordered) - 1))))
+            stages[stage] = {
+                "count": len(values),
+                "last_ms": round(values[-1] * 1000.0, 2),
+                "mean_ms": round(sum(values) * 1000.0 / len(values), 2),
+                "p95_ms": round(ordered[p95_index] * 1000.0, 2),
+                "max_ms": round(max(values) * 1000.0, 2),
+                "bytes": int(self.bytes.get(stage, 0)),
+            }
+        return {
+            "format": "live-segmentation-session-metrics-v1",
+            "session_seconds": round(max(0.0, time.time() - self.started_at_epoch), 2),
+            "stages": stages,
+            "counters": {key: int(value) for key, value in sorted(self.counters.items())},
+            "pending_roundtrips": len(self._queued_operations),
+        }
+
+
+class PendingOperationJournal:
+    """Crash-safe local journal for unacknowledged operations.
+
+    The journal root is local application storage. Loading the journal never
+    resolves or touches a collaboration path contained in its context.
+    """
+
+    FORMAT = "live-segmentation-pending-operations-v1"
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def write(self, context, operations):
+        operations = [dict(item) for item in operations or []]
+        if not operations:
+            self.clear()
+            return
+        payload = {
+            "format": self.FORMAT,
+            "updated_at_epoch": time.time(),
+            "context": dict(context or {}),
+            "operations": operations,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+
+    def read(self, expected_context=None):
+        if not self.path.is_file():
+            return []
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if payload.get("format") != self.FORMAT:
+            return []
+        if expected_context is not None:
+            actual = payload.get("context") or {}
+            for key, value in dict(expected_context).items():
+                if str(actual.get(key) or "") != str(value or ""):
+                    return []
+        return [dict(item) for item in payload.get("operations") or [] if isinstance(item, dict)]
+
+    def clear(self):
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def segmentation_quality_report(masks, min_component_voxels=20):
+    """Return deterministic empty/component/overlap checks for label masks."""
+    normalized = {
+        str(segment_id): np.asarray(mask, dtype=bool)
+        for segment_id, mask in dict(masks or {}).items()
+    }
+    issues = []
+    labels = {}
+    try:
+        from scipy import ndimage
+    except ImportError:  # Slicer normally ships SciPy; keep a bounded fallback.
+        ndimage = None
+    for segment_id, mask in normalized.items():
+        voxel_count = int(np.count_nonzero(mask))
+        item = {"segment_id": segment_id, "voxels": voxel_count, "components": 0}
+        if voxel_count == 0:
+            issues.append({"type": "empty", "segment_id": segment_id, "voxels": 0})
+            labels[segment_id] = item
+            continue
+        if ndimage is not None:
+            component_map, component_count = ndimage.label(mask)
+            sizes = np.bincount(component_map.ravel())[1:]
+        else:
+            remaining = {tuple(int(value) for value in point) for point in np.argwhere(mask)}
+            sizes = []
+            while remaining:
+                pending = [remaining.pop()]
+                size = 0
+                while pending:
+                    point = pending.pop()
+                    size += 1
+                    for axis in range(mask.ndim):
+                        for direction in (-1, 1):
+                            neighbor = list(point)
+                            neighbor[axis] += direction
+                            neighbor = tuple(neighbor)
+                            if neighbor in remaining:
+                                remaining.remove(neighbor)
+                                pending.append(neighbor)
+                sizes.append(size)
+            component_count = len(sizes)
+        small = [int(value) for value in sizes if int(value) < int(min_component_voxels)]
+        item["components"] = int(component_count)
+        item["small_components"] = len(small)
+        if component_count > 1:
+            issues.append(
+                {
+                    "type": "disconnected",
+                    "segment_id": segment_id,
+                    "components": int(component_count),
+                }
+            )
+        if small:
+            issues.append(
+                {
+                    "type": "small-components",
+                    "segment_id": segment_id,
+                    "count": len(small),
+                    "smallest_voxels": min(small),
+                }
+            )
+        labels[segment_id] = item
+    segment_ids = sorted(normalized, key=str.casefold)
+    for index, first_id in enumerate(segment_ids):
+        for second_id in segment_ids[index + 1 :]:
+            if normalized[first_id].shape != normalized[second_id].shape:
+                continue
+            overlap = int(np.count_nonzero(normalized[first_id] & normalized[second_id]))
+            if overlap:
+                issues.append(
+                    {
+                        "type": "overlap",
+                        "segments": [first_id, second_id],
+                        "voxels": overlap,
+                    }
+                )
+    return {
+        "format": "live-segmentation-quality-report-v1",
+        "labels": labels,
+        "issues": issues,
+        "issue_count": len(issues),
+        "min_component_voxels": int(min_component_voxels),
+    }
 
 
 def operation_changed_voxel_count(operation, decode_mask_delta):
@@ -76,6 +282,7 @@ def operation_summary(operation, decode_mask_delta=None):
         "system_snapshot": bool(operation.get("system_snapshot", False)),
         "segment_deleted": bool(operation.get("segment_deleted", False)),
         "client_operation_id": operation.get("client_operation_id"),
+        "undo_of_sequence": operation.get("undo_of_sequence"),
     }
     if operation.get("changed_voxels") is not None:
         result["changed_voxels"] = int(operation["changed_voxels"])
@@ -167,12 +374,24 @@ def validate_material_template(payload):
     }
 
 
-def build_invitation(transport, room_name, volume_signature, location, template=None):
-    """Create a secret-free portable room invitation payload."""
-    if transport not in {"shared-folder", "server"}:
+def build_invitation(
+    transport,
+    room_name,
+    volume_signature,
+    location,
+    template=None,
+    fallback_shared_folder=None,
+    access_code=None,
+):
+    """Create a portable room invitation payload.
+
+    Server API keys are never included. Direct-LAN invitations intentionally
+    carry their temporary session code and must therefore be shared privately.
+    """
+    if transport not in {"shared-folder", "server", "direct-lan"}:
         raise ValueError("Unsupported invitation transport")
     result = {
-        "format": INVITATION_FORMAT,
+        "format": INVITATION_FORMAT_V2 if transport == "direct-lan" else INVITATION_FORMAT,
         "transport": transport,
         "room_name": str(room_name or "").strip(),
         "volume_signature": str(volume_signature or "").strip(),
@@ -182,13 +401,20 @@ def build_invitation(transport, room_name, volume_signature, location, template=
         raise ValueError("Invitation is missing room, dataset signature, or location")
     if template is not None:
         result["material_template"] = validate_material_template(template)
+    if fallback_shared_folder:
+        result["fallback_shared_folder"] = str(fallback_shared_folder).strip()
+    if access_code:
+        result["access_code"] = str(access_code).strip()
     return result
 
 
 def parse_invitation(payload):
     if isinstance(payload, (str, bytes)):
         payload = json.loads(payload)
-    if not isinstance(payload, dict) or payload.get("format") != INVITATION_FORMAT:
+    if not isinstance(payload, dict) or payload.get("format") not in {
+        INVITATION_FORMAT,
+        INVITATION_FORMAT_V2,
+    }:
         raise ValueError("This is not a Live Segmentation invitation")
     return build_invitation(
         payload.get("transport"),
@@ -196,6 +422,8 @@ def parse_invitation(payload):
         payload.get("volume_signature"),
         payload.get("location"),
         payload.get("material_template"),
+        payload.get("fallback_shared_folder"),
+        payload.get("access_code"),
     )
 
 

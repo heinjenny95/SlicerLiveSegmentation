@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.11.6.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.12.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.11.6`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.12.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -102,6 +102,14 @@ an entry copies it into the field; network access starts only after **Join live
 room**. Failed locations are not remembered, and **Clear list** removes the
 local history.
 
+Version 0.12.0 adds an optional one-click direct-LAN relay with automatic
+shared-folder fallback, live stage-by-stage latency measurements, a
+non-destructive connection benchmark, persistent spatial comment threads, an
+always-visible activity dock, collaborative undo, local crash recovery,
+review queues, segmentation QA checks, revision comparison overlays,
+double-clickable `.livesegroom` invitations, and anonymized session-metrics
+export. The pre-existing room-template feature is unchanged.
+
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
 subdirectory containing room metadata, ordered voxel operations, and expiring
@@ -121,12 +129,23 @@ to the same voxel, the operation ordered later by the shared transport wins.
   Round trips of 2.5 seconds or more are marked as a slow connection. **Sync
   now** immediately requests participants, edits, chat, locks, and a health
   check without rescanning history or backups.
+- **Direct LAN with fallback:** one participant can start a lightweight LAN
+  relay from the module and export a `.livesegroom` invitation. Collaborators
+  prefer that direct HTTP path and automatically use the same shared-folder
+  room when the relay is temporarily unavailable. The access-code relay is
+  unencrypted and is intended only for a trusted institutional LAN or VPN.
+- **Latency and benchmark panel:** publish, receive, apply/render, chat, and
+  edit-roundtrip timings update during the session. **Benchmark** performs
+  repeated non-destructive health and live-feed reads and rates the connection.
 - **Permanent room chat:** messages are stored in the room and reappear after
   leaving, restarting Slicer, or joining from another computer. Messages can
   carry a Slicer crosshair/slice location and jump collaborators directly there.
   The sender sees a message immediately while it is persisted independently in
   the background. A persistent Slicer dock keeps chat visible while Segment
   Editor or another module is active.
+- **Spatial comment threads:** a comment can be attached to the selected label,
+  crosshair, and slice offsets, revisited from a queue, and resolved without
+  deleting the permanent discussion record.
 - **Live spatial presence:** online users publish active label, editor effect,
   crosshair and slice offsets. Users can jump to a collaborator or follow that
   person's view. Remote voxel changes receive a short-lived colored outline.
@@ -143,6 +162,13 @@ to the same voxel, the operation ordered later by the shared transport wins.
   appear as soon as their ordered operation arrives (for example,
   `07:34 Jenny created label “Label 1”`). A selected revision can be restored as
   a new append-only revision, so no history is silently rewritten.
+- **Collaborative undo and comparison:** **Undo my last shared edit** publishes
+  an inverse operation instead of rewinding shared history and preserves voxels
+  changed later by another participant. **Compare with current** creates a
+  display-only Added/Removed overlay for a selected historical sequence.
+- **Review queue and QA:** review states are sorted into a visible queue.
+  On-demand quality checks report empty labels, disconnected or very small
+  components, and overlaps between labels without changing voxel data.
 - **Snapshots and compaction:** complete segment states are periodically appended
   as one cropped clear snapshot plus zero-sparse 64³ chunk patches using the
   normal backwards-compatible operation format. Widely separated components do
@@ -161,11 +187,18 @@ to the same voxel, the operation ordered later by the shared transport wins.
   space, operation/snapshot/archive counts, pending changes, and backup count.
   A sanitized diagnostic JSON report intentionally omits users, room names,
   server URLs, and shared-folder paths.
+- **Crash recovery and research metrics:** unacknowledged edits are journaled in
+  local application storage and can be replayed idempotently after rejoining the
+  same user/room/dataset/connection. An anonymized JSON export contains only
+  timing distributions, byte/count totals, fallback counts, and aggregate QA
+  counts—never user names, room names, URLs, or paths.
 - **Room material templates:** administrators can publish required label IDs,
   names, colors, and Slicer/DICOM terminology entries. The template creates
   missing labels without replacing existing voxel data.
-- **Portable invitations:** secret-free `.liveseg` files populate room and
-  connection settings and verify that the selected source volume matches.
+- **Portable invitations:** `.livesegroom` files populate room and connection
+  settings, carry the temporary direct-LAN session code when applicable, and
+  verify that the selected source volume matches. The Windows installer
+  registers them for double-click opening; legacy `.liveseg` files still import.
 - **Clean leave/rejoin:** leaving detaches Segment Editor and removes every local
   room replica. Rejoining always rebuilds exactly one clean replica from the
   permanent operation history.
@@ -231,7 +264,8 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 43 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
+- 54 automated transport, API, direct-LAN/fallback, crash-recovery, QA,
+  chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel
@@ -256,6 +290,10 @@ legacy shared API key does not verify individual identities.
 - A real Slicer 5.12.3 deletion smoke test confirmed that local label removal
   publishes a tombstone, a peer deletion removes the complete MRML segment,
   historical reconstruction excludes it, and it remains absent after rejoin.
+- A real Slicer 5.12.3 direct-LAN smoke test joined through the one-click relay,
+  published a 27-voxel edit in about 0.2 seconds, and passed spatial comments,
+  QA, benchmark, review queue, revision overlay, collaborative undo, and
+  end-to-end latency-metrics checks.
 
 Use only an institutionally approved shared folder with suitable access
 controls. Segmentation changes may themselves represent sensitive research or

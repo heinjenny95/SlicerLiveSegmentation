@@ -9,7 +9,11 @@
    and expiring presence records using atomic file publication.
 3. An optional FastAPI transport exposes the same live-room operations through
    HTTP and persists them in SQLite.
-4. Drawing and inference tools are outside this extension. They interoperate by
+4. An optional in-process `ThreadingHTTPServer` exposes the shared-folder client
+   on a trusted LAN. A hybrid client prefers this relay and uses the same
+   persistent shared room as fallback. The relay uses only Python's standard
+   library and a temporary access code.
+5. Drawing and inference tools are outside this extension. They interoperate by
    modifying the room-managed MRML Segmentation node.
 
 ## Data flow
@@ -28,7 +32,9 @@ Segment Editor or another separately installed tool
              |                       |
       shared/network folder    optional HTTP server
              |                       |
-             +------ ordered log ----+
+       optional LAN relay ------------+
+             |       preferred path
+             +------ ordered log -----+
                          |
                          v
               collaborating clients
@@ -73,6 +79,28 @@ color, crosshair RAS position, and Red/Yellow/Green slice offsets. Following a
 user changes local view state only. Incoming changes create a separate temporary
 display-only Segmentation node, so highlight geometry never enters the shared
 operation observer.
+
+Remote operations also append to a persistent local activity dock. Spatial
+comments reuse the permanent chat log with a message-kind marker, stable comment
+ID, segment metadata, crosshair and slice offsets; resolution is another
+append-only chat event.
+
+## Revisions, undo, quality, and metrics
+
+Historical state reconstruction remains append-only. A comparison request
+builds a separate display-only Segmentation node containing the union of voxels
+added and removed since the chosen sequence. Collaborative undo reads the target
+operation plus its immediate prior label state, then publishes an inverse patch.
+It changes only target voxels that still equal the target operation's written
+value, preserving later changes on the same region.
+
+Quality checks copy current masks on the GUI thread and analyze them on a daemon
+worker for empty labels, connected components, small components, and pairwise
+overlap. Session metrics retain a bounded in-memory sample window per lane and
+export only aggregate timing/count/byte statistics. Unacknowledged outgoing
+operations are atomically journaled under Slicer's local application-data
+directory, keyed by user, room, dataset signature, transport, and a hash of the
+connection identity; no saved UNC path is probed during startup.
 
 ## Dataset protection, presence, and connection health
 

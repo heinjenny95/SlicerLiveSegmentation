@@ -169,14 +169,15 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 47,
+            "automated_tests": 54,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
                 "backups-history-chunked-snapshot-conflict-review-diagnostics-"
                 "fast-connection-reset-label-deletion-exact-rejoin-"
                 "nonblocking-startup-shutdown-two-stage-latency-watchdog-"
-                "safe-recent-folder-history"
+                "safe-recent-folder-history-direct-lan-fallback-spatial-comments-"
+                "quality-benchmark-review-comparison-collaborative-undo-metrics"
             ),
             "two_process_slicer_live_sync_test": (
                 "passed-two-slicer-256-cubed-bidirectional-rapid-three-component-"

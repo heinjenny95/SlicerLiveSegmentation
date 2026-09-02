@@ -8,8 +8,10 @@
 - Releasearchive lassen sich vollständig öffnen
 - Manifestgrößen stimmen mit den erzeugten Dateien überein
 - SHA-256-Prüfsummen stimmen
-- mindestens 21 Transport-, API- und Protokolltests erfolgreich
+- mindestens 54 Transport-, API- und Protokolltests erfolgreich
 - echter erweiterter Slicer-Smoke-Test erfolgreich
+- echter Direct-LAN-, Fallback-, Undo-, QA- und Revisionsvergleichstest erfolgreich
+- `.livesegroom`-Dateizuordnung und Doppelklick-Import geprüft
 - Archive enthalten keine `.git`, `.venv`, Datenbank-, Patientendaten- oder Secret-Dateien
 
 ## Manuell vor produktiver Nutzung

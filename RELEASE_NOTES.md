@@ -1,4 +1,63 @@
-# Live Segmentation 0.11.6
+# Live Segmentation 0.12.0
+
+Version 0.12.0 turns the existing low-latency collaboration core into a more
+complete biological segmentation workspace. Room templates were deliberately
+left unchanged in this release.
+
+## Faster connection choices and visible performance
+
+- **Direct LAN + shared-folder fallback** starts a dependency-free relay inside
+  Slicer, protects it with a temporary session code, prefers the LAN path, and
+  falls back to the identical persistent shared-folder room.
+- The performance line separates publish, receive, local apply/render, chat,
+  and full edit-roundtrip latency. A non-destructive five-sample benchmark
+  reports minimum, median, p95, maximum, errors, and an overall rating.
+- The direct relay and every existing live lane remain background operations;
+  an unavailable LAN host or shared folder does not block Slicer's GUI thread.
+
+## Collaboration, review, and recovery
+
+- Persistent spatial comments attach a discussion to a label and Slicer
+  location, support jump-to-position and resolution, and reuse the permanent
+  room-chat log.
+- A persistent activity dock keeps remote label updates visible while Segment
+  Editor or another module is open; the existing voxel highlight remains.
+- Collaborative undo publishes an append-only inverse operation and reverts
+  only voxels that still contain the value written by the selected edit, so
+  later collaborator changes are preserved.
+- Unacknowledged edits are written atomically to a local, context-bound crash
+  journal and may be replayed idempotently after joining the same room and
+  dataset. Explicitly leaving clears the journal.
+- Review states are displayed as a priority queue. Historical revisions can be
+  compared with the current segmentation in a separate green/red Added/Removed
+  overlay without changing shared data.
+
+## Quality, invitations, and research measurements
+
+- Read-only QA checks detect empty labels, disconnected and small components,
+  and overlapping label voxels.
+- The Windows installer registers `.livesegroom`; double-clicking an invitation
+  opens Slicer, selects Live Segmentation, and populates the connection. Direct
+  invitations contain the temporary session code and must be shared privately.
+- An anonymized session export contains latency distributions, byte/count
+  totals, fallback counts, and aggregate QA counts while omitting user names,
+  room names, URLs, paths, images, and segmentation payloads.
+
+## Verification
+
+- 54 automated tests pass, including real localhost two-client LAN relay,
+  invalid-code rejection, LAN-outage fallback, crash journal, invitation,
+  metrics, QA, server schema, and all prior protocol behavior.
+- Real Slicer 5.12.3 shared-folder and direct-LAN smoke tests pass. The extended
+  direct-LAN run published a small edit in about 0.2 seconds and completed
+  spatial comment, QA, benchmark, review queue, revision-overlay, collaborative
+  undo, and end-to-end metrics checks.
+- Ruff, compileall, installer packaging, archive validation, normal launch, Safe
+  Start, and double-click invitation checks are part of the release process.
+
+---
+
+# Previous release: Live Segmentation 0.11.6
 
 Version 0.11.6 restores convenient access to previously used collaboration
 locations without reintroducing network-dependent Slicer startup.

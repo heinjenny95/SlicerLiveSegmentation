@@ -66,6 +66,22 @@ $safeShortcut.IconLocation = "$SlicerPath,0"
 $safeShortcut.Description = 'Live Segmentation mit isolierten lokalen Slicer-Einstellungen starten'
 $safeShortcut.Save()
 
+$roomScript = Join-Path $moduleDestination 'Resources\Scripts\OpenLiveSegmentationRoom.py'
+$classesRoot = 'HKCU:\Software\Classes'
+$extensionKey = Join-Path $classesRoot '.livesegroom'
+$classKey = Join-Path $classesRoot 'LiveSegmentation.Room'
+$iconKey = Join-Path $classKey 'DefaultIcon'
+$commandKey = Join-Path $classKey 'shell\open\command'
+New-Item -Path $extensionKey -Force | Out-Null
+Set-Item -Path $extensionKey -Value 'LiveSegmentation.Room'
+New-Item -Path $classKey -Force | Out-Null
+Set-Item -Path $classKey -Value 'Live Segmentation room invitation'
+New-Item -Path $iconKey -Force | Out-Null
+Set-Item -Path $iconKey -Value "$SlicerPath,0"
+New-Item -Path $commandKey -Force | Out-Null
+$openRoomCommand = "`"$SlicerPath`" --additional-module-path `"$moduleDestination`" --python-script `"$roomScript`" `"%1`""
+Set-Item -Path $commandKey -Value $openRoomCommand
+
 $message = @"
 Live Segmentation $version wurde separat installiert.
 
@@ -73,6 +89,7 @@ Andere Segmentierungs-Plugins: bleiben unverändert installiert
 Live-Plugin: $moduleDestination
 Desktop-Shortcut: $shortcutPath
 Recovery-Shortcut ohne gespeicherte Slicer-Einstellungen: $safeShortcutPath
+Einladungen: .livesegroom-Dateien öffnen Slicer und laden den Raum automatisch
 
 Öffne künftig den neuen Shortcut „Live Segmentation“.
 Falls Slicer mit alten Einstellungen nicht startet, verwende einmal

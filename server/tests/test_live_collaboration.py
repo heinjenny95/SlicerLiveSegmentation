@@ -22,6 +22,9 @@ from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 from collaboration import (  # noqa: E402
     ChunkedMaskBaseline,
+    HybridRoomClient,
+    LanRelayServer,
+    LanRoomClient,
     LiveCollaborationError,
     SharedFolderRoomClient,
     _atomic_temporary_path,
@@ -39,9 +42,12 @@ from collaboration import (  # noqa: E402
 )
 from fastapi.testclient import TestClient  # noqa: E402
 from features import (  # noqa: E402
+    PendingOperationJournal,
+    SessionMetrics,
     build_invitation,
     parse_invitation,
     reconstruct_snapshot_operations,
+    segmentation_quality_report,
     validate_material_template,
 )
 
@@ -1363,3 +1369,180 @@ def test_server_per_user_tokens_bind_identity(tmp_path):
             json={"room_name": "token room", "volume_signature": "c1" * 32},
         )
         assert joined.status_code == 200
+
+
+def test_direct_lan_invitation_round_trip_contains_fallback_and_session_code():
+    invitation = build_invitation(
+        "direct-lan",
+        "insect-head",
+        "dataset-signature",
+        "http://192.168.1.20:8765",
+        fallback_shared_folder=r"\\research\live",
+        access_code="temporary-code",
+    )
+    assert invitation["format"] == "live-segmentation-room-v2"
+    assert invitation["fallback_shared_folder"] == r"\\research\live"
+    assert invitation["access_code"] == "temporary-code"
+    assert parse_invitation(json.dumps(invitation)) == invitation
+
+
+def test_session_metrics_and_crash_journal_are_sanitized_and_context_bound(tmp_path):
+    metrics = SessionMetrics()
+    metrics.record("chat-send", 0.012, byte_count=120)
+    metrics.operation_queued("operation-1", started=time.monotonic() - 0.01)
+    metrics.operation_acknowledged("operation-1")
+    summary = metrics.summary()
+    assert summary["stages"]["chat-send"]["last_ms"] == 12.0
+    assert summary["stages"]["edit_roundtrip"]["last_ms"] >= 1.0
+    assert "user" not in json.dumps(summary).lower()
+
+    journal = PendingOperationJournal(tmp_path / "pending.json")
+    context = {"room_name": "room-a", "volume_signature": "signature-a"}
+    operation = {"client_operation_id": "operation-1", "segment_id": "organ"}
+    journal.write(context, [operation])
+    assert journal.read(context) == [operation]
+    assert journal.read({**context, "room_name": "room-b"}) == []
+    journal.clear()
+    assert not journal.path.exists()
+
+
+def test_segmentation_quality_report_finds_empty_disconnected_and_overlap():
+    first = np.zeros((8, 8, 8), dtype=np.uint8)
+    first[1, 1, 1] = 1
+    first[6, 6, 6] = 1
+    second = np.zeros_like(first)
+    second[1, 1, 1] = 1
+    empty = np.zeros_like(first)
+    report = segmentation_quality_report(
+        {"first": first, "second": second, "empty": empty},
+        min_component_voxels=2,
+    )
+    issue_types = {item["type"] for item in report["issues"]}
+    assert {"empty", "disconnected", "small-components", "overlap"} <= issue_types
+
+
+def test_direct_lan_relay_supports_two_clients_and_rejects_wrong_code(tmp_path):
+    relay = LanRelayServer(
+        tmp_path,
+        access_code="correct-code",
+        host="127.0.0.1",
+        port=0,
+    )
+    relay.start()
+    port = relay._httpd.server_address[1]
+    url = f"http://127.0.0.1:{port}"
+    try:
+        alice = LanRoomClient(url, "alice", "correct-code")
+        bob = LanRoomClient(url, "bob", "correct-code")
+        alice_room = alice.join("lan-room", "dataset-signature")
+        bob_room = bob.join("lan-room", "dataset-signature")
+        assert alice_room["id"] == bob_room["id"]
+
+        empty = np.zeros((4, 4, 4), dtype=np.uint8)
+        mask = empty.copy()
+        mask[1:3, 1:3, 1:3] = 1
+        alice.push_operation(
+            alice_room["id"], operation_payload("organ", empty, mask)
+        )
+        received = bob.operations(bob_room["id"], 0)
+        assert len(received) == 1
+        assert received[0]["author"] == "alice"
+
+        wrong = LanRoomClient(url, "mallory", "wrong-code")
+        with pytest.raises(LiveCollaborationError, match="session code"):
+            wrong.join("lan-room", "dataset-signature")
+    finally:
+        relay.stop()
+
+
+def test_hybrid_client_falls_back_to_shared_store_when_lan_is_unavailable(tmp_path):
+    fallback = SharedFolderRoomClient(tmp_path, "alice")
+    unavailable = LanRoomClient(
+        "http://127.0.0.1:9",
+        "alice",
+        "unused-code",
+        timeout_seconds=0.05,
+    )
+    hybrid = HybridRoomClient(unavailable, fallback, retry_seconds=60)
+    room = hybrid.join("fallback-room", "dataset-signature")
+    assert hybrid.fallback_count == 1
+
+    empty = np.zeros((3, 3, 3), dtype=np.uint8)
+    mask = empty.copy()
+    mask[1, 1, 1] = 1
+    hybrid.push_operation(room["id"], operation_payload("organ", empty, mask))
+    assert hybrid.fallback_count == 2
+    assert len(fallback.operations(room["id"], 0)) == 1
+
+
+def test_hybrid_client_mirrors_fast_lan_edits_then_fails_over(tmp_path):
+    relay = LanRelayServer(
+        tmp_path / "local-relay",
+        access_code="hybrid-code",
+        host="127.0.0.1",
+        port=0,
+    )
+    relay.start()
+    port = relay._httpd.server_address[1]
+    lan = LanRoomClient(f"http://127.0.0.1:{port}", "alice", "hybrid-code")
+    fallback = SharedFolderRoomClient(tmp_path / "fallback", "alice")
+    hybrid = HybridRoomClient(lan, fallback, retry_seconds=60)
+    try:
+        room = hybrid.join("mirrored-room", "dataset-signature")
+        empty = np.zeros((3, 3, 3), dtype=np.uint8)
+        first = empty.copy()
+        first[1, 1, 1] = 1
+        hybrid.push_operation(
+            room["id"], operation_payload("organ", empty, first, operation_id="mirror-1")
+        )
+        deadline = time.time() + 2.0
+        mirrored = []
+        while time.time() < deadline:
+            mirrored = fallback.operations(room["id"], 0)
+            if mirrored:
+                break
+            time.sleep(0.02)
+        assert len(mirrored) == 1
+
+        relay.stop()
+        second = first.copy()
+        second[2, 2, 2] = 1
+        hybrid.push_operation(
+            room["id"], operation_payload("organ", first, second, operation_id="mirror-2")
+        )
+        assert hybrid.fallback_count == 1
+        assert len(fallback.operations(room["id"], 0)) == 2
+    finally:
+        relay.stop()
+
+
+def test_server_preserves_collaborative_undo_metadata(client, headers):
+    room = client.post(
+        "/api/live/rooms/join",
+        headers=headers,
+        json={"room_name": "undo metadata", "volume_signature": "d1" * 32},
+    ).json()
+    empty = np.zeros((3, 3, 3), dtype=np.uint8)
+    first = empty.copy()
+    first[1, 1, 1] = 1
+    created = client.post(
+        f"/api/live/rooms/{room['id']}/operations",
+        headers=headers,
+        json=operation_payload("organ", empty, first, operation_id="undo-source-1"),
+    ).json()
+    reverted = operation_payload(
+        "organ", first, empty, operation_id="undo-inverse-1"
+    )
+    reverted["undo_of_sequence"] = created["sequence"]
+    response = client.post(
+        f"/api/live/rooms/{room['id']}/operations",
+        headers=headers,
+        json=reverted,
+    )
+    assert response.status_code == 201
+    assert response.json()["undo_of_sequence"] == created["sequence"]
+    operations = client.get(
+        f"/api/live/rooms/{room['id']}/operations?after=0",
+        headers=headers,
+    ).json()
+    assert operations[-1]["undo_of_sequence"] == created["sequence"]
