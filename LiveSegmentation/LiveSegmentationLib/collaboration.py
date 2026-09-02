@@ -876,7 +876,12 @@ class SharedFolderRoomClient:
 
     def _queue_operation_artifacts(self, room_path, operation):
         """Persist hot-feed records without delaying their live publication."""
-        self._artifact_queue.put((Path(room_path), dict(operation)))
+        # Give peers a short uncontended window to read the hot feed before the
+        # same SMB connection starts creating archive/index metadata. The hot
+        # feed is already the durable write-ahead journal during this grace time.
+        self._artifact_queue.put(
+            (time.monotonic() + 0.75, Path(room_path), dict(operation))
+        )
         with self._artifact_worker_lock:
             if self._artifact_worker is not None and self._artifact_worker.is_alive():
                 return
@@ -884,7 +889,9 @@ class SharedFolderRoomClient:
             def drain():
                 while True:
                     try:
-                        item_room_path, item_operation = self._artifact_queue.get_nowait()
+                        due_at, item_room_path, item_operation = (
+                            self._artifact_queue.get_nowait()
+                        )
                     except queue.Empty:
                         with self._artifact_worker_lock:
                             if self._artifact_queue.empty():
@@ -892,6 +899,9 @@ class SharedFolderRoomClient:
                                 return
                         continue
                     try:
+                        remaining = float(due_at) - time.monotonic()
+                        if remaining > 0:
+                            time.sleep(remaining)
                         self._persist_operation_artifacts(
                             item_room_path, item_operation
                         )
@@ -971,7 +981,69 @@ class SharedFolderRoomClient:
             "presence": self._read_presence(room_path),
         }
 
-    def push_operation(self, room_id, operation):
+    def _analyze_operation_conflicts(
+        self,
+        room_id,
+        room_path,
+        operation,
+        stored,
+        sequence,
+        base_sequence,
+    ):
+        conflicts = []
+        segment_id = str(operation.get("segment_id") or "")
+        if base_sequence > 0 and operation.get("operation_kind") != "snapshot":
+            for previous in self.operations(room_id, base_sequence, limit=5000):
+                previous_sequence = int(previous.get("sequence", 0))
+                if previous_sequence <= base_sequence or previous_sequence >= sequence:
+                    continue
+                if previous.get("author") == self.user_name or previous.get(
+                    "system_snapshot"
+                ):
+                    continue
+                try:
+                    overlap = operation_overlap_count(
+                        previous, operation, decode_mask_delta
+                    )
+                except Exception:
+                    overlap = 0
+                if overlap:
+                    conflicts.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "segment_id": segment_id,
+                            "other_author": previous.get("author"),
+                            "other_sequence": previous_sequence,
+                            "overlap_voxels": overlap,
+                        }
+                    )
+        for conflict in conflicts:
+            conflict.update(
+                {
+                    "sequence": sequence,
+                    "author": self.user_name,
+                    "created_at": _utc_iso(),
+                    "resolution": "unresolved",
+                }
+            )
+            _write_json_atomic(
+                room_path / "conflicts" / f"{sequence:020d}--{conflict['id']}.json",
+                conflict,
+                durable=False,
+            )
+        self._append_audit_async(
+            room_path,
+            "segmentation.operation",
+            {
+                "sequence": sequence,
+                "segment_id": stored.get("segment_id"),
+                "changed_voxels": stored.get("changed_voxels"),
+                "conflict_count": len(conflicts),
+            },
+        )
+        return conflicts
+
+    def push_operation(self, room_id, operation, defer_conflicts=False):
         room_path = self._require_room(room_id)
         operation_id = str(operation.get("client_operation_id") or "").strip()
         if not operation_id:
@@ -980,7 +1052,6 @@ class SharedFolderRoomClient:
         operations_path = room_path / "operations"
         operation_index_path = room_path / "operation-index" / f"{operation_hash}.json"
         state_path = room_path / "sequence-state.json"
-        conflicts = []
         with self._sequence_lock(room_path):
             state = {}
             if state_path.is_file():
@@ -1090,55 +1161,35 @@ class SharedFolderRoomClient:
         # journal. Append-only history, retry index, and owner metadata are
         # derived immediately in one background lane.
         self._queue_operation_artifacts(room_path, stored)
-        # Conflict analysis can involve decoding many historical deltas. It is
-        # intentionally outside the sequence lock, so another collaborator can
-        # publish the next edit while this diagnostic work finishes.
-        if base_sequence > 0 and operation.get("operation_kind") != "snapshot":
-            # Only edits after the sender's base can conflict. The compact recent
-            # feed resolves those files directly instead of scanning room history.
-            for previous in self.operations(room_id, base_sequence, limit=5000):
-                previous_sequence = int(previous.get("sequence", 0))
-                if previous_sequence <= base_sequence or previous_sequence >= sequence:
-                    continue
-                if previous.get("author") == self.user_name or previous.get("system_snapshot"):
-                    continue
+        if defer_conflicts:
+            def analyze_later():
+                time.sleep(0.75)
                 try:
-                    overlap = operation_overlap_count(previous, operation, decode_mask_delta)
-                except Exception:
-                    overlap = 0
-                if overlap:
-                    conflicts.append(
-                        {
-                            "id": str(uuid.uuid4()),
-                            "segment_id": segment_id,
-                            "other_author": previous.get("author"),
-                            "other_sequence": previous_sequence,
-                            "overlap_voxels": overlap,
-                        }
+                    self._analyze_operation_conflicts(
+                        room_id,
+                        room_path,
+                        operation,
+                        stored,
+                        sequence,
+                        base_sequence,
                     )
-        for conflict in conflicts:
-            conflict.update(
-                {
-                    "sequence": sequence,
-                    "author": self.user_name,
-                    "created_at": _utc_iso(),
-                    "resolution": "unresolved",
-                }
-            )
-            _write_json_atomic(
-                room_path / "conflicts" / f"{sequence:020d}--{conflict['id']}.json",
-                conflict,
-                durable=False,
-            )
-        self._append_audit_async(
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=analyze_later,
+                name="LiveSegmentation-conflict-analysis",
+                daemon=True,
+            ).start()
+            return {"sequence": sequence, "duplicate": False}
+
+        conflicts = self._analyze_operation_conflicts(
+            room_id,
             room_path,
-            "segmentation.operation",
-            {
-                "sequence": sequence,
-                "segment_id": stored.get("segment_id"),
-                "changed_voxels": stored.get("changed_voxels"),
-                "conflict_count": len(conflicts),
-            },
+            operation,
+            stored,
+            sequence,
+            base_sequence,
         )
         result = {"sequence": sequence, "duplicate": False}
         if conflicts:
@@ -1219,6 +1270,27 @@ class SharedFolderRoomClient:
             return operation
 
         operations = _parallel_map(read_operation, selected)
+        operations_by_sequence = {
+            int(operation["sequence"]): operation for operation in operations
+        }
+        for sequence, operation in inline_by_sequence.items():
+            if after_sequence < sequence <= after_sequence + limit:
+                operations_by_sequence[sequence] = operation
+        operations = []
+        start_sequence = after_sequence + 1
+        if start_sequence not in operations_by_sequence:
+            snapshots = [
+                sequence
+                for sequence, operation in operations_by_sequence.items()
+                if operation.get("operation_kind") == "snapshot"
+            ]
+            if snapshots:
+                start_sequence = min(snapshots)
+        for sequence in range(start_sequence, min(latest, after_sequence + limit) + 1):
+            operation = operations_by_sequence.get(sequence)
+            if operation is None:
+                break
+            operations.append(operation)
         for operation in operations:
             segment_id = str(operation.get("segment_id") or "")
             author = str(operation.get("author") or "")
@@ -1948,6 +2020,9 @@ class SharedFolderRoomClient:
     def publish_room_snapshot(self, room_id, segment_operations, compact=True, label=""):
         """Append a compatible full-state batch and archive older loose files."""
         room_path = self._require_room(room_id)
+        # Explicit compaction must include operations that are still inside the
+        # hot-feed archive grace period.
+        self._artifact_queue.join()
         if not segment_operations:
             return None
         group_id = str(uuid.uuid4())
@@ -2305,6 +2380,8 @@ class LiveCollaborationController:
         self._observed_segmentation = None
         self._observer_tags = []
         self._observer_callbacks = []
+        self._segment_revisions = {}
+        self._shared_folder_watcher = None
         self._applying_remote = False
         # Independent lanes keep slow project maintenance from blocking live
         # edits, presence, chat, or label locks.
@@ -2740,7 +2817,9 @@ class LiveCollaborationController:
         self.owner.layout.addWidget(self.group)
 
         self.timer = qt.QTimer()
-        self.timer.setInterval(150)
+        # Watchers handle the normal hot path. This short timer remains the
+        # compatibility fallback for network filesystems without notifications.
+        self.timer.setInterval(75)
         self.timer.timeout.connect(self.on_timer)
 
     @staticmethod
@@ -3430,6 +3509,7 @@ class LiveCollaborationController:
         client = None
         try:
             self._session_token += 1
+            self._stop_shared_folder_watcher()
             user_name = self._text(self.user_edit)
             room_name = self._text(self.room_edit)
             if not room_name:
@@ -3480,6 +3560,7 @@ class LiveCollaborationController:
             self.force_snapshots.clear()
             self.outgoing.clear()
             self.outgoing_keys.clear()
+            self._segment_revisions.clear()
             self.last_chat_sequence = 0
             self.pending_chat.clear()
             self.displayed_chat_sequences.clear()
@@ -3533,6 +3614,7 @@ class LiveCollaborationController:
             self.connection_healthy = True
             self.connected = True
             self._observe_segmentation(segmentation_node)
+            self._arm_shared_folder_watcher()
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
             if self.initial_sync_complete:
                 self._initialize_baselines_and_seed(
@@ -3632,6 +3714,7 @@ class LiveCollaborationController:
         self._session_token += 1
         if hasattr(self, "timer"):
             self.timer.stop()
+        self._stop_shared_folder_watcher()
         self._unobserve_segmentation()
         if client is not None and room_id:
             try:
@@ -3653,6 +3736,7 @@ class LiveCollaborationController:
         self.force_snapshots.clear()
         self.outgoing.clear()
         self.outgoing_keys.clear()
+        self._segment_revisions.clear()
         self._known_segment_ids.clear()
         self.pending_chat.clear()
         self.displayed_chat_sequences.clear()
@@ -3801,6 +3885,114 @@ class LiveCollaborationController:
             )
         )
 
+    @staticmethod
+    def _segment_revision(node, segment_id):
+        """Return a cheap revision token for a segment's binary labelmap."""
+        if node is None:
+            return None
+        segment = node.GetSegmentation().GetSegment(str(segment_id))
+        if segment is None:
+            return None
+        try:
+            import vtkSegmentationCorePython as vtkSegmentationCore
+
+            binary_name = (
+                vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+            )
+            image = segment.GetRepresentation(binary_name)
+            if image is None:
+                return None
+            scalars = image.GetPointData().GetScalars()
+            return (
+                int(image.GetMTime()),
+                int(scalars.GetMTime()) if scalars is not None else -1,
+                tuple(int(value) for value in image.GetExtent()),
+            )
+        except Exception:
+            return None
+
+    def _remember_segment_revision(self, node, segment_id):
+        if node is None:
+            return
+        key = (node.GetID(), str(segment_id))
+        self._segment_revisions[key] = self._segment_revision(node, segment_id)
+
+    def _probe_selected_segment_revision(self):
+        """Catch interactive edits whose normal segmentation event is delayed."""
+        if self._applying_remote or not self.initial_sync_complete:
+            return
+        try:
+            node, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
+        except Exception:
+            return
+        if node is None or node.GetID() != self.segmentation_node_id or not segment_id:
+            return
+        key = (node.GetID(), str(segment_id))
+        revision = self._segment_revision(node, segment_id)
+        if revision is None:
+            return
+        previous = self._segment_revisions.get(key)
+        self._segment_revisions[key] = revision
+        if previous is not None and revision != previous:
+            self.dirty_segments.add(key)
+            self._force_sync_refresh = True
+
+    def _stop_shared_folder_watcher(self):
+        watcher = self._shared_folder_watcher
+        self._shared_folder_watcher = None
+        if watcher is None:
+            return
+        try:
+            watcher.blockSignals(True)
+            paths = list(watcher.files()) + list(watcher.directories())
+            if paths:
+                watcher.removePaths(paths)
+            watcher.deleteLater()
+        except Exception:
+            pass
+
+    def _arm_shared_folder_watcher(self):
+        """Watch the atomic hot feed and room directory for immediate SMB wakeups."""
+        if not isinstance(self.client, SharedFolderRoomClient) or not self.room_id:
+            return
+        try:
+            import qt
+
+            if self._shared_folder_watcher is None:
+                watcher = qt.QFileSystemWatcher()
+                watcher.fileChanged.connect(self._on_shared_folder_changed)
+                watcher.directoryChanged.connect(self._on_shared_folder_changed)
+                self._shared_folder_watcher = watcher
+            watcher = self._shared_folder_watcher
+            room_path = Path(self.client._require_room(self.room_id))
+            candidates = [room_path, room_path / "sequence-state.json"]
+            watched = set(
+                str(path)
+                for path in list(watcher.files()) + list(watcher.directories())
+            )
+            missing = [
+                str(path)
+                for path in candidates
+                if path.exists() and str(path) not in watched
+            ]
+            if missing:
+                watcher.addPaths(missing)
+        except Exception:
+            return
+
+    def _on_shared_folder_changed(self, path=None):
+        del path
+        if not self.connected:
+            return
+        self._force_sync_refresh = True
+        self._arm_shared_folder_watcher()
+        try:
+            import qt
+
+            qt.QTimer.singleShot(0, self.on_timer)
+        except Exception:
+            pass
+
     def _unobserve_segmentation(self):
         if self._observed_segmentation is not None:
             for observer_tag in self._observer_tags:
@@ -3812,6 +4004,7 @@ class LiveCollaborationController:
         self._observed_segmentation = None
         self._observer_tags = []
         self._observer_callbacks = []
+        self._segment_revisions.clear()
 
     def _on_segmentation_modified(self, caller=None, event=None, segment_id=None):
         del caller, event
@@ -3866,6 +4059,7 @@ class LiveCollaborationController:
             else:
                 self.baselines[key] = mask.copy()
                 self.baseline_bounds[key] = list(bounds) if bounds is not None else None
+            self._remember_segment_revision(node, segment_id)
 
     def _read_mask_crop(self, node, segment_id):
         volume_node = self.owner.get_volume_node()
@@ -4025,6 +4219,7 @@ class LiveCollaborationController:
                 continue
             previous = self.baselines.get(key)
             current_crop, current_bounds = self._read_mask_crop(node, key[1])
+            self._remember_segment_revision(node, key[1])
             if self._current_role() == "viewer":
                 current = self._mask_from_crop(current_crop, current_bounds)
                 if previous is not None and np.any(current != previous):
@@ -4121,12 +4316,13 @@ class LiveCollaborationController:
         if not self.connected:
             return
         self._drain_worker_results()
+        self._probe_selected_segment_revision()
         now = time.time()
 
         force_sync = bool(self._force_sync_refresh)
         force_realtime = bool(self._force_realtime_refresh)
 
-        if force_sync or now - self._last_sync_poll >= 0.20:
+        if force_sync or now - self._last_sync_poll >= 0.10:
             self._prepare_outgoing()
 
         push_idle = self._edit_push_worker is None or not self._edit_push_worker.is_alive()
@@ -4164,7 +4360,7 @@ class LiveCollaborationController:
             self._edit_push_worker.start()
 
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
-        if pull_idle and (force_sync or now - self._last_sync_poll >= 0.20):
+        if pull_idle and (force_sync or now - self._last_sync_poll >= 0.10):
             self._last_sync_poll = now
             self._edit_pull_worker = threading.Thread(
                 target=self._edit_pull_lane,
@@ -4320,7 +4516,12 @@ class LiveCollaborationController:
                 result = {"ids": [], "rejected": [], "conflicts": [], "errors": []}
                 for operation in group:
                     try:
-                        pushed = client.push_operation(room_id, operation)
+                        if isinstance(client, SharedFolderRoomClient):
+                            pushed = client.push_operation(
+                                room_id, operation, defer_conflicts=True
+                            )
+                        else:
+                            pushed = client.push_operation(room_id, operation)
                         result["ids"].append(operation["client_operation_id"])
                         result["conflicts"].extend((pushed or {}).get("conflicts") or [])
                     except Exception as exc:
@@ -5580,6 +5781,7 @@ class LiveCollaborationController:
                 if np.any(local_changes):
                     self.dirty_segments.add(key)
                 self._known_segment_ids.add(segment_id)
+                self._remember_segment_revision(node, segment_id)
                 self._set_segment_collaboration_tags(segment_id)
                 if operation.get("author") != self.user_name:
                     highlight_changed = changed

@@ -1,4 +1,44 @@
-# Live Segmentation 0.10.2
+# Live Segmentation 0.10.3
+
+Version 0.10.3 removes the remaining manual Segment Editor and SMB maintenance
+delays observed for a large edit confined to one microscopy slice.
+
+## Event-driven interactive edits
+
+- The currently selected label now has a constant-time binary-labelmap revision
+  probe. Segment Editor effects that update their VTK representation before the
+  normal high-level segmentation callback are queued without waiting for that
+  delayed callback.
+- Shared-folder rooms use filesystem change notifications to wake the receiver
+  immediately when the atomic hot feed changes. A 100 ms poll remains as a safe
+  fallback for network filesystems that do not provide notifications.
+- Receiver updates, including additions and removals, remain cropped to the
+  operation bounding box and do not copy the complete microscopy volume.
+
+## Foreground-first shared-folder scheduling
+
+- Hot-feed publication and receiver reads now get a short uncontended SMB window
+  before operation archives, retry indexes, label-owner metadata, audit records,
+  and conflict analysis start.
+- The live UI returns after the atomic edit is published; conflict detection then
+  runs independently and remains available through the permanent conflict panel.
+- Mixed hot-feed/archive reads now merge correctly during the archive grace
+  period, while explicit history compaction waits for pending durable archives.
+
+## Measured verification
+
+- With two real Slicer 5.12.3 processes, the real LSDF share, and a
+  479×247×313 volume, a 49,729-voxel single-slice edit was visible on the receiver
+  after 0.23 seconds.
+- A second patch to the same label published in 0.17 seconds and was fully visible
+  on the receiver after 0.27 seconds.
+- All 31 automated tests, Ruff, Python compilation, and the complete advanced
+  Slicer smoke test pass, including chat, locks, history, backups, conflict
+  detection, diagnostics, connection recovery, and clean rejoin.
+
+---
+
+# Previous release: Live Segmentation 0.10.2
 
 Version 0.10.2 removes the serial shared-folder metadata round trips that could
 still make a small remote edit appear roughly ten seconds after it was drawn.
