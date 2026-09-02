@@ -38,6 +38,13 @@ Each operation contains a stable client-operation ID, segment ID, name, color,
 volume geometry, voxel bounding box, a packed changed-voxel mask, and packed
 binary values. Bit fields are compressed with zlib and encoded as Base64.
 
+Each client retains confirmed label state in sparse 64×64×64 `uint8` chunks.
+Chunks are allocated only when they contain foreground voxels and are removed
+when they become empty. Incoming patches read and mutate only the affected
+chunks. This makes persistent baseline memory proportional to occupied label
+chunks rather than `volume voxels × label count`; the source image and Slicer's
+own active binary labelmap remain under Slicer's normal memory management.
+
 The first participant may seed a new room from an explicitly selected local
 segmentation. A participant joining an existing room receives a fresh local
 replica, and the ordered log recreates the same segment IDs and voxel state.
@@ -105,19 +112,24 @@ Shared-folder clients coordinate an interval lease and save full `.mrb` Slicer
 project bundles under the room's `backups` directory. Bundles are staged locally
 and atomically published; prior versions are never overwritten.
 
-Segmentation checkpoints are appended as contiguous groups of normal `snapshot`
-operations. Snapshot payloads contain only each segment's effective non-zero
-extent (or a zero-changed-voxel one-voxel marker for an empty label), while still
-reconstructing a complete segment state. This keeps them readable by
-operation-only clients without transferring a source-volume-sized zero field. Once a complete
-group exists, older loose operation JSON files move into a ZIP archive. Timeline
-and restoration read active and archived records, while new joins replay only a
+Segmentation checkpoints are appended as contiguous groups of normal operations.
+For each segment, the first operation is a standard `snapshot` that clears the
+old state and sets the first occupied chunk; additional occupied chunks are
+ordinary `patch` operations. An empty label uses a zero-changed-voxel one-voxel
+snapshot marker. The group therefore reconstructs a complete segment while no
+temporary payload spans distant components or source-volume-sized zero fields.
+Existing operation-only clients remain compatible because they already
+understand the ordered snapshot-plus-patch semantics. Once a complete group
+exists, older loose operation JSON files move into a ZIP archive. Timeline and
+restoration read active and archived records, while new joins replay only a
 recent full snapshot group and newer patches.
 
 The MRML Segmentation node is a disposable local room replica. Leave detaches it
 from Segment Editor and removes it from the scene. Session tokens make delayed
 worker results harmless, and rejoin always reconstructs one new replica from the
-ordered room history.
+ordered room history. Until the join watermark is reached, the pull lane remains
+armed so a short SMB cache-visibility window during checkpoint publication cannot
+leave a new replica at sequence zero.
 
 ## Persistence
 

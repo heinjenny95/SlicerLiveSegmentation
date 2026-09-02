@@ -17,13 +17,13 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.10.4.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.11.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.10.4`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.11.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -90,8 +90,9 @@ to the same voxel, the operation ordered later by the shared transport wins.
   `07:34 Jenny created label “Label 1”`). A selected revision can be restored as
   a new append-only revision, so no history is silently rewritten.
 - **Snapshots and compaction:** complete segment states are periodically appended
-  as cropped, zero-sparse snapshots using the normal backwards-compatible
-  operation format. Older loose operation
+  as one cropped clear snapshot plus zero-sparse 64³ chunk patches using the
+  normal backwards-compatible operation format. Widely separated components do
+  not create a temporary dense bounding box. Older loose operation
   files move into ZIP archives, keeping join time and folder enumeration bounded
   while retaining historical restore data.
 - **Conflict review:** overlapping concurrent voxel operations produce permanent
@@ -123,6 +124,11 @@ to the same voxel, the operation ordered later by the shared transport wins.
   effective internal labelmap extents and incoming edits mutate only the changed
   voxel box. Small brush strokes no longer export, copy, or re-import the entire
   source-volume geometry.
+- **Sparse large-volume baselines:** confirmed label state is retained in
+  independently allocated 64×64×64 chunks. Empty source-volume space consumes no
+  baseline memory, erased chunks are released, and diagnostics expose allocated
+  chunk bytes. This prevents every label from retaining a dense copy of a large
+  microscopy volume.
 - **One-read live edit feed:** the complete newest voxel operations are embedded
   in a bounded atomic hot feed. Receivers no longer wait for a state-file read
   followed by a second network-file read. Append-only archives, retry indexes,
@@ -140,6 +146,23 @@ to the same voxel, the operation ordered later by the shared transport wins.
   and conflict analysis use the network share. Repeated edits of the same label
   are no longer held behind this maintenance work.
 
+## Large-dataset considerations
+
+Live Segmentation's confirmed baselines and checkpoints are sparse and chunked,
+so the extension itself no longer retains a full source-volume-sized byte mask
+for every label. Total memory still includes the source image, Slicer's active
+binary labelmap representations, display data, and undo history. In particular,
+Slicer may store one label's binary representation over the bounding extent
+between its outermost components. A label that densely spans an entire 1024³
+volume can therefore still require substantial RAM even though the collaboration
+baseline remains sparse. Non-linear parent-transform geometries also use Slicer's
+general full-volume resampling fallback for correctness.
+
+For exceptionally large projects, keep unrelated distant structures in separate
+labels when scientifically appropriate, monitor Slicer process memory, and first
+test the intended volume, label count, undo settings, and network share on a
+representative workstation.
+
 ## Optional collaboration server
 
 The connection selector also offers **Collaboration server**. This transport is
@@ -154,13 +177,17 @@ legacy shared API key does not verify individual identities.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 31 automated transport, API, chat-anchor, snapshot/compaction, history,
+- 36 automated transport, API, chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.
 - Two simultaneously running Slicer 5.12.3 processes synchronize a 27-voxel
   edit and an 8-voxel return edit in both directions through a shared folder.
 - Two Slicer processes synchronized a 27-voxel edit on a 512×512×512 reference
-  volume in about 0.55 seconds end-to-end on the development host.
+  volume; the current sparse-baseline run published in about 0.28 seconds and
+  restored 27/27 voxels after a clean rejoin.
+- Two simultaneous Slicer processes on a 256×256×256 volume converged on 35/35
+  voxels after a bidirectional edit and received all 24/24 voxels from three
+  rapid disconnected additions to the same label.
 - A separate two-Slicer round trip through the real LSDF share published the
   sender edit in 0.343 seconds and applied it remotely in 0.448 seconds.
 - A joining client starts without a Segmentation node, receives the room node

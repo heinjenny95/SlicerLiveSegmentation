@@ -21,10 +21,12 @@ import collaboration as collaboration_module  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 from collaboration import (  # noqa: E402
+    ChunkedMaskBaseline,
     LiveCollaborationError,
     SharedFolderRoomClient,
     _atomic_temporary_path,
     apply_mask_delta,
+    encode_chunked_mask_snapshot,
     encode_mask_crop_delta,
     encode_mask_crop_delta_after_operations,
     encode_mask_crop_snapshot,
@@ -113,6 +115,114 @@ def test_cropped_delta_only_compares_effective_segment_region():
     assert encoded["voxel_bbox"] == [93, 94, 120, 123, 210, 213]
     result = apply_mask_delta(previous, encoded)
     assert int(result.sum()) == 36
+
+
+def test_chunked_baseline_scales_with_touched_chunks_not_volume_size():
+    shape = (4096, 4096, 4096)
+    baseline = ChunkedMaskBaseline(shape, chunk_size=64)
+    components = (
+        [10, 14, 20, 24, 30, 34],
+        [2000, 2004, 2100, 2104, 2200, 2204],
+        [4080, 4084, 4000, 4004, 3900, 3904],
+    )
+    values = np.ones((4, 4, 4), dtype=np.uint8)
+    for bounds in components:
+        baseline.set_region(bounds, values != 0, values)
+
+    assert baseline.chunk_count == 3
+    assert baseline.allocated_bytes <= 3 * 64**3
+    assert int(baseline.region(components[1]).sum()) == 64
+
+    baseline.set_region(
+        components[1], np.ones_like(values, dtype=bool), np.zeros_like(values)
+    )
+    assert baseline.chunk_count == 2
+    assert not np.any(baseline.region(components[1]))
+
+
+def test_chunked_baseline_encodes_a_small_edit_in_huge_geometry():
+    shape = (4096, 4096, 4096)
+    bounds = [3000, 3004, 2000, 2004, 1000, 1004]
+    previous_crop = np.ones((4, 4, 4), dtype=np.uint8)
+    previous_crop[3, 3, 3] = 0
+    baseline = ChunkedMaskBaseline.from_crop(shape, previous_crop, bounds)
+    current_crop = np.ones_like(previous_crop)
+    encoded = encode_mask_crop_delta_after_operations(
+        baseline,
+        current_crop,
+        bounds,
+        bounds,
+        shape,
+        [],
+    )
+    assert encoded["voxel_bbox"] == [3003, 3004, 2003, 2004, 1003, 1004]
+    changed, values = collaboration_module.decode_mask_delta(encoded)
+    assert int(changed.sum()) == 1
+    assert int(values[changed].sum()) == 1
+    assert baseline.allocated_bytes == 64**3
+
+
+def test_chunked_snapshot_never_materializes_the_sparse_global_extent():
+    shape = (4096, 4096, 4096)
+    baseline = ChunkedMaskBaseline(shape, chunk_size=64)
+    components = (
+        [4, 8, 8, 12, 12, 16],
+        [2048, 2052, 2112, 2116, 2176, 2180],
+        [4088, 4092, 4000, 4004, 3900, 3904],
+    )
+    values = np.ones((4, 4, 4), dtype=np.uint8)
+    for bounds in components:
+        baseline.set_region(bounds, values != 0, values)
+
+    operations = encode_chunked_mask_snapshot(baseline)
+
+    assert len(operations) == 3
+    assert operations[0]["operation_kind"] == "snapshot"
+    assert [item["operation_kind"] for item in operations[1:]] == ["patch", "patch"]
+    for operation in operations:
+        z0, z1, y0, y1, x0, x1 = operation["voxel_bbox"]
+        assert max(z1 - z0, y1 - y0, x1 - x0) <= 64
+
+    reconstructed = ChunkedMaskBaseline(shape, chunk_size=64)
+    for operation in operations:
+        if operation["operation_kind"] == "snapshot":
+            reconstructed.clear()
+        changed, decoded_values = collaboration_module.decode_mask_delta(operation)
+        reconstructed.set_region(operation["voxel_bbox"], changed, decoded_values)
+    assert reconstructed.chunk_count == 3
+    assert all(int(reconstructed.region(bounds).sum()) == 64 for bounds in components)
+
+
+def test_shared_snapshot_preserves_chunk_patch_semantics(tmp_path):
+    shape = (128, 128, 128)
+    baseline = ChunkedMaskBaseline(shape, chunk_size=64)
+    first_bounds = [2, 5, 3, 6, 4, 7]
+    second_bounds = [100, 103, 110, 113, 120, 123]
+    values = np.ones((3, 3, 3), dtype=np.uint8)
+    for bounds in (first_bounds, second_bounds):
+        baseline.set_region(bounds, values != 0, values)
+    segment_operations = [
+        {
+            "segment_id": "Organ",
+            "segment_name": "Organ",
+            "color_hex": "#37E8B8",
+            **operation,
+        }
+        for operation in encode_chunked_mask_snapshot(baseline)
+    ]
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    room = alice.join("chunked snapshot", "c" * 64)
+    manifest = alice.publish_room_snapshot(
+        room["id"], segment_operations, compact=True
+    )
+
+    active = alice.operations(room["id"], 0)
+    assert manifest["segment_count"] == 1
+    assert [item["operation_kind"] for item in active] == ["snapshot", "patch"]
+    reconstructed = np.zeros(shape, dtype=np.uint8)
+    for operation in active:
+        reconstructed = apply_mask_delta(reconstructed, operation)
+    assert int(reconstructed.sum()) == 54
 
 
 def test_rapid_same_label_components_queue_without_losing_a_stroke():

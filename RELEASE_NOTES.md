@@ -1,4 +1,49 @@
-# Live Segmentation 0.10.4
+# Live Segmentation 0.11.0
+
+Version 0.11.0 makes live collaboration practical on very large biological
+image volumes without retaining one source-volume-sized mask copy per label.
+
+## Sparse chunked label baselines
+
+- Confirmed label state is stored in independently allocated 64×64×64 `uint8`
+  chunks. Empty space consumes no baseline memory, and a chunk is released again
+  when all of its voxels are erased.
+- A virtual 4096³ geometry with three small components in distant parts of the
+  volume allocates only three chunks (less than 0.8 MiB) instead of a theoretical
+  64 GiB dense mask per label.
+- Ordinary outgoing and incoming edits compare and update only their affected
+  regions. Diagnostics report chunk count and allocated baseline bytes.
+
+## Bounded checkpoints and reliable rejoin
+
+- A complete sparse checkpoint is encoded as one backwards-compatible clear
+  snapshot followed by small chunk patches. Components at opposite ends of a
+  volume no longer force a temporary dense bounding-box allocation during
+  history compaction.
+- Shared-folder and optional server transports preserve the snapshot/patch group
+  semantics, while older operation-only clients can still replay the same
+  ordered log.
+- Initial synchronization remains armed until the join watermark is reached,
+  handling the short SMB visibility window around a newly compacted checkpoint.
+- A chunk-coordinate regression that could prevent a checkpoint from applying
+  after leave/rejoin is fixed. The lifecycle smoke test now reconstructs the
+  expected room mask and requires exact voxel equality instead of checking only
+  that one replica exists.
+
+## Measured verification
+
+- A real Slicer 5.12.3 run synchronized a sparse edit on a 512×512×512 source
+  volume in 0.28 seconds and restored 27/27 voxels after a clean rejoin.
+- Two simultaneous Slicer processes on a 256×256×256 volume exchanged a return
+  edit and converged on 35/35 voxels. In the same parallel run, all three rapid
+  disconnected components reached both clients (24/24 added voxels).
+- All 36 automated tests, Ruff, Python compilation, and the complete advanced
+  Slicer smoke test pass, including exact 50/50-voxel rejoin after chat, locks,
+  history compaction, conflicts, backup creation, and connection recovery.
+
+---
+
+# Previous release: Live Segmentation 0.10.4
 
 Version 0.10.4 guarantees that rapid consecutive edits of the same label are
 queued and delivered without losing a component.

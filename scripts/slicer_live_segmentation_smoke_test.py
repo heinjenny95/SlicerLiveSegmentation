@@ -266,6 +266,22 @@ def run_probe():
 
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS", "0") == "1":
             rapid_segment_id = segment_id
+            rapid_base_voxels = 35 if (
+                (
+                    mode == "produce"
+                    and os.environ.get(
+                        "LIVE_SEGMENTATION_SMOKE_WAIT_FOR_RETURN_EDIT", "0"
+                    )
+                    == "1"
+                )
+                or (
+                    mode == "consume"
+                    and os.environ.get(
+                        "LIVE_SEGMENTATION_SMOKE_RETURN_EDIT", "0"
+                    )
+                    == "1"
+                )
+            ) else 27
             rapid_bounds = (
                 [0, 2, 0, 2, 0, 2],
                 [6, 8, 0, 2, 7, 9],
@@ -308,7 +324,7 @@ def run_probe():
                     for item in operations:
                         if item["segment_id"] == rapid_segment_id:
                             rapid_mask = apply_mask_delta(rapid_mask, item)
-                    rapid_component_voxels = int(rapid_mask.sum()) - 27
+                    rapid_component_voxels = int(rapid_mask.sum()) - rapid_base_voxels
                     if rapid_component_voxels == 24:
                         break
             else:
@@ -325,7 +341,7 @@ def run_probe():
                     )
                     rapid_component_voxels = int(
                         np.asarray(rapid_mask, dtype=np.uint8).sum()
-                    ) - 27
+                    ) - rapid_base_voxels
                     if rapid_component_voxels == 24:
                         break
             if rapid_component_voxels != 24:
@@ -484,18 +500,24 @@ def run_probe():
 
             controller.snapshot_label_edit.setText("Smoke milestone")
             controller.request_room_snapshot()
-            deadline = time.time() + 12
+            deadline = time.time() + 20
             manifests = []
+            snapshot_archives = []
             while time.time() < deadline:
                 pump_events(0.15)
                 manifests = controller.client.snapshot_manifests(controller.room_id)
-                if manifests:
+                snapshot_archives = list(
+                    controller.client._room_path.joinpath(
+                        "operation-archives"
+                    ).glob("*.zip")
+                )
+                if manifests and snapshot_archives:
                     break
             if not manifests:
                 raise RuntimeError("Room snapshot was not published")
             if manifests[-1].get("label") != "Smoke milestone":
                 raise RuntimeError("Milestone name was not preserved in version history")
-            if not list(controller.client._room_path.joinpath("operation-archives").glob("*.zip")):
+            if not snapshot_archives:
                 raise RuntimeError("Snapshot did not compact earlier loose operations")
 
             base_sequence = controller.last_sequence
@@ -619,6 +641,19 @@ def run_probe():
         standard_segment_editor_node = editor.segmentationNode().GetID()
         lifecycle = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_LIFECYCLE", "0") == "1":
+            from LiveSegmentationLib.collaboration import apply_mask_delta
+
+            expected_rejoin_mask = np.zeros(image.shape, dtype=np.uint8)
+            for operation in controller.client.operations(controller.room_id, 0):
+                if operation["segment_id"] == segment_id:
+                    expected_rejoin_mask = apply_mask_delta(
+                        expected_rejoin_mask, operation
+                    )
+            expected_rejoin_voxels = int(expected_rejoin_mask.sum())
+            if expected_rejoin_voxels <= 0:
+                raise RuntimeError(
+                    "Lifecycle probe could not reconstruct the shared label before leaving"
+                )
             first_node_id = segmentation.GetID()
             controller.leave()
             pump_events(0.2)
@@ -637,10 +672,20 @@ def run_probe():
                 raise RuntimeError("Leaving did not clear Segment Editor label fields")
 
             controller.join()
-            deadline = time.time() + 12
+            if not controller.connected:
+                raise RuntimeError(
+                    "Rejoining the live room failed: "
+                    f"{controller._last_error or controller.status_label.text}"
+                )
+            deadline = time.time() + 20
             rejoined_voxels = 0
             while time.time() < deadline:
+                # The smoke probe itself runs synchronously before Slicer's
+                # regular application event loop takes over. Tick the
+                # controller explicitly so a completed worker result cannot
+                # remain queued merely because this test is pumping Qt events.
                 pump_events(0.15)
+                controller.on_timer()
                 rejoined = controller._segmentation_node()
                 if (
                     controller.initial_sync_complete
@@ -651,8 +696,49 @@ def run_probe():
                         rejoined, segment_id, volume, image.shape
                     )
                     rejoined_voxels = int(np.asarray(rejoined_mask, dtype=np.uint8).sum())
-                    if rejoined_voxels >= 27:
+                    if rejoined_voxels == expected_rejoin_voxels:
                         break
+            if rejoined_voxels != expected_rejoin_voxels:
+                worker_state = {
+                    name: bool(
+                        getattr(controller, name, None) is not None
+                        and getattr(controller, name).is_alive()
+                    )
+                    for name in (
+                        "_edit_push_worker",
+                        "_edit_pull_worker",
+                        "_maintenance_worker",
+                    )
+                }
+                try:
+                    direct_operation_count = len(
+                        controller.client.operations(controller.room_id, 0)
+                    )
+                except Exception as exc:
+                    direct_operation_count = f"error: {exc}"
+                timer_active = controller.timer.isActive
+                timer_active = (
+                    timer_active() if callable(timer_active) else bool(timer_active)
+                )
+                queued_results = []
+                while not controller._worker_results.empty():
+                    queued_results.append(controller._worker_results.get_nowait())
+                for queued_result in queued_results:
+                    controller._worker_results.put(queued_result)
+                raise RuntimeError(
+                    "Rejoining did not restore the complete shared label: "
+                    f"received {rejoined_voxels} of {expected_rejoin_voxels} voxels "
+                    f"(initial sync complete: {controller.initial_sync_complete}, "
+                    f"last sequence: {controller.last_sequence}, "
+                    f"target sequence: {controller.initial_sequence}, "
+                    f"connected: {controller.connected}, "
+                    f"workers: {worker_state}, "
+                    f"direct operations: {direct_operation_count}, "
+                    f"timer active: {timer_active}, "
+                    "queued worker results: "
+                    f"{[(item.get('lane'), item.get('session_token'), bool(item.get('error')), len(item.get('operations') or [])) for item in queued_results]}, "
+                    f"last error: {controller._last_error})"
+                )
             replicas = [
                 node
                 for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
@@ -680,6 +766,7 @@ def run_probe():
                 "old_node_removed": True,
                 "rejoin_replica_count": len(replicas),
                 "rejoined_voxels": rejoined_voxels,
+                "expected_rejoin_voxels": expected_rejoin_voxels,
                 "second_node_removed": slicer.mrmlScene.GetNodeByID(second_node_id) is None,
                 "editor_cleared": editor.segmentationNode() is None,
             }

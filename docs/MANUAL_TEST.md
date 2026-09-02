@@ -34,6 +34,23 @@
 4. Select a different label and repeat. Confirm the Segment Editor selection,
    live history, and the received label identity all agree.
 
+## Large-volume and sparse-component scaling
+
+1. Repeat the two-user test with a representative high-resolution biological
+   volume (at least 512×512×512 voxels when hardware permits).
+2. Create several small labels and paint sparse components at widely separated
+   locations. Confirm normal brush edits remain region-based and do not allocate
+   one dense source-volume mask per label.
+3. Run room diagnostics and record `baseline_storage`: mode must be
+   `sparse-64-cubed-chunks`, allocated bytes must track occupied chunks, and
+   deleting a component must allow its empty chunk to be released.
+4. Create a checkpoint, leave, and rejoin. Verify every component is restored
+   exactly once and the voxel count equals the state reconstructed directly from
+   the room log.
+5. Confirm the checkpoint group begins with a snapshot and uses small patch
+   operations for further occupied chunks instead of one bounding box spanning
+   distant components.
+
 ## Separately installed tools
 
 1. Keep the live room connected.
@@ -123,3 +140,8 @@ generic `Modified()` call. With `LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS=1`,
 the producer also adds three disconnected components to the same existing label
 at 120 ms intervals. The third notification intentionally precedes its voxel
 write; the peer must still receive all 24 new voxels.
+
+The lifecycle probe reconstructs the authoritative room mask before leaving and
+requires exact voxel equality after rejoin. The release validation also runs a
+512×512×512 single-client lifecycle case and a simultaneous 256×256×256
+bidirectional rapid-stroke case.

@@ -264,6 +264,197 @@ def _delta_bounds(changed):
     ]
 
 
+class ChunkedMaskBaseline:
+    """Sparse uint8 mask stored as independently allocated fixed-size chunks."""
+
+    def __init__(self, shape, chunk_size=64):
+        self.shape = tuple(int(value) for value in shape)
+        if len(self.shape) != 3 or any(value <= 0 for value in self.shape):
+            raise ValueError("A chunked live baseline needs a valid 3D shape")
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size <= 0:
+            raise ValueError("Chunk size must be positive")
+        self.chunks = {}
+
+    @classmethod
+    def from_crop(cls, shape, crop=None, bounds=None, chunk_size=64):
+        baseline = cls(shape, chunk_size=chunk_size)
+        if crop is not None and bounds is not None:
+            values = np.asarray(crop, dtype=np.uint8)
+            baseline.set_region(bounds, values != 0, values)
+        return baseline
+
+    @property
+    def allocated_bytes(self):
+        return sum(int(chunk.nbytes) for chunk in self.chunks.values())
+
+    @property
+    def chunk_count(self):
+        return len(self.chunks)
+
+    def clear(self):
+        self.chunks.clear()
+
+    def _chunk_shape(self, coordinate):
+        starts = [int(value) * self.chunk_size for value in coordinate]
+        return tuple(
+            min(self.chunk_size, self.shape[axis] - starts[axis])
+            for axis in range(3)
+        )
+
+    def _intersections(self, bounds):
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+        if (
+            z0 < 0
+            or y0 < 0
+            or x0 < 0
+            or z1 > self.shape[0]
+            or y1 > self.shape[1]
+            or x1 > self.shape[2]
+            or z0 >= z1
+            or y0 >= y1
+            or x0 >= x1
+        ):
+            raise ValueError("Chunked baseline bounds are outside the volume")
+        for chunk_z in range(z0 // self.chunk_size, (z1 - 1) // self.chunk_size + 1):
+            for chunk_y in range(y0 // self.chunk_size, (y1 - 1) // self.chunk_size + 1):
+                for chunk_x in range(x0 // self.chunk_size, (x1 - 1) // self.chunk_size + 1):
+                    coordinate = (chunk_z, chunk_y, chunk_x)
+                    cz0, cy0, cx0 = (
+                        chunk_z * self.chunk_size,
+                        chunk_y * self.chunk_size,
+                        chunk_x * self.chunk_size,
+                    )
+                    cz1 = min(cz0 + self.chunk_size, self.shape[0])
+                    cy1 = min(cy0 + self.chunk_size, self.shape[1])
+                    cx1 = min(cx0 + self.chunk_size, self.shape[2])
+                    iz0, iz1 = max(z0, cz0), min(z1, cz1)
+                    iy0, iy1 = max(y0, cy0), min(y1, cy1)
+                    ix0, ix1 = max(x0, cx0), min(x1, cx1)
+                    region_slices = (
+                        slice(iz0 - z0, iz1 - z0),
+                        slice(iy0 - y0, iy1 - y0),
+                        slice(ix0 - x0, ix1 - x0),
+                    )
+                    chunk_slices = (
+                        slice(iz0 - cz0, iz1 - cz0),
+                        slice(iy0 - cy0, iy1 - cy0),
+                        slice(ix0 - cx0, ix1 - cx0),
+                    )
+                    yield coordinate, region_slices, chunk_slices
+
+    def region(self, bounds):
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+        result = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
+        for coordinate, region_slices, chunk_slices in self._intersections(bounds):
+            chunk = self.chunks.get(coordinate)
+            if chunk is not None:
+                result[region_slices] = chunk[chunk_slices]
+        return result
+
+    def set_region(self, bounds, changed, values):
+        changed = np.asarray(changed, dtype=bool)
+        values = np.asarray(values, dtype=np.uint8)
+        if changed.shape != values.shape:
+            raise ValueError("Changed and value crops must have identical shapes")
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+        expected = (z1 - z0, y1 - y0, x1 - x0)
+        if changed.shape != expected:
+            raise ValueError("Chunk update shape does not match its bounds")
+        for coordinate, region_slices, chunk_slices in self._intersections(bounds):
+            local_changed = changed[region_slices]
+            if not np.any(local_changed):
+                continue
+            local_values = values[region_slices]
+            chunk = self.chunks.get(coordinate)
+            if chunk is None:
+                if not np.any(local_values[local_changed]):
+                    continue
+                chunk = np.zeros(self._chunk_shape(coordinate), dtype=np.uint8)
+                self.chunks[coordinate] = chunk
+            target = chunk[chunk_slices]
+            target[local_changed] = local_values[local_changed]
+            if not np.any(chunk):
+                self.chunks.pop(coordinate, None)
+
+    def replace_crop(self, crop=None, bounds=None):
+        self.clear()
+        if crop is not None and bounds is not None:
+            values = np.asarray(crop, dtype=np.uint8)
+            self.set_region(bounds, values != 0, values)
+
+    def to_dense(self):
+        result = np.zeros(self.shape, dtype=np.uint8)
+        for coordinate, chunk in self.chunks.items():
+            z0, y0, x0 = (value * self.chunk_size for value in coordinate)
+            z1, y1, x1 = (
+                z0 + chunk.shape[0],
+                y0 + chunk.shape[1],
+                x0 + chunk.shape[2],
+            )
+            result[z0:z1, y0:y1, x0:x1] = chunk
+        return result
+
+
+def _baseline_shape(baseline):
+    return tuple(int(value) for value in baseline.shape)
+
+
+def _baseline_region(baseline, bounds):
+    if isinstance(baseline, ChunkedMaskBaseline):
+        return baseline.region(bounds)
+    z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+    return np.asarray(baseline, dtype=np.uint8)[z0:z1, y0:y1, x0:x1].copy()
+
+
+def _baseline_dense(baseline):
+    if isinstance(baseline, ChunkedMaskBaseline):
+        return baseline.to_dense()
+    return np.asarray(baseline, dtype=np.uint8).copy()
+
+
+def encode_chunked_mask_snapshot(baseline):
+    """Encode one full sparse mask as a clear operation plus chunk patches.
+
+    Every operation remains compatible with existing clients: the first
+    operation has regular snapshot semantics and therefore clears the old
+    label, while later operations are ordinary patches. No temporary array is
+    larger than one baseline chunk, even when components are far apart in a
+    very large source volume.
+    """
+    if not isinstance(baseline, ChunkedMaskBaseline):
+        raise TypeError("Chunked snapshot encoding requires a chunked baseline")
+    if not baseline.chunks:
+        return [encode_mask_crop_snapshot(None, None, baseline.shape)]
+
+    operations = []
+    for index, (coordinate, chunk) in enumerate(sorted(baseline.chunks.items())):
+        encoded = encode_mask_delta(
+            np.zeros_like(chunk),
+            chunk,
+            replace=index == 0,
+        )
+        if encoded is None:
+            continue
+        z0, y0, x0 = (
+            int(value) * baseline.chunk_size for value in coordinate
+        )
+        ez0, ez1, ey0, ey1, ex0, ex1 = encoded["voxel_bbox"]
+        encoded["voxel_bbox"] = [
+            z0 + ez0,
+            z0 + ez1,
+            y0 + ey0,
+            y0 + ey1,
+            x0 + ex0,
+            x0 + ex1,
+        ]
+        encoded["volume_shape"] = [int(value) for value in baseline.shape]
+        operations.append(encoded)
+    if operations:
+        return operations
+    return [encode_mask_crop_snapshot(None, None, baseline.shape)]
+
+
 def encode_mask_delta(previous, current, replace=False):
     """Encode changed boolean voxels in a compact, deterministic operation payload."""
     current = np.asarray(current, dtype=np.uint8)
@@ -390,9 +581,8 @@ def encode_mask_crop_delta_after_operations(
     the baseline first, so every later stroke can be queued immediately and in
     order without copying the complete reference volume.
     """
-    previous = np.asarray(previous, dtype=np.uint8)
     volume_shape = tuple(int(value) for value in volume_shape)
-    if previous.shape != volume_shape:
+    if _baseline_shape(previous) != volume_shape:
         raise ValueError("Baseline and live volume geometry do not match")
 
     operations = list(pending_operations or [])
@@ -427,7 +617,7 @@ def encode_mask_crop_delta_after_operations(
             cx0 - x0 : cx1 - x0,
         ] = np.asarray(current_crop, dtype=np.uint8)
 
-    queued_region = previous[z0:z1, y0:y1, x0:x1].copy()
+    queued_region = _baseline_region(previous, comparison_bounds)
     for operation in operations:
         if operation.get("operation_kind") == "snapshot":
             queued_region.fill(0)
@@ -676,7 +866,9 @@ class LiveRoomClient:
             stored = {
                 **operation,
                 "client_operation_id": f"snapshot-{group_id}-{index}",
-                "operation_kind": "snapshot",
+                "operation_kind": str(
+                    operation.get("operation_kind") or "snapshot"
+                ),
                 "snapshot_group_id": group_id,
                 "snapshot_group_index": index,
                 "snapshot_group_count": len(segment_operations),
@@ -686,7 +878,12 @@ class LiveRoomClient:
             results.append(self.push_operation(room_id, stored))
         return {
             "id": group_id,
-            "segment_count": len(results),
+            "segment_count": len(
+                {
+                    str(operation.get("segment_id") or "")
+                    for operation in segment_operations
+                }
+            ),
             "last_sequence": int(results[-1]["sequence"]) if results else 0,
             "compacted": False,
             "label": str(label or "")[:200],
@@ -2142,7 +2339,9 @@ class SharedFolderRoomClient:
                 stored = {
                     **operation,
                     "client_operation_id": operation_id,
-                    "operation_kind": "snapshot",
+                    "operation_kind": str(
+                        operation.get("operation_kind") or "snapshot"
+                    ),
                     "sequence": sequence,
                     "author": self.user_name,
                     "created_at": _utc_iso(),
@@ -2197,7 +2396,12 @@ class SharedFolderRoomClient:
                 "before_sequence": before_sequence,
                 "first_sequence": created[0]["sequence"],
                 "last_sequence": created[-1]["sequence"],
-                "segment_count": len(created),
+                "segment_count": len(
+                    {
+                        str(operation.get("segment_id") or "")
+                        for operation in created
+                    }
+                ),
                 "compacted": bool(compact),
                 "label": str(label or "")[:200],
             }
@@ -2234,7 +2438,12 @@ class SharedFolderRoomClient:
             "history.snapshot",
             {
                 "snapshot_id": group_id,
-                "segments": len(created),
+                "segments": len(
+                    {
+                        str(operation.get("segment_id") or "")
+                        for operation in created
+                    }
+                ),
                 "through_sequence": before_sequence,
                 "compacted": bool(compact),
             },
@@ -4177,14 +4386,15 @@ class LiveCollaborationController:
         for segment_id in node.GetSegmentation().GetSegmentIDs():
             key = (node.GetID(), segment_id)
             crop, bounds = self._read_mask_crop(node, segment_id)
-            mask = self._mask_from_crop(crop, bounds)
             if seed:
-                self.baselines[key] = np.zeros_like(mask)
+                self.baselines[key] = ChunkedMaskBaseline(self.volume_shape)
                 self.baseline_bounds[key] = None
                 self.force_snapshots.add(key)
                 self.dirty_segments.add(key)
             else:
-                self.baselines[key] = mask.copy()
+                self.baselines[key] = ChunkedMaskBaseline.from_crop(
+                    self.volume_shape, crop, bounds
+                )
                 self.baseline_bounds[key] = list(bounds) if bounds is not None else None
             self._remember_segment_revision(node, segment_id)
 
@@ -4249,6 +4459,19 @@ class LiveCollaborationController:
         ] = np.asarray(crop, dtype=np.uint8)
         return result
 
+    def _crop_differs_from_baseline(
+        self, baseline, current_crop, current_bounds, baseline_bounds
+    ):
+        comparison_bounds = _bounds_union(current_bounds, baseline_bounds)
+        if baseline is None or comparison_bounds is None:
+            return False
+        current_region = self._crop_region(
+            current_crop, current_bounds, comparison_bounds
+        )
+        return bool(
+            np.any(current_region != _baseline_region(baseline, comparison_bounds))
+        )
+
     @staticmethod
     def _segment_color_hex(segment):
         color = [0.29, 0.56, 0.89]
@@ -4305,7 +4528,7 @@ class LiveCollaborationController:
                 current_region = self._crop_region(
                     current_crop, current_bounds, restore_bounds
                 )
-                target_region = baseline[z0:z1, y0:y1, x0:x1]
+                target_region = _baseline_region(baseline, restore_bounds)
                 crop_updater = getattr(
                     self.owner, "update_segment_binary_labelmap_crop", None
                 )
@@ -4322,7 +4545,10 @@ class LiveCollaborationController:
                 )
             if not restored_incrementally:
                 self.owner.update_segment_binary_labelmap_from_array(
-                    baseline, node, segment_id, self.owner.get_volume_node()
+                    _baseline_dense(baseline),
+                    node,
+                    segment_id,
+                    self.owner.get_volume_node(),
                 )
             self.owner.refresh_segmentation_display(node, segment_id)
         finally:
@@ -4346,21 +4572,29 @@ class LiveCollaborationController:
             current_crop, current_bounds = self._read_mask_crop(node, key[1])
             self._remember_segment_revision(node, key[1])
             if self._current_role() == "viewer":
-                current = self._mask_from_crop(current_crop, current_bounds)
-                if previous is not None and np.any(current != previous):
+                if self._crop_differs_from_baseline(
+                    previous,
+                    current_crop,
+                    current_bounds,
+                    self.baseline_bounds.get(key),
+                ):
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
                 continue
             if self._locked_by_other(key[1]):
-                current = self._mask_from_crop(current_crop, current_bounds)
-                if previous is not None and np.any(current != previous):
+                if self._crop_differs_from_baseline(
+                    previous,
+                    current_crop,
+                    current_bounds,
+                    self.baseline_bounds.get(key),
+                ):
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
                 continue
             if previous is None:
-                previous = np.zeros(tuple(self.volume_shape), dtype=np.uint8)
+                previous = ChunkedMaskBaseline(self.volume_shape)
             # A new room/label is announced as a snapshot, but that snapshot is
             # encoded from the segment's effective crop (one voxel when empty),
             # never from the complete microscopy volume.
@@ -4425,14 +4659,23 @@ class LiveCollaborationController:
             key = (node.GetID(), segment_id)
             mask = self.baselines.get(key)
             if mask is None:
-                mask = self._read_mask(node, segment_id)
-            bounds = self.baseline_bounds.get(key)
-            crop = None
-            if bounds is not None:
-                z0, z1, y0, y1, x0, x1 = bounds
-                crop = np.ascontiguousarray(mask[z0:z1, y0:y1, x0:x1])
-            encoded = encode_mask_crop_snapshot(crop, bounds, self.volume_shape)
-            if encoded is not None:
+                crop, bounds = self._read_mask_crop(node, segment_id)
+                mask = ChunkedMaskBaseline.from_crop(
+                    self.volume_shape, crop, bounds
+                )
+            if isinstance(mask, ChunkedMaskBaseline):
+                encoded_operations = encode_chunked_mask_snapshot(mask)
+            else:
+                bounds = self.baseline_bounds.get(key)
+                crop = None
+                if bounds is not None:
+                    crop = _baseline_region(mask, bounds)
+                encoded_operations = [
+                    encode_mask_crop_snapshot(crop, bounds, self.volume_shape)
+                ]
+            for encoded in encoded_operations:
+                if encoded is None:
+                    continue
                 result.append(
                     {
                         "segment_id": segment_id,
@@ -4576,7 +4819,12 @@ class LiveCollaborationController:
             )
             self._presence_worker.start()
 
-        self._force_sync_refresh = False
+        # Keep the pull lane armed until the join watermark is actually
+        # reached. A shared-folder checkpoint may briefly expose its new
+        # sequence number before every compacted artifact is visible through
+        # an SMB cache. Treat an empty first read as transient instead of
+        # leaving a freshly joined room at sequence zero.
+        self._force_sync_refresh = not self.initial_sync_complete
         self._force_realtime_refresh = False
 
         maintenance_idle = (
@@ -5450,6 +5698,11 @@ class LiveCollaborationController:
                     f"Checksum {'valid' if valid else 'FAILED'}: {(value or {}).get('name', '')}"
                 )
             elif action == "diagnostics":
+                chunked_baselines = [
+                    baseline
+                    for baseline in self.baselines.values()
+                    if isinstance(baseline, ChunkedMaskBaseline)
+                ]
                 self.last_diagnostics = dict(value or {})
                 self.last_diagnostics.update(
                     {
@@ -5458,6 +5711,17 @@ class LiveCollaborationController:
                         "dirty_segments": len(self.dirty_segments),
                         "pending_chat_messages": len(self.pending_chat),
                         "connection_healthy": bool(self.connection_healthy),
+                        "baseline_storage": {
+                            "mode": "sparse-64-cubed-chunks",
+                            "labels": len(chunked_baselines),
+                            "chunks": sum(
+                                baseline.chunk_count for baseline in chunked_baselines
+                            ),
+                            "allocated_bytes": sum(
+                                baseline.allocated_bytes
+                                for baseline in chunked_baselines
+                            ),
+                        },
                     }
                 )
                 self.diagnostics_text.setPlainText(
@@ -5822,10 +6086,11 @@ class LiveCollaborationController:
                 operation_bounds = [
                     int(value) for value in operation["voxel_bbox"]
                 ]
+                oz0, oz1, oy0, oy1, ox0, ox1 = operation_bounds
                 changed, values = decode_mask_delta(operation)
                 baseline = self.baselines.get(key)
                 if baseline is None:
-                    baseline = np.zeros(tuple(self.volume_shape), dtype=np.uint8)
+                    baseline = ChunkedMaskBaseline(self.volume_shape)
                     self.baselines[key] = baseline
 
                 # Ordinary edits only touch the operation crop. Checkpoints may
@@ -5854,9 +6119,7 @@ class LiveCollaborationController:
                     )
 
                 az0, az1, ay0, ay1, ax0, ax1 = affected_bounds
-                server_before_region = baseline[
-                    az0:az1, ay0:ay1, ax0:ax1
-                ].copy()
+                server_before_region = _baseline_region(baseline, affected_bounds)
                 local_changes = (
                     current_region != server_before_region
                     if self.initial_sync_complete
@@ -5864,15 +6127,18 @@ class LiveCollaborationController:
                 )
 
                 if operation.get("operation_kind") == "snapshot":
-                    baseline.fill(0)
-                oz0, oz1, oy0, oy1, ox0, ox1 = operation_bounds
-                baseline_operation_crop = baseline[
-                    oz0:oz1, oy0:oy1, ox0:ox1
-                ]
-                baseline_operation_crop[changed] = values[changed]
-                server_after_region = baseline[
-                    az0:az1, ay0:ay1, ax0:ax1
-                ]
+                    if isinstance(baseline, ChunkedMaskBaseline):
+                        baseline.clear()
+                    else:
+                        baseline.fill(0)
+                if isinstance(baseline, ChunkedMaskBaseline):
+                    baseline.set_region(operation_bounds, changed, values)
+                else:
+                    baseline_operation_crop = baseline[
+                        oz0:oz1, oy0:oy1, ox0:ox1
+                    ]
+                    baseline_operation_crop[changed] = values[changed]
+                server_after_region = _baseline_region(baseline, affected_bounds)
                 visible_region = server_after_region.copy()
                 visible_region[local_changes] = current_region[local_changes]
 
@@ -5895,7 +6161,7 @@ class LiveCollaborationController:
                 if not applied_incrementally:
                     # Geometry with a non-linear parent transform uses Slicer's
                     # general full-volume resampling path for correctness.
-                    visible_full = baseline.copy()
+                    visible_full = _baseline_dense(baseline)
                     visible_full[
                         az0:az1, ay0:ay1, ax0:ax1
                     ][local_changes] = current_region[local_changes]
