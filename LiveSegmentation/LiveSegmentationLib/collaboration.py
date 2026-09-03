@@ -3403,7 +3403,7 @@ class LiveCollaborationController:
 
         self.shared_folder_label = qt.QLabel("Shared folder")
         self.shared_folder_widget = qt.QWidget()
-        shared_folder_layout = qt.QHBoxLayout(self.shared_folder_widget)
+        shared_folder_layout = qt.QGridLayout(self.shared_folder_widget)
         shared_folder_layout.setContentsMargins(0, 0, 0, 0)
         self.shared_folder_edit = qt.QComboBox()
         self.shared_folder_edit.setEditable(True)
@@ -3426,17 +3426,19 @@ class LiveCollaborationController:
             "Forget the locally stored recent shared-folder paths"
         )
         self.shared_folder_clear_button.clicked.connect(self.clear_recent_shared_folders)
-        shared_folder_layout.addWidget(self.shared_folder_edit, 1)
-        shared_folder_layout.addWidget(self.shared_folder_button)
-        shared_folder_layout.addWidget(self.shared_folder_clear_button)
+        shared_folder_layout.addWidget(self.shared_folder_edit, 0, 0, 1, 2)
+        shared_folder_layout.addWidget(self.shared_folder_button, 1, 0)
+        shared_folder_layout.addWidget(self.shared_folder_clear_button, 1, 1)
+        shared_folder_layout.setColumnStretch(0, 1)
+        shared_folder_layout.setColumnStretch(1, 1)
         identity_layout.addRow(self.shared_folder_label, self.shared_folder_widget)
         layout.addLayout(identity_layout)
 
         self.join_button = qt.QPushButton("Join live room")
         self.join_button.setMinimumHeight(34)
         self.join_button.clicked.connect(self.toggle_connection)
-        connection_actions = qt.QHBoxLayout()
-        connection_actions.addWidget(self.join_button, 1)
+        connection_actions = qt.QGridLayout()
+        connection_actions.addWidget(self.join_button, 0, 0, 1, 2)
         self.refresh_button = qt.QPushButton("Sync now")
         self.refresh_button.setToolTip(
             "Immediately request new edits, participants, chat, and label locks. "
@@ -3444,14 +3446,16 @@ class LiveCollaborationController:
         )
         self.refresh_button.enabled = False
         self.refresh_button.clicked.connect(self.refresh_now)
-        connection_actions.addWidget(self.refresh_button)
+        connection_actions.addWidget(self.refresh_button, 1, 0)
         self.benchmark_button = qt.QPushButton("Benchmark")
         self.benchmark_button.setToolTip(
             "Measure non-destructive health and live-feed round trips for this room"
         )
         self.benchmark_button.enabled = False
         self.benchmark_button.clicked.connect(self.run_connection_benchmark)
-        connection_actions.addWidget(self.benchmark_button)
+        connection_actions.addWidget(self.benchmark_button, 1, 1)
+        connection_actions.setColumnStretch(0, 1)
+        connection_actions.setColumnStretch(1, 1)
         layout.addLayout(connection_actions)
 
         self.status_label = qt.QLabel("● Offline")
@@ -3461,7 +3465,7 @@ class LiveCollaborationController:
         self.users_label = qt.QLabel("Nobody else is connected")
         self.users_label.setWordWrap(True)
         layout.addWidget(self.users_label)
-        presence_actions = qt.QHBoxLayout()
+        presence_actions = qt.QGridLayout()
         self.collaborator_combo = qt.QComboBox()
         self.collaborator_combo.setToolTip("Select an online collaborator")
         self.follow_checkbox = qt.QCheckBox("Follow view")
@@ -3473,10 +3477,12 @@ class LiveCollaborationController:
         self.jump_to_user_button.clicked.connect(self.jump_to_selected_user)
         self.open_activity_dock_button = qt.QPushButton("Open activity")
         self.open_activity_dock_button.clicked.connect(self.show_activity_dock)
-        presence_actions.addWidget(self.collaborator_combo, 1)
-        presence_actions.addWidget(self.follow_checkbox)
-        presence_actions.addWidget(self.jump_to_user_button)
-        presence_actions.addWidget(self.open_activity_dock_button)
+        presence_actions.addWidget(self.collaborator_combo, 0, 0, 1, 2)
+        presence_actions.addWidget(self.follow_checkbox, 1, 0)
+        presence_actions.addWidget(self.jump_to_user_button, 1, 1)
+        presence_actions.addWidget(self.open_activity_dock_button, 2, 0, 1, 2)
+        presence_actions.setColumnStretch(0, 1)
+        presence_actions.setColumnStretch(1, 1)
         layout.addLayout(presence_actions)
 
         label_management_layout = qt.QFormLayout()
@@ -3496,7 +3502,7 @@ class LiveCollaborationController:
         self.lock_button.enabled = False
         self.lock_button.clicked.connect(self.toggle_selected_segment_lock)
         layout.addWidget(self.lock_button)
-        lock_actions = qt.QHBoxLayout()
+        lock_actions = qt.QGridLayout()
         self.lock_expiry_spin = qt.QSpinBox()
         self.lock_expiry_spin.minimum = 0
         self.lock_expiry_spin.maximum = 1440
@@ -3508,13 +3514,15 @@ class LiveCollaborationController:
         self.transfer_owner_button = qt.QPushButton("Transfer to selected user")
         self.transfer_owner_button.enabled = False
         self.transfer_owner_button.clicked.connect(self.transfer_selected_segment_owner)
-        lock_actions.addWidget(qt.QLabel("Lock duration"))
-        lock_actions.addWidget(self.lock_expiry_spin)
-        lock_actions.addWidget(self.request_access_button)
-        lock_actions.addWidget(self.transfer_owner_button)
+        lock_actions.addWidget(qt.QLabel("Lock duration"), 0, 0)
+        lock_actions.addWidget(self.lock_expiry_spin, 0, 1)
+        lock_actions.addWidget(self.request_access_button, 1, 0)
+        lock_actions.addWidget(self.transfer_owner_button, 1, 1)
+        lock_actions.setColumnStretch(0, 1)
+        lock_actions.setColumnStretch(1, 1)
         layout.addLayout(lock_actions)
 
-        review_actions = qt.QHBoxLayout()
+        review_actions = qt.QGridLayout()
         self.review_state_combo = qt.QComboBox()
         for value, label in (
             ("draft", "Draft"),
@@ -3529,21 +3537,24 @@ class LiveCollaborationController:
         self.set_review_button = qt.QPushButton("Set label review state")
         self.set_review_button.enabled = False
         self.set_review_button.clicked.connect(self.set_selected_segment_review_state)
-        review_actions.addWidget(self.review_state_combo)
-        review_actions.addWidget(self.review_note_edit, 1)
-        review_actions.addWidget(self.set_review_button)
+        review_actions.addWidget(self.review_state_combo, 0, 0)
+        review_actions.addWidget(self.set_review_button, 0, 1)
+        review_actions.addWidget(self.review_note_edit, 1, 0, 1, 2)
+        review_actions.setColumnStretch(0, 1)
+        review_actions.setColumnStretch(1, 1)
         layout.addLayout(review_actions)
 
-        role_actions = qt.QHBoxLayout()
+        role_actions = qt.QGridLayout()
         self.role_combo = qt.QComboBox()
         for role in ROOM_ROLES:
             self.role_combo.addItem(role.title(), role)
         self.set_role_button = qt.QPushButton("Set selected user's role")
         self.set_role_button.enabled = False
         self.set_role_button.clicked.connect(self.set_selected_user_role)
-        role_actions.addWidget(qt.QLabel("Room role"))
-        role_actions.addWidget(self.role_combo)
-        role_actions.addWidget(self.set_role_button)
+        role_actions.addWidget(qt.QLabel("Room role"), 0, 0)
+        role_actions.addWidget(self.role_combo, 0, 1)
+        role_actions.addWidget(self.set_role_button, 1, 0, 1, 2)
+        role_actions.setColumnStretch(1, 1)
         layout.addLayout(role_actions)
 
         chat_group = ctk.ctkCollapsibleButton()
@@ -3566,7 +3577,7 @@ class LiveCollaborationController:
         chat_entry_layout.addWidget(self.chat_input, 1)
         chat_entry_layout.addWidget(self.chat_send_button)
         chat_layout.addLayout(chat_entry_layout)
-        chat_location_layout = qt.QHBoxLayout()
+        chat_location_layout = qt.QGridLayout()
         self.chat_anchor_checkbox = qt.QCheckBox("Attach current Slicer location")
         self.chat_anchor_checkbox.checked = True
         self.chat_location_combo = qt.QComboBox()
@@ -3576,10 +3587,12 @@ class LiveCollaborationController:
         self.jump_to_chat_button.clicked.connect(self.jump_to_selected_chat_anchor)
         self.open_chat_dock_button = qt.QPushButton("Open persistent chat")
         self.open_chat_dock_button.clicked.connect(self.show_chat_dock)
-        chat_location_layout.addWidget(self.chat_anchor_checkbox)
-        chat_location_layout.addWidget(self.chat_location_combo, 1)
-        chat_location_layout.addWidget(self.jump_to_chat_button)
-        chat_location_layout.addWidget(self.open_chat_dock_button)
+        chat_location_layout.addWidget(self.chat_anchor_checkbox, 0, 0, 1, 2)
+        chat_location_layout.addWidget(self.chat_location_combo, 1, 0, 1, 2)
+        chat_location_layout.addWidget(self.jump_to_chat_button, 2, 0)
+        chat_location_layout.addWidget(self.open_chat_dock_button, 2, 1)
+        chat_location_layout.setColumnStretch(0, 1)
+        chat_location_layout.setColumnStretch(1, 1)
         chat_layout.addLayout(chat_location_layout)
         comment_layout = qt.QHBoxLayout()
         self.comment_input = qt.QLineEdit()
@@ -3649,7 +3662,7 @@ class LiveCollaborationController:
         self.backup_tree.setHeaderLabels(["Backup", "Size", "Pinned", "Checksum"])
         self.backup_tree.setMaximumHeight(135)
         backup_form.addRow(self.backup_tree)
-        backup_buttons = qt.QHBoxLayout()
+        backup_buttons = qt.QGridLayout()
         self.backup_now_button = qt.QPushButton("Back up now")
         self.backup_now_button.clicked.connect(self.create_backup_now)
         self.refresh_backups_button = qt.QPushButton("Refresh backups")
@@ -3660,15 +3673,20 @@ class LiveCollaborationController:
         self.verify_backup_button.clicked.connect(self.verify_selected_backup)
         self.restore_backup_button = qt.QPushButton("Restore")
         self.restore_backup_button.clicked.connect(self.restore_selected_backup)
-        for button in (
+        for index, button in enumerate((
             self.backup_now_button,
             self.refresh_backups_button,
             self.pin_backup_button,
             self.verify_backup_button,
             self.restore_backup_button,
-        ):
+        )):
             button.enabled = False
-            backup_buttons.addWidget(button)
+            if index == 4:
+                backup_buttons.addWidget(button, 2, 0, 1, 2)
+            else:
+                backup_buttons.addWidget(button, index // 2, index % 2)
+        backup_buttons.setColumnStretch(0, 1)
+        backup_buttons.setColumnStretch(1, 1)
         backup_form.addRow(backup_buttons)
         layout.addWidget(backup_group)
         self.backup_group = backup_group
@@ -3687,7 +3705,7 @@ class LiveCollaborationController:
         )
         self.history_tree.setMaximumHeight(180)
         history_layout.addWidget(self.history_tree)
-        history_buttons = qt.QHBoxLayout()
+        history_buttons = qt.QGridLayout()
         self.refresh_history_button = qt.QPushButton("Reload full history")
         self.refresh_history_button.clicked.connect(self.refresh_advanced_state)
         self.restore_revision_button = qt.QPushButton("Restore selected revision")
@@ -3700,16 +3718,21 @@ class LiveCollaborationController:
         self.create_snapshot_button.clicked.connect(self.request_room_snapshot)
         self.snapshot_label_edit = qt.QLineEdit()
         self.snapshot_label_edit.setPlaceholderText("Optional milestone name")
-        history_buttons.addWidget(self.snapshot_label_edit, 1)
-        for button in (
+        history_buttons.addWidget(self.snapshot_label_edit, 0, 0, 1, 2)
+        for index, button in enumerate((
             self.refresh_history_button,
             self.restore_revision_button,
             self.compare_revision_button,
             self.undo_shared_button,
             self.create_snapshot_button,
-        ):
+        )):
             button.enabled = False
-            history_buttons.addWidget(button)
+            if index == 4:
+                history_buttons.addWidget(button, 3, 0, 1, 2)
+            else:
+                history_buttons.addWidget(button, 1 + index // 2, index % 2)
+        history_buttons.setColumnStretch(0, 1)
+        history_buttons.setColumnStretch(1, 1)
         history_layout.addLayout(history_buttons)
         self.conflict_tree = qt.QTreeWidget()
         self.conflict_tree.setHeaderLabels(
@@ -3717,7 +3740,7 @@ class LiveCollaborationController:
         )
         self.conflict_tree.setMaximumHeight(120)
         history_layout.addWidget(self.conflict_tree)
-        conflict_buttons = qt.QHBoxLayout()
+        conflict_buttons = qt.QGridLayout()
         self.resolve_latest_button = qt.QPushButton("Accept latest")
         self.resolve_mine_button = qt.QPushButton("Reapply mine")
         self.resolve_other_button = qt.QPushButton("Use other version")
@@ -3726,14 +3749,16 @@ class LiveCollaborationController:
         self.resolve_mine_button.clicked.connect(lambda: self.resolve_selected_conflict("mine"))
         self.resolve_other_button.clicked.connect(lambda: self.resolve_selected_conflict("other"))
         self.resolve_union_button.clicked.connect(lambda: self.resolve_selected_conflict("union"))
-        for button in (
+        for index, button in enumerate((
             self.resolve_latest_button,
             self.resolve_mine_button,
             self.resolve_other_button,
             self.resolve_union_button,
-        ):
+        )):
             button.enabled = False
-            conflict_buttons.addWidget(button)
+            conflict_buttons.addWidget(button, index // 2, index % 2)
+        conflict_buttons.setColumnStretch(0, 1)
+        conflict_buttons.setColumnStretch(1, 1)
         history_layout.addLayout(conflict_buttons)
         self.review_queue_tree = qt.QTreeWidget()
         self.review_queue_tree.setHeaderLabels(["Review state", "Label", "Updated by", "Note"])
@@ -3764,34 +3789,37 @@ class LiveCollaborationController:
         self.performance_label = qt.QLabel("No live performance samples yet")
         self.performance_label.setWordWrap(True)
         project_layout.addWidget(self.performance_label)
-        diagnostic_buttons = qt.QHBoxLayout()
+        diagnostic_buttons = qt.QGridLayout()
         self.run_diagnostics_button = qt.QPushButton("Run diagnostics")
         self.run_diagnostics_button.clicked.connect(self.run_room_diagnostics)
         self.export_diagnostics_button = qt.QPushButton("Export sanitized report")
         self.export_diagnostics_button.clicked.connect(self.export_diagnostics)
         self.export_metrics_button = qt.QPushButton("Export research metrics")
         self.export_metrics_button.clicked.connect(self.export_session_metrics)
-        diagnostic_buttons.addWidget(self.run_diagnostics_button)
-        diagnostic_buttons.addWidget(self.export_diagnostics_button)
-        diagnostic_buttons.addWidget(self.export_metrics_button)
+        diagnostic_buttons.addWidget(self.run_diagnostics_button, 0, 0)
+        diagnostic_buttons.addWidget(self.export_diagnostics_button, 0, 1)
+        diagnostic_buttons.addWidget(self.export_metrics_button, 1, 0, 1, 2)
+        diagnostic_buttons.setColumnStretch(0, 1)
+        diagnostic_buttons.setColumnStretch(1, 1)
         project_layout.addLayout(diagnostic_buttons)
-        quality_layout = qt.QHBoxLayout()
+        quality_layout = qt.QGridLayout()
         self.quality_min_component_spin = qt.QSpinBox()
         self.quality_min_component_spin.minimum = 1
         self.quality_min_component_spin.maximum = 1000000
         self.quality_min_component_spin.value = 20
         self.run_quality_button = qt.QPushButton("Run segmentation quality checks")
         self.run_quality_button.clicked.connect(self.run_quality_checks)
-        quality_layout.addWidget(qt.QLabel("Small component <"))
-        quality_layout.addWidget(self.quality_min_component_spin)
-        quality_layout.addWidget(qt.QLabel("voxels"))
-        quality_layout.addWidget(self.run_quality_button, 1)
+        quality_layout.addWidget(qt.QLabel("Small component <"), 0, 0)
+        quality_layout.addWidget(self.quality_min_component_spin, 0, 1)
+        quality_layout.addWidget(qt.QLabel("voxels"), 0, 2)
+        quality_layout.addWidget(self.run_quality_button, 1, 0, 1, 3)
+        quality_layout.setColumnStretch(1, 1)
         project_layout.addLayout(quality_layout)
         self.quality_text = qt.QPlainTextEdit()
         self.quality_text.setReadOnly(True)
         self.quality_text.setMaximumHeight(110)
         project_layout.addWidget(self.quality_text)
-        template_buttons = qt.QHBoxLayout()
+        template_buttons = qt.QVBoxLayout()
         self.publish_template_button = qt.QPushButton("Publish labels as room template")
         self.publish_template_button.clicked.connect(self.publish_material_template)
         self.apply_template_button = qt.QPushButton("Apply room template")
@@ -3799,7 +3827,7 @@ class LiveCollaborationController:
         template_buttons.addWidget(self.publish_template_button)
         template_buttons.addWidget(self.apply_template_button)
         project_layout.addLayout(template_buttons)
-        invite_buttons = qt.QHBoxLayout()
+        invite_buttons = qt.QVBoxLayout()
         self.export_invite_button = qt.QPushButton("Export .livesegroom invitation")
         self.export_invite_button.clicked.connect(self.export_invitation)
         self.import_invite_button = qt.QPushButton("Import invitation")
@@ -3813,7 +3841,8 @@ class LiveCollaborationController:
         recovery_group.text = "Crash recovery"
         recovery_group.collapsed = True
         recovery_layout = qt.QVBoxLayout(recovery_group)
-        self.recovery_enabled_checkbox = qt.QCheckBox(
+        self.recovery_enabled_checkbox = qt.QCheckBox("Keep crash-recovery journal")
+        self.recovery_enabled_checkbox.setToolTip(
             "Keep a local crash-recovery journal for unacknowledged edits"
         )
         self.recovery_enabled_checkbox.checked = str(

@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.12.0.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.12.1.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.12.0`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.12.1`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -109,6 +109,11 @@ always-visible activity dock, collaborative undo, local crash recovery,
 review queues, segmentation QA checks, revision comparison overlays,
 double-clickable `.livesegroom` invitations, and anonymized session-metrics
 export. The pre-existing room-template feature is unchanged.
+
+Version 0.12.1 makes the module panel responsive on narrow and lower-resolution
+displays. Wide action rows wrap into compact grids, while long lists continue to
+use Slicer's normal scrolling. The measured minimum module-content width is 288
+pixels instead of 741 pixels in version 0.12.0.
 
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`

@@ -27,3 +27,4 @@ two-user-*.json
 .shared-realtime-*/
 .shared-v*/
 .v*-*.json
+scripts/*.result.json

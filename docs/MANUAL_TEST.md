@@ -65,6 +65,18 @@
 5. Repeat with an incorrect session code and verify the join is rejected. Never
    expose the unencrypted relay outside a trusted LAN or approved VPN.
 
+## Narrow module panel
+
+1. Open **Live Segmentation** and drag the left module panel toward its minimum
+   width. Confirm that it can shrink to approximately 288 pixels rather than
+   occupying a large fraction of the display.
+2. Expand **Room chat**, **Live activity, version history, and conflicts**, and
+   **Diagnostics, templates, and invitations**. Confirm that action controls are
+   arranged over multiple rows, remain clickable, and do not force the panel
+   wider.
+3. Run `scripts/slicer_ui_width_smoke_test.py` with the source module path and
+   confirm `root_minimum_hint` is at most 360 pixels.
+
 ## Version 0.12 collaboration enhancements
 
 1. Send an ordinary message and a spatial comment. Verify both appear

@@ -13,7 +13,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleWidget,
 )
 
-PLUGIN_VERSION = "0.12.0"
+PLUGIN_VERSION = "0.12.1"
 
 
 def clear_legacy_connection_settings():
@@ -733,4 +733,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.12.0")
+        self.assertEqual(PLUGIN_VERSION, "0.12.1")

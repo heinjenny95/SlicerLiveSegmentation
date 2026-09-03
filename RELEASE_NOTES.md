@@ -1,4 +1,24 @@
-# Live Segmentation 0.12.0
+# Live Segmentation 0.12.1
+
+Version 0.12.1 fixes the module panel occupying an excessive fraction of the
+screen on narrow and lower-resolution displays.
+
+## Responsive module panel
+
+- Wide one-line action bars for connection, presence, locks, review, chat,
+  backups, history, conflict resolution, diagnostics, quality checks, and
+  invitations now use compact multi-row layouts.
+- Long functionality remains available without horizontal clipping; the normal
+  Slicer module panel continues to scroll vertically.
+- The crash-recovery checkbox uses a shorter visible label and keeps its full
+  explanation as a tooltip.
+- A real Slicer 5.12.3 UI-width smoke test measures a minimum module-content
+  width of 288 pixels, reduced from 741 pixels in version 0.12.0.
+- All collaboration behavior and room formats remain unchanged.
+
+---
+
+# Previous release: Live Segmentation 0.12.0
 
 Version 0.12.0 turns the existing low-latency collaboration core into a more
 complete biological segmentation workspace. Room templates were deliberately

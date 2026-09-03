@@ -12,6 +12,7 @@
 - echter erweiterter Slicer-Smoke-Test erfolgreich
 - echter Direct-LAN-, Fallback-, Undo-, QA- und Revisionsvergleichstest erfolgreich
 - `.livesegroom`-Dateizuordnung und Doppelklick-Import geprüft
+- echtes Slicer-UI-Breitenprofil: Modul-Mindestbreite höchstens 360 px
 - Archive enthalten keine `.git`, `.venv`, Datenbank-, Patientendaten- oder Secret-Dateien
 
 ## Manuell vor produktiver Nutzung
