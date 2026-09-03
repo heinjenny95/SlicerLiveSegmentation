@@ -113,6 +113,14 @@ def run_probe():
         controller = widget.live_collaboration
         if controller is None or not hasattr(controller, "group"):
             raise RuntimeError("Live collaboration UI was not created")
+        controller.transport_combo.setCurrentIndex(1)
+        pump_events(0.05)
+        if controller.lan_settings.isHidden() or controller.lan_url_edit.isHidden():
+            raise RuntimeError("Direct LAN mode did not reveal its host/address controls")
+        controller.transport_combo.setCurrentIndex(2)
+        pump_events(0.05)
+        if controller.server_settings.isHidden() or controller.server_edit.isHidden():
+            raise RuntimeError("HTTPS mode did not reveal its server-address control")
         if startup_reset_probe:
             if controller._text(controller.shared_folder_edit) or controller._text(
                 controller.room_edit
@@ -599,6 +607,9 @@ def run_probe():
                     break
             if "Persistent controller chat test" not in chat_text:
                 raise RuntimeError("Controller chat message did not appear")
+            own_activity_text = controller.activity_dock_text.toPlainText()
+            if "You " not in own_activity_text:
+                raise RuntimeError("Own live segmentation activity was not displayed")
 
             controller.toggle_selected_segment_lock()
             deadline = time.time() + 8
@@ -632,6 +643,7 @@ def run_probe():
             collaboration_extras = {
                 "chat_visible": True,
                 "chat_optimistic": True,
+                "own_activity_visible": True,
                 "lock_round_trip": True,
                 "explicit_label_selector": True,
                 "backup_settings_editable": True,
@@ -646,6 +658,8 @@ def run_probe():
                 PRESENCE_DISPLAY_GRACE_SECONDS,
                 SharedFolderRoomClient,
                 encode_mask_delta,
+                encode_metadata_update,
+                new_collaboration_segment_id,
             )
 
             peer = SharedFolderRoomClient(
@@ -701,6 +715,121 @@ def run_probe():
             )
             if "thomas-smoke" not in controller.presence_by_user:
                 raise RuntimeError("Collaborator presence did not recover")
+
+            # Slicer's default Segment_1-style IDs are only unique inside one
+            # scene. A live room must replace them before publication so two
+            # users can create labels concurrently without crossing colors or
+            # voxel data.
+            ids_before_local_add = set(segmentation.GetSegmentation().GetSegmentIDs())
+            local_label = slicer.vtkSegment()
+            local_label.SetName("Locally created label")
+            local_label.SetColor(0.92, 0.68, 0.12)
+            segmentation.GetSegmentation().AddSegment(local_label, "Segment_1")
+            pump_events(0.1)
+            local_added_ids = (
+                set(segmentation.GetSegmentation().GetSegmentIDs())
+                - ids_before_local_add
+            )
+            if len(local_added_ids) != 1:
+                raise RuntimeError(
+                    f"Local label creation produced unexpected IDs: {local_added_ids}"
+                )
+            local_global_id = next(iter(local_added_ids))
+            if not local_global_id.startswith("LiveSeg-") or local_global_id == "Segment_1":
+                raise RuntimeError(
+                    f"Local label kept a scene-local ID: {local_global_id}"
+                )
+
+            remote_label_id = new_collaboration_segment_id()
+            remote_mask = np.zeros(image.shape, dtype=np.uint8)
+            remote_mask[2, 2, 2] = 1
+            remote_create = {
+                "client_operation_id": f"advanced-remote-create-{uuid.uuid4()}",
+                "segment_id": remote_label_id,
+                "segment_name": "Remote original name",
+                "color_hex": "#8A3FFC",
+                "base_sequence": controller.last_sequence,
+                "metadata_update": True,
+                **encode_mask_delta(
+                    np.zeros_like(remote_mask), remote_mask, replace=True
+                ),
+            }
+            peer.push_operation(controller.room_id, remote_create)
+            controller.refresh_now()
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                pump_events(0.12)
+                remote_segment = segmentation.GetSegmentation().GetSegment(remote_label_id)
+                if remote_segment is not None:
+                    break
+            if remote_segment is None:
+                raise RuntimeError("Concurrent remote label did not arrive")
+            if controller._segment_color_hex(remote_segment) != "#8A3FFC":
+                raise RuntimeError("Concurrent remote label arrived with the wrong color")
+            if segmentation.GetSegmentation().GetSegment(local_global_id) is None:
+                raise RuntimeError("Concurrent remote label replaced the local label")
+
+            remote_metadata = {
+                "client_operation_id": f"advanced-remote-metadata-{uuid.uuid4()}",
+                "segment_id": remote_label_id,
+                "segment_name": "Remotely renamed label",
+                "color_hex": "#2457C5",
+                "base_sequence": controller.last_sequence,
+                "metadata_update": True,
+                **encode_metadata_update(image.shape),
+            }
+            peer.push_operation(controller.room_id, remote_metadata)
+            controller.refresh_now()
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                pump_events(0.12)
+                remote_segment = segmentation.GetSegmentation().GetSegment(remote_label_id)
+                if (
+                    remote_segment is not None
+                    and remote_segment.GetName() == "Remotely renamed label"
+                    and controller._segment_color_hex(remote_segment) == "#2457C5"
+                ):
+                    break
+            if remote_segment.GetName() != "Remotely renamed label":
+                raise RuntimeError("Remote label rename was not applied in Segment Editor")
+            if controller._segment_color_hex(remote_segment) != "#2457C5":
+                raise RuntimeError("Remote label color was not applied in Segment Editor")
+
+            # A delayed paint packet is allowed to add voxels, but its embedded
+            # context must never revert the newer explicit name/color update.
+            remote_after_stale_patch = remote_mask.copy()
+            remote_after_stale_patch[3, 3, 3] = 1
+            stale_voxel_operation = {
+                "client_operation_id": f"advanced-stale-metadata-{uuid.uuid4()}",
+                "segment_id": remote_label_id,
+                "segment_name": "Remote original name",
+                "color_hex": "#E31A1C",
+                "base_sequence": controller.last_sequence,
+                **encode_mask_delta(remote_mask, remote_after_stale_patch),
+            }
+            peer.push_operation(controller.room_id, stale_voxel_operation)
+            controller.refresh_now()
+            deadline = time.time() + 8
+            remote_voxel_count = 0
+            while time.time() < deadline:
+                pump_events(0.12)
+                remote_voxel_count = int(
+                    widget.segment_mask_in_reference_geometry(
+                        segmentation, remote_label_id, volume, image.shape
+                    ).sum()
+                )
+                if remote_voxel_count == 2:
+                    break
+            remote_segment = segmentation.GetSegmentation().GetSegment(remote_label_id)
+            if remote_voxel_count != 2:
+                raise RuntimeError("Delayed remote paint patch did not add its voxel")
+            if (
+                remote_segment.GetName() != "Remotely renamed label"
+                or controller._segment_color_hex(remote_segment) != "#2457C5"
+            ):
+                raise RuntimeError(
+                    "A delayed voxel patch reverted newer label name/color metadata"
+                )
 
             controller.chat_input.setText("Anchored spatial message")
             controller.send_chat_message()
@@ -808,6 +937,9 @@ def run_probe():
             advanced_features = {
                 "rich_presence": True,
                 "presence_delay_grace_and_recovery": True,
+                "global_label_identity": True,
+                "label_metadata_sync": True,
+                "stale_voxel_metadata_guard": True,
                 "spatial_chat": True,
                 "material_template": True,
                 "review_and_access_request": True,

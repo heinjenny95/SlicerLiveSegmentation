@@ -281,6 +281,7 @@ def operation_summary(operation, decode_mask_delta=None):
         "snapshot_label": operation.get("snapshot_label"),
         "system_snapshot": bool(operation.get("system_snapshot", False)),
         "segment_deleted": bool(operation.get("segment_deleted", False)),
+        "metadata_update": bool(operation.get("metadata_update", False)),
         "client_operation_id": operation.get("client_operation_id"),
         "undo_of_sequence": operation.get("undo_of_sequence"),
     }
@@ -311,11 +312,12 @@ def reconstruct_snapshot_operations(
         segment_id = str(operation.get("segment_id") or "")
         if not segment_id:
             continue
-        metadata[segment_id] = {
-            "segment_id": segment_id,
-            "segment_name": operation.get("segment_name") or segment_id,
-            "color_hex": operation.get("color_hex") or "#4A90E2",
-        }
+        if segment_id not in metadata or operation.get("metadata_update"):
+            metadata[segment_id] = {
+                "segment_id": segment_id,
+                "segment_name": operation.get("segment_name") or segment_id,
+                "color_hex": operation.get("color_hex") or "#4A90E2",
+            }
         if operation.get("segment_deleted"):
             masks.pop(segment_id, None)
             active_segments.discard(segment_id)

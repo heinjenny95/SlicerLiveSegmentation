@@ -33,9 +33,10 @@ from .schemas import (
     LiveSegmentLockUpdate,
 )
 
-SERVER_VERSION = "0.13.1"
-COLLABORATION_PROTOCOL_VERSION = 2
-MINIMUM_COMPATIBLE_PLUGIN_VERSION = "0.11.2"
+SERVER_VERSION = "0.14.0"
+COLLABORATION_PROTOCOL_VERSION = 3
+MINIMUM_COMPATIBLE_PLUGIN_VERSION = "0.14.0"
+ROOM_SCHEMA_VERSION = 3
 
 
 def iso_now() -> str:
@@ -48,6 +49,7 @@ def public_live_operation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["voxel_bbox"] = json.loads(data["voxel_bbox"])
     data["system_snapshot"] = bool(data.get("system_snapshot", False))
     data["segment_deleted"] = bool(data.get("segment_deleted", False))
+    data["metadata_update"] = bool(data.get("metadata_update", False))
     return data
 
 
@@ -218,11 +220,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             public_participants = [dict(item) for item in participants.values()]
         with database.connect() as connection:
             room = connection.execute(
-                "SELECT name, volume_signature FROM live_rooms WHERE name = ? COLLATE NOCASE",
+                "SELECT name, volume_signature, schema_version FROM live_rooms WHERE name = ? COLLATE NOCASE",
                 (payload.room_name,),
             ).fetchone()
         room_exists = room is not None
-        room_compatible = not room_exists or room["volume_signature"] == payload.volume_signature
+        room_compatible = not room_exists or (
+            room["volume_signature"] == payload.volume_signature
+            and int(room["schema_version"] or 0) == ROOM_SCHEMA_VERSION
+        )
         return {
             "status": "ok",
             "transport": "remote-https-server",
@@ -241,6 +246,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "room_exists": room_exists,
             "room_compatible": room_compatible,
             "room_name": room["name"] if room_exists else payload.room_name,
+            "room_schema_version": (
+                int(room["schema_version"] or 0) if room_exists else ROOM_SCHEMA_VERSION
+            ),
             "client_plugin_version": payload.plugin_version,
             "request_user": user,
             "requested_volume_signature": payload.volume_signature,
@@ -262,14 +270,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 room_id = str(uuid.uuid4())
                 connection.execute(
                     """
-                    INSERT INTO live_rooms(id, name, volume_signature, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO live_rooms(
+                        id, name, volume_signature, schema_version, created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (room_id, payload.room_name, payload.volume_signature, user, iso_now()),
+                    (
+                        room_id,
+                        payload.room_name,
+                        payload.volume_signature,
+                        ROOM_SCHEMA_VERSION,
+                        user,
+                        iso_now(),
+                    ),
                 )
                 room = connection.execute(
                     "SELECT * FROM live_rooms WHERE id = ?", (room_id,)
                 ).fetchone()
+            elif int(room["schema_version"] or 0) != ROOM_SCHEMA_VERSION:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "This room uses an older label-identity format. Create a new "
+                            "room with Live Segmentation 0.14.0 on every computer."
+                        ),
+                        "room_name": room["name"],
+                    },
+                )
             elif room["volume_signature"] != payload.volume_signature:
                 raise HTTPException(
                     status_code=409,
@@ -431,10 +458,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         voxel_bbox, encoding, payload, base_sequence,
                         snapshot_group_id, snapshot_group_index,
                         snapshot_group_count, system_snapshot, snapshot_label,
-                        segment_deleted, undo_of_sequence,
+                        segment_deleted, metadata_update, undo_of_sequence,
                         changed_voxels,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -456,6 +483,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         int(payload.system_snapshot),
                         payload.snapshot_label,
                         int(payload.segment_deleted),
+                        int(payload.metadata_update),
                         payload.undo_of_sequence,
                         changed_voxels,
                         iso_now(),

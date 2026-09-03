@@ -67,18 +67,24 @@
 
 ## Direct LAN, invitation, and fallback
 
-1. On participant A choose **Direct LAN + shared-folder fallback**, select a
-   writable shared folder, enable local hosting, and click **Start LAN host**.
-2. Export a `.livesegroom` invitation and open it by double-click on participant
+1. On participant A choose **Direct LAN + shared-folder fallback** and confirm
+   the URL, session-code, host, and port controls appear directly below the
+   connection selector. Leave the optional fallback folder blank, enable local
+   hosting, and click **Start LAN host**.
+2. Verify the host creates and displays a reachable LAN URL and random session
+   code automatically. The private room store must be local to the host; a
+   shared folder must not be required.
+3. Export a `.livesegroom` invitation and open it by double-click on participant
    B. Verify Slicer opens Live Segmentation and fills room, relay URL, session
    code, and fallback folder without automatically joining.
-3. Load the matching source volume on B and join. Paint in both directions and
+4. Load the matching source volume on B and join. Paint in both directions and
    verify the status says direct LAN and edits remain sub-second on a suitable
    local network.
-4. Stop the LAN host while both clients remain able to access the shared folder.
+5. Repeat with a writable fallback folder selected on both clients. Stop the LAN
+   host while both clients remain able to access that shared folder.
    Verify subsequent requests use the fallback and the activity/metrics counters
    record it without freezing Slicer.
-5. Repeat with an incorrect session code and verify the join is rejected. Never
+6. Repeat with an incorrect session code and verify the join is rejected. Never
    expose the unencrypted relay outside a trusted LAN or approved VPN.
 
 ## Narrow module panel
@@ -141,6 +147,28 @@
    save or pull.
 5. In B add a non-overlapping area to the same segment and verify both areas in A.
 6. Erase part of the segment in B and verify the removal in A.
+
+## Concurrent label identity and properties (0.14 protocol)
+
+1. Install version 0.14.0 on both computers and create a new room. Confirm an
+   older room or an older client is rejected with an explicit compatibility
+   message instead of joining.
+2. Add one new label on each computer at nearly the same moment, using Slicer's
+   default names and without coordinating which user clicks first. Paint both
+   labels simultaneously on the same slice.
+3. Confirm both labels remain distinct on both computers: each has the correct
+   name, color, voxels, owner, selection, and lock state. No component may
+   disappear, reappear under another color, or move to the other label.
+4. Rename one label and change its color on A. Confirm B's standard Segment
+   Editor table and rendered segmentation update without leaving/rejoining.
+5. Continue painting rapidly on both computers immediately around another
+   rename/color change. Confirm a delayed brush operation may add its voxels but
+   cannot restore an older name or color.
+6. Confirm the always-visible activity dock contains both collaborators' events
+   and the current user's acknowledged events, with the latter prefixed by
+   **You**.
+7. Switch to **Remote HTTPS server** before joining and confirm the server URL
+   and access-token controls are visible directly below the connection selector.
 
 ## Rapid same-label strokes
 

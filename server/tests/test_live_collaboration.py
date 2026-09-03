@@ -38,6 +38,8 @@ from collaboration import (  # noqa: E402
     encode_mask_crop_delta_after_operations,
     encode_mask_crop_snapshot,
     encode_mask_delta,
+    encode_metadata_update,
+    new_collaboration_segment_id,
     update_recent_shared_folders,
     validate_remote_server_url,
     volume_signature,
@@ -238,6 +240,23 @@ def test_mask_deltas_preserve_independent_edits_and_order_overlaps():
     assert final[4, 5, 6] == 1
 
 
+def test_new_live_labels_receive_globally_unique_internal_ids():
+    first = new_collaboration_segment_id()
+    second = new_collaboration_segment_id()
+    assert first.startswith("LiveSeg-")
+    assert second.startswith("LiveSeg-")
+    assert first != second
+
+
+def test_metadata_update_payload_changes_no_voxels():
+    encoded = encode_metadata_update((40, 50, 60))
+    changed, values = collaboration_module.decode_mask_delta(encoded)
+    assert encoded["operation_kind"] == "patch"
+    assert encoded["voxel_bbox"] == [0, 1, 0, 1, 0, 1]
+    assert not np.any(changed)
+    assert not np.any(values)
+
+
 def test_snapshot_replaces_preexisting_local_voxels():
     remote = np.zeros((4, 4, 4), dtype=np.uint8)
     remote[1:3, 1:3, 1:3] = 1
@@ -293,6 +312,48 @@ def test_historical_reconstruction_removes_and_can_recreate_a_deleted_label():
     assert [item["segment_id"] for item in after_recreate] == ["Organ"]
     restored = apply_mask_delta(empty, after_recreate[0])
     assert np.array_equal(restored, mask)
+
+
+def test_explicit_metadata_update_is_not_reverted_by_later_voxel_patch():
+    shape = (4, 4, 4)
+    empty = np.zeros(shape, dtype=np.uint8)
+    first_mask = empty.copy()
+    first_mask[1, 1, 1] = 1
+    second_mask = first_mask.copy()
+    second_mask[2, 2, 2] = 1
+    created = {
+        **operation_payload("global-id", empty, first_mask, replace=True),
+        "sequence": 1,
+        "segment_name": "Original",
+        "color_hex": "#FF0000",
+        "metadata_update": True,
+    }
+    renamed = {
+        "client_operation_id": "metadata-update-1",
+        "segment_id": "global-id",
+        "segment_name": "Renamed",
+        "color_hex": "#00FF00",
+        "metadata_update": True,
+        "sequence": 2,
+        **encode_metadata_update(shape),
+    }
+    stale_paint = {
+        **operation_payload(
+            "global-id", first_mask, second_mask, operation_id="stale-paint-1"
+        ),
+        "sequence": 3,
+        "segment_name": "Original",
+        "color_hex": "#FF0000",
+    }
+
+    reconstructed = reconstruct_snapshot_operations(
+        [created, renamed, stale_paint], 3, apply_mask_delta, encode_mask_delta
+    )
+
+    assert len(reconstructed) == 1
+    assert reconstructed[0]["segment_name"] == "Renamed"
+    assert reconstructed[0]["color_hex"] == "#00FF00"
+    assert np.array_equal(apply_mask_delta(empty, reconstructed[0]), second_mask)
 
 
 def test_cropped_delta_only_compares_effective_segment_region():
@@ -512,6 +573,7 @@ def test_live_room_join_ordered_idempotent_operations_and_presence(client, heade
     room = joined.json()
     assert room["created"] is True
     assert room["latest_sequence"] == 0
+    assert room["schema_version"] == 3
 
     bob_headers = {"X-LiveSeg-User": "bob"}
     rejoined = client.post(
@@ -592,12 +654,83 @@ def test_live_room_join_ordered_idempotent_operations_and_presence(client, heade
     assert presence["bob"]["active_segment_name"] == "Tumor"
 
 
+def test_remote_server_rejects_legacy_room_identity_format(client, headers):
+    with client.app.state.database.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO live_rooms(
+                id, name, volume_signature, schema_version, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-room-id",
+                "legacy identity room",
+                "a" * 64,
+                2,
+                "alice",
+                "2026-09-03T00:00:00+00:00",
+            ),
+        )
+
+    preflight = client.post(
+        "/api/live/preflight",
+        headers=headers,
+        json={
+            "room_name": "legacy identity room",
+            "volume_signature": "a" * 64,
+            "plugin_version": "0.14.0",
+            "protocol_version": 3,
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.json()["room_compatible"] is False
+    assert preflight.json()["room_schema_version"] == 2
+
+    joined = client.post(
+        "/api/live/rooms/join",
+        headers=headers,
+        json={"room_name": "legacy identity room", "volume_signature": "a" * 64},
+    )
+    assert joined.status_code == 409
+    assert "older label-identity format" in joined.text
+
+
+def test_remote_server_preserves_explicit_metadata_updates(client, headers):
+    joined = client.post(
+        "/api/live/rooms/join",
+        headers=headers,
+        json={"room_name": "metadata room", "volume_signature": "c" * 64},
+    )
+    room_id = joined.json()["id"]
+    operation = {
+        "client_operation_id": "metadata-update-server-1",
+        "segment_id": "LiveSeg-global",
+        "segment_name": "Renamed organ",
+        "color_hex": "#12AB34",
+        "metadata_update": True,
+        **encode_metadata_update((3, 3, 3)),
+    }
+    created = client.post(
+        f"/api/live/rooms/{room_id}/operations", headers=headers, json=operation
+    )
+    assert created.status_code == 201, created.text
+
+    operations = client.get(
+        f"/api/live/rooms/{room_id}/operations?after=0", headers=headers
+    ).json()
+    assert len(operations) == 1
+    assert operations[0]["metadata_update"] is True
+    assert operations[0]["segment_name"] == "Renamed organ"
+    assert operations[0]["color_hex"] == "#12AB34"
+    assert operations[0]["changed_voxels"] == 0
+
+
 def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(client):
     payload = {
         "room_name": "internet collaboration",
         "volume_signature": "a" * 64,
-        "plugin_version": "0.13.1",
-        "protocol_version": 2,
+        "plugin_version": "0.14.0",
+        "protocol_version": 3,
     }
     alice = client.post(
         "/api/live/preflight", json=payload, headers={"X-LiveSeg-User": "alice"}
@@ -632,9 +765,9 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.13.1"
-    assert health.json()["protocol_version"] == 2
-    assert health.json()["minimum_plugin_version"] == "0.11.2"
+    assert health.json()["version"] == "0.14.0"
+    assert health.json()["protocol_version"] == 3
+    assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
     assert isinstance(health.json()["server_time_epoch"], float)
 
@@ -644,9 +777,9 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.13.1",
-            "protocol_version": 2,
-            "minimum_plugin_version": "0.11.2",
+            "server_version": "0.14.0",
+            "protocol_version": 3,
+            "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
             "authentication": "user-tokens",
             "room_exists": True,
@@ -654,8 +787,8 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.13.1",
-                    "protocol_version": 2,
+                    "plugin_version": "0.14.0",
+                    "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
             ],
@@ -778,7 +911,7 @@ def test_shared_folder_room_rejects_a_different_source_volume(tmp_path):
         bob.join("SPECIMEN MISMATCH", "e" * 64)
 
 
-def test_shared_folder_upgrades_old_room_before_deletion_capability_is_used(tmp_path):
+def test_shared_folder_rejects_old_room_without_global_label_identity(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "alice")
     alice.join("legacy room", "f" * 64)
     metadata_path = alice._room_path / "room.json"
@@ -789,11 +922,8 @@ def test_shared_folder_upgrades_old_room_before_deletion_capability_is_used(tmp_
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     bob = SharedFolderRoomClient(tmp_path, "bob")
-    bob.join("legacy room", "f" * 64)
-    upgraded = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert upgraded["schema_version"] == 2
-    assert upgraded["minimum_plugin_version"] == "0.11.2"
-    assert "segment-deletion-tombstone-v1" in upgraded["capabilities"]
+    with pytest.raises(LiveCollaborationError, match="older label-identity format"):
+        bob.join("legacy room", "f" * 64)
 
 
 def test_shared_folder_newer_room_explains_that_every_client_must_update(tmp_path):
@@ -801,16 +931,26 @@ def test_shared_folder_newer_room_explains_that_every_client_must_update(tmp_pat
     alice.join("future room", "a" * 64)
     metadata_path = alice._room_path / "room.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["schema_version"] = 3
-    metadata["minimum_plugin_version"] = "0.12.0"
+    metadata["schema_version"] = 4
+    metadata["minimum_plugin_version"] = "0.15.0"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     bob = SharedFolderRoomClient(tmp_path, "bob")
     with pytest.raises(
         LiveCollaborationError,
-        match=r"requires plugin version 0\.12\.0 or newer.*every computer",
+        match=r"requires plugin version 0\.15\.0 or newer.*every computer",
     ):
         bob.join("future room", "a" * 64)
+
+
+def test_shared_folder_new_room_requires_collision_safe_clients(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    alice.join("identity room", "b" * 64)
+    metadata = json.loads((alice._room_path / "room.json").read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == 3
+    assert metadata["minimum_plugin_version"] == "0.14.0"
+    assert "global-segment-identity-v1" in metadata["capabilities"]
+    assert "explicit-segment-metadata-v1" in metadata["capabilities"]
 
 
 def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
@@ -1621,8 +1761,8 @@ def test_public_preflight_requires_forwarded_https_and_individual_token(tmp_path
     payload = {
         "room_name": "public room",
         "volume_signature": "a" * 64,
-        "plugin_version": "0.13.1",
-        "protocol_version": 2,
+        "plugin_version": "0.14.0",
+        "protocol_version": 3,
     }
     with TestClient(create_app(settings)) as public_client:
         rejected = public_client.post(

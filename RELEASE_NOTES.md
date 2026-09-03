@@ -1,4 +1,63 @@
-# Live Segmentation 0.13.1
+# Live Segmentation 0.14.0
+
+Version 0.14.0 fixes label identity and display-metadata corruption found during
+simultaneous two-computer editing, and makes the Direct LAN and Remote HTTPS
+connection flows directly usable from the main module panel.
+
+## Collision-safe collaborative labels
+
+- Every label created after joining a room receives a UUID-backed, room-global
+  segment ID before its first operation is published. Two Slicer scenes can no
+  longer publish unrelated `Segment_1` labels under the same identity.
+- Concurrent edits on different labels remain isolated even if both labels were
+  created at the same time on different computers. Voxel data, display color,
+  name, ownership, and locks all use the same stable global ID.
+- Material templates retain their intentionally defined IDs, while ordinary
+  labels made through Segment Editor or another extension are globalized
+  automatically.
+- Shared-folder schema 3 and collaboration protocol 3 reject older rooms with a
+  clear upgrade message. This deliberate compatibility boundary prevents an old
+  client from silently reintroducing ambiguous segment IDs.
+
+## Ordered name and color synchronization
+
+- Label rename and color changes are now explicit zero-voxel operations. They
+  are ordered, persisted, reconstructed on rejoin, and applied to existing
+  labels in Slicer's standard Segment Editor.
+- Ordinary voxel operations carry label properties only as descriptive context.
+  A delayed paint packet therefore cannot revert a newer rename or color change.
+- A pending local property change remains visible if a remote operation arrives
+  before the local update is published; normal room ordering determines the
+  final shared result after both operations reach the journal.
+
+## Activity and connection UI
+
+- The activity dock includes acknowledged changes made by the current user as
+  `You …`, in addition to collaborator activity.
+- Selecting **Direct LAN** immediately reveals the LAN relay URL, session code,
+  host control, and port next to the connection selector. Selecting **Remote
+  HTTPS server** reveals its server URL and token in the same location.
+- A LAN host creates its private local room store, advertised IP URL, and random
+  session code automatically. A shared folder is optional and serves only as a
+  mirror/fallback; a guest enters the host's URL and session code or imports the
+  generated invitation.
+
+## Verification
+
+- 72 automated tests pass, including shared-folder and server persistence of
+  zero-voxel metadata changes, global-ID generation, historical reconstruction,
+  and rejection of unsafe legacy room formats.
+- The Slicer 5.12.3 integration probe creates local and remote labels
+  concurrently, applies a remote rename and color change, then deliberately
+  delivers a later paint packet containing stale properties. Its new voxel is
+  applied while the newer name, color, and label identity remain unchanged.
+- The same full integration run verifies own activity, chat, locks, presence,
+  material templates, review state, room snapshots, conflict detection, and
+  diagnostics.
+
+---
+
+# Previous release: Live Segmentation 0.13.1
 
 Version 0.13.1 repairs participant presence and live-feed latency failures
 reproduced on a real two-computer NAS session.

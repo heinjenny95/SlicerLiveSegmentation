@@ -81,7 +81,7 @@ except ImportError:  # regular-Python transport tests import this file directly
     )
 
 LIVE_ENCODING = "zlib-packbits-v1"
-SHARED_FOLDER_SCHEMA_VERSION = 2
+SHARED_FOLDER_SCHEMA_VERSION = 3
 SHARED_FOLDER_MINIMUM_PLUGIN_VERSION = MINIMUM_COMPATIBLE_PLUGIN_VERSION
 MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
@@ -100,6 +100,18 @@ PREFLIGHT_PARTICIPANT_TTL_SECONDS = 120.0
 PREFLIGHT_TIMEOUT_SECONDS = 20.0
 PRESENCE_DELAY_WARNING_SECONDS = 3.0
 PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
+
+
+def new_collaboration_segment_id():
+    """Return a globally unique, opaque Slicer segment identifier.
+
+    Slicer's default ``Segment_1`` identifiers are only unique within one
+    local scene. Two collaborators can therefore create different labels with
+    the same internal ID at the same time. Live rooms use UUID-backed IDs for
+    every segment created after joining so voxel operations can never cross
+    label boundaries because of a local-ID collision.
+    """
+    return f"LiveSeg-{uuid.uuid4().hex}"
 
 
 def _version_tuple(value):
@@ -810,6 +822,22 @@ def encode_mask_delta(previous, current, replace=False):
         "operation_kind": "snapshot" if replace else "patch",
         "volume_shape": [int(value) for value in current.shape],
         "voxel_bbox": bounds,
+        "encoding": LIVE_ENCODING,
+        "payload": base64.b64encode(zlib.compress(raw, level=6)).decode("ascii"),
+    }
+
+
+def encode_metadata_update(volume_shape):
+    """Encode an ordered metadata change that touches zero voxels."""
+    volume_shape = [int(value) for value in volume_shape]
+    if len(volume_shape) != 3 or any(value <= 0 for value in volume_shape):
+        raise ValueError("A metadata update requires a valid volume shape")
+    raw = np.packbits(np.asarray([False]), bitorder="little").tobytes()
+    raw += np.packbits(np.asarray([False]), bitorder="little").tobytes()
+    return {
+        "operation_kind": "patch",
+        "volume_shape": volume_shape,
+        "voxel_bbox": [0, 1, 0, 1, 0, 1],
         "encoding": LIVE_ENCODING,
         "payload": base64.b64encode(zlib.compress(raw, level=6)).decode("ascii"),
     }
@@ -1646,7 +1674,7 @@ class SharedFolderRoomClient:
         )
         schema_version = int(metadata.get("schema_version", 0) or 0) if metadata else 0
         room_compatible = not metadata or metadata.get("volume_signature") == str(signature)
-        schema_compatible = not metadata or schema_version in {1, SHARED_FOLDER_SCHEMA_VERSION}
+        schema_compatible = not metadata or schema_version == SHARED_FOLDER_SCHEMA_VERSION
         minimum = str(
             metadata.get("minimum_plugin_version") or SHARED_FOLDER_MINIMUM_PLUGIN_VERSION
         ) if metadata else SHARED_FOLDER_MINIMUM_PLUGIN_VERSION
@@ -1688,8 +1716,11 @@ class SharedFolderRoomClient:
                     else ""
                 ),
                 "This room was damaged by a stale-cache collision in an older release. "
-                "Create a new room with version 0.13.1 or newer."
+                "Create a new room with version 0.14.0 or newer."
                 if duplicate_sequences
+                else "Create a new room with Live Segmentation 0.14.0 on every computer. "
+                "Older rooms do not provide collision-safe global label identities."
+                if room_exists and schema_version < SHARED_FOLDER_SCHEMA_VERSION
                 else "Install the same current Live Segmentation release on every computer."
                 if not schema_compatible or not plugin_compatible
                 else "",
@@ -1780,7 +1811,11 @@ class SharedFolderRoomClient:
                 metadata = {
                     "schema_version": SHARED_FOLDER_SCHEMA_VERSION,
                     "minimum_plugin_version": SHARED_FOLDER_MINIMUM_PLUGIN_VERSION,
-                    "capabilities": ["segment-deletion-tombstone-v1"],
+                    "capabilities": [
+                        "segment-deletion-tombstone-v1",
+                        "global-segment-identity-v1",
+                        "explicit-segment-metadata-v1",
+                    ],
                     "name": str(room_name).strip(),
                     "room_id": room_key,
                     "volume_signature": str(signature),
@@ -1791,19 +1826,16 @@ class SharedFolderRoomClient:
                 created = True
 
         schema_version = int(metadata.get("schema_version", 0))
-        if schema_version == 1:
-            metadata = {
-                **metadata,
-                "schema_version": SHARED_FOLDER_SCHEMA_VERSION,
-                "minimum_plugin_version": SHARED_FOLDER_MINIMUM_PLUGIN_VERSION,
-                "capabilities": ["segment-deletion-tombstone-v1"],
-            }
-            _write_json_atomic(metadata_path, metadata)
-            schema_version = SHARED_FOLDER_SCHEMA_VERSION
         if schema_version != SHARED_FOLDER_SCHEMA_VERSION:
             minimum_version = str(
                 metadata.get("minimum_plugin_version") or "a newer version"
             )
+            if schema_version < SHARED_FOLDER_SCHEMA_VERSION:
+                raise LiveCollaborationError(
+                    "This room uses an older label-identity format that cannot safely "
+                    "distinguish labels created simultaneously on different computers. "
+                    "Create a new room with Live Segmentation 0.14.0 on every computer."
+                )
             raise LiveCollaborationError(
                 "This room uses a newer Live Segmentation format and requires "
                 f"plugin version {minimum_version} or newer. Update the plugin on "
@@ -1815,7 +1847,7 @@ class SharedFolderRoomClient:
                 "This room contains duplicate operation sequence(s) "
                 + ", ".join(str(item) for item in duplicate_sequences)
                 + " from an older stale-cache collision. Its ordering is ambiguous. "
-                "Create a new room with Live Segmentation 0.13.1 or newer."
+                "Create a new room with Live Segmentation 0.14.0 or newer."
             )
         self._room_id = room_key
         self._room_path = room_path
@@ -3940,12 +3972,14 @@ class LiveCollaborationController:
         self.baseline_bounds = {}
         self.dirty_segments = set()
         self.force_snapshots = set()
+        self.metadata_updates = set()
         self.outgoing = []
         self.outgoing_keys = set()
         self.awaiting_echo = []
         self._applied_local_operation_ids = set()
         self._known_segment_ids = set()
         self._segment_metadata = {}
+        self._preserve_added_segment_ids = False
         self.pending_segment_deletions = {}
         self._observed_node = None
         self._observed_segmentation = None
@@ -4062,7 +4096,7 @@ class LiveCollaborationController:
         default_room = ""
         default_transport = "shared-folder"
         default_shared_folder = ""
-        default_server = "http://127.0.0.1:8000"
+        default_server = ""
         recent_shared_folders = decode_recent_shared_folders(
             settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]")
         )
@@ -4572,10 +4606,11 @@ class LiveCollaborationController:
         layout.addWidget(recovery_group)
 
         self.server_settings = ctk.ctkCollapsibleButton()
-        self.server_settings.text = "Remote HTTPS server"
-        self.server_settings.collapsed = True
+        self.server_settings.text = "HTTPS server address"
+        self.server_settings.collapsed = False
         advanced_layout = qt.QFormLayout(self.server_settings)
         self.server_edit = qt.QLineEdit(default_server)
+        self.server_edit.setPlaceholderText("https://collaboration.example.org")
         self.api_key_edit = qt.QLineEdit()
         self.api_key_edit.echoMode = qt.QLineEdit.Password
         self.allow_insecure_http_checkbox = qt.QCheckBox(
@@ -4594,7 +4629,7 @@ class LiveCollaborationController:
         layout.addWidget(self.server_settings)
 
         self.lan_settings = ctk.ctkCollapsibleButton()
-        self.lan_settings.text = "Direct LAN session"
+        self.lan_settings.text = "Direct LAN address and host"
         self.lan_settings.collapsed = False
         lan_form = qt.QFormLayout(self.lan_settings)
         self.lan_url_edit = qt.QLineEdit()
@@ -4603,6 +4638,10 @@ class LiveCollaborationController:
         self.lan_access_code_edit.setPlaceholderText("Imported or generated session code")
         self.lan_access_code_edit.echoMode = qt.QLineEdit.PasswordEchoOnEdit
         self.lan_host_checkbox = qt.QCheckBox("Host the LAN relay on this computer")
+        self.lan_host_checkbox.setToolTip(
+            "Enable this on exactly one computer. Check connection or Join live room "
+            "will start the host automatically. Other users enter the displayed URL and code."
+        )
         self.lan_port_spin = qt.QSpinBox()
         self.lan_port_spin.minimum = 0
         self.lan_port_spin.maximum = 65535
@@ -4611,9 +4650,10 @@ class LiveCollaborationController:
         self.lan_host_button = qt.QPushButton("Start LAN host")
         self.lan_host_button.clicked.connect(self.toggle_lan_host)
         self.lan_status_label = qt.QLabel(
-            "Direct LAN keeps its hot state locally; the selected shared folder is an optional "
-            "background mirror and fallback. "
-            "Use this unencrypted relay only on a trusted institutional LAN or VPN."
+            "Host: enable the checkbox, then click Start LAN host (or Join). "
+            "Guest: enter the host's LAN relay URL and session code. No shared folder is required; "
+            "a selected folder is used only as an optional mirror/fallback. Use this unencrypted "
+            "relay only on a trusted LAN or VPN."
         )
         self.lan_status_label.setWordWrap(True)
         lan_form.addRow("LAN relay URL", self.lan_url_edit)
@@ -4623,6 +4663,15 @@ class LiveCollaborationController:
         lan_form.addRow(self.lan_host_button)
         lan_form.addRow(self.lan_status_label)
         layout.addWidget(self.lan_settings)
+
+        # Connection addresses belong next to the connection selector, not at
+        # the bottom of a long module panel. Reinsert both mode-specific panels
+        # immediately below the identity form so their URL fields are visible
+        # before the Join and Check connection buttons.
+        layout.removeWidget(self.server_settings)
+        layout.removeWidget(self.lan_settings)
+        layout.insertWidget(2, self.server_settings)
+        layout.insertWidget(2, self.lan_settings)
 
         self.transport_combo.currentIndexChanged.connect(self._update_transport_fields)
         self._update_transport_fields()
@@ -4681,6 +4730,10 @@ class LiveCollaborationController:
         self.shared_folder_widget.setVisible(shared)
         self.server_settings.setVisible(mode == "server")
         self.lan_settings.setVisible(direct)
+        if mode == "server":
+            self.server_settings.collapsed = False
+        if direct:
+            self.lan_settings.collapsed = False
         self.backup_group.setVisible(shared)
         if hasattr(self, "backup_enabled_checkbox"):
             self._on_backup_settings_changed()
@@ -5086,7 +5139,7 @@ class LiveCollaborationController:
         )
         self.activity_dock_text = qt.QPlainTextEdit()
         self.activity_dock_text.setReadOnly(True)
-        self.activity_dock_text.setPlaceholderText("Remote label changes appear here")
+        self.activity_dock_text.setPlaceholderText("Your and collaborators' label changes appear here")
         self.activity_dock.setWidget(self.activity_dock_text)
         main_window.addDockWidget(qt.Qt.RightDockWidgetArea, self.activity_dock)
         self.activity_dock.hide()
@@ -5745,9 +5798,13 @@ class LiveCollaborationController:
             self._show_error("This room does not have a material template yet", popup=True)
             return
         try:
+            self._preserve_added_segment_ids = True
             self.owner.apply_material_template(template)
+            self._on_segmentation_modified()
         except Exception as exc:
             self._show_error(f"Could not apply material template: {exc}", popup=True)
+        finally:
+            self._preserve_added_segment_ids = False
 
     def _current_volume_signature(self):
         import slicer
@@ -6180,6 +6237,7 @@ class LiveCollaborationController:
             self.baseline_bounds.clear()
             self.dirty_segments.clear()
             self.force_snapshots.clear()
+            self.metadata_updates.clear()
             self.outgoing.clear()
             self.outgoing_keys.clear()
             self.awaiting_echo.clear()
@@ -6423,11 +6481,13 @@ class LiveCollaborationController:
         self.baseline_bounds.clear()
         self.dirty_segments.clear()
         self.force_snapshots.clear()
+        self.metadata_updates.clear()
         self.outgoing.clear()
         self.outgoing_keys.clear()
         self.awaiting_echo.clear()
         self._applied_local_operation_ids.clear()
         self._segment_metadata.clear()
+        self._preserve_added_segment_ids = False
         self.pending_segment_deletions.clear()
         self._segment_revisions.clear()
         self._segment_verifications.clear()
@@ -6673,6 +6733,20 @@ class LiveCollaborationController:
         key = (node.GetID(), str(segment_id))
         self._segment_revisions[key] = self._segment_revision(node, segment_id)
 
+    def _current_segment_metadata(self, node, segment_id):
+        """Read current display metadata without mutating the local baseline."""
+        segment_id = str(segment_id or "")
+        if node is None or not segment_id:
+            return None
+        segment = node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return None
+        return {
+            "segment_id": segment_id,
+            "segment_name": segment.GetName() or segment_id,
+            "color_hex": self._segment_color_hex(segment),
+        }
+
     def _remember_segment_metadata(self, node, segment_id):
         """Cache display metadata while a segment still exists.
 
@@ -6682,16 +6756,44 @@ class LiveCollaborationController:
         segment_id = str(segment_id or "")
         if node is None or not segment_id:
             return self._segment_metadata.get(segment_id)
-        segment = node.GetSegmentation().GetSegment(segment_id)
-        if segment is None:
+        metadata = self._current_segment_metadata(node, segment_id)
+        if metadata is None:
             return self._segment_metadata.get(segment_id)
-        metadata = {
-            "segment_id": segment_id,
-            "segment_name": segment.GetName() or segment_id,
-            "color_hex": self._segment_color_hex(segment),
-        }
         self._segment_metadata[segment_id] = metadata
         return metadata
+
+    def _adopt_unique_segment_id(self, node, segment_id):
+        """Replace a newly created local scene ID with a room-global ID."""
+        segment_id = str(segment_id or "")
+        if node is None or not segment_id or segment_id.startswith("LiveSeg-"):
+            return segment_id
+        segmentation = node.GetSegmentation()
+        segment = segmentation.GetSegment(segment_id)
+        if segment is None:
+            return segment_id
+        replacement_id = new_collaboration_segment_id()
+        self._applying_remote = True
+        try:
+            segmentation.RemoveSegment(segment_id)
+            try:
+                added = segmentation.AddSegment(segment, replacement_id)
+            except Exception:
+                segmentation.AddSegment(segment, segment_id)
+                raise
+            if added is False:
+                segmentation.AddSegment(segment, segment_id)
+                return segment_id
+            try:
+                segment.SetTag("LiveSegmentation.GlobalID", replacement_id)
+            except Exception:
+                pass
+        finally:
+            self._applying_remote = False
+        try:
+            self.owner.select_segment_in_editor(replacement_id)
+        except Exception:
+            pass
+        return replacement_id
 
     def _schedule_segment_verification(self, key, duration=2.0):
         """Recheck a recently edited label after early Segment Editor events."""
@@ -6734,6 +6836,17 @@ class LiveCollaborationController:
         if node is None or node.GetID() != self.segmentation_node_id or not segment_id:
             return
         key = (node.GetID(), str(segment_id))
+        current_metadata = self._current_segment_metadata(node, segment_id)
+        previous_metadata = self._segment_metadata.get(str(segment_id))
+        if (
+            current_metadata is not None
+            and previous_metadata is not None
+            and current_metadata != previous_metadata
+        ):
+            self._segment_metadata[str(segment_id)] = current_metadata
+            self.metadata_updates.add(key)
+            self.dirty_segments.add(key)
+            self._force_sync_refresh = True
         revision = self._segment_revision(node, segment_id)
         if revision is None:
             return
@@ -6804,13 +6917,34 @@ class LiveCollaborationController:
         current_ids = set(node.GetSegmentation().GetSegmentIDs())
         previous_ids = set(self._known_segment_ids)
         added_ids = current_ids - previous_ids
+        if added_ids and not self._preserve_added_segment_ids:
+            for added_segment_id in sorted(added_ids):
+                self._adopt_unique_segment_id(node, added_segment_id)
+            current_ids = set(node.GetSegmentation().GetSegmentIDs())
+            added_ids = current_ids - previous_ids
         removed_ids = previous_ids - current_ids
         ids_changed = bool(added_ids or removed_ids)
+        metadata_changed_ids = set()
         for current_segment_id in current_ids:
-            self._remember_segment_metadata(node, current_segment_id)
+            previous_metadata = self._segment_metadata.get(current_segment_id)
+            current_metadata = self._current_segment_metadata(node, current_segment_id)
+            if (
+                current_metadata is not None
+                and previous_metadata is not None
+                and current_metadata != previous_metadata
+            ):
+                metadata_changed_ids.add(current_segment_id)
+            if current_metadata is not None:
+                self._segment_metadata[current_segment_id] = current_metadata
         for added_segment_id in added_ids:
-            self.force_snapshots.add((node.GetID(), added_segment_id))
+            added_key = (node.GetID(), added_segment_id)
+            self.force_snapshots.add(added_key)
+            self.metadata_updates.add(added_key)
             self.segment_owners.setdefault(added_segment_id, self.user_name)
+        for changed_segment_id in metadata_changed_ids:
+            changed_key = (node.GetID(), changed_segment_id)
+            self.metadata_updates.add(changed_key)
+            self.dirty_segments.add(changed_key)
         for removed_segment_id in removed_ids:
             key = (node.GetID(), removed_segment_id)
             metadata = dict(
@@ -6825,6 +6959,7 @@ class LiveCollaborationController:
                 self.pending_segment_deletions[removed_segment_id] = metadata
             self.dirty_segments.discard(key)
             self.force_snapshots.discard(key)
+            self.metadata_updates.discard(key)
             self._segment_revisions.pop(key, None)
             self._segment_verifications.pop(key, None)
         self._known_segment_ids = current_ids
@@ -6850,7 +6985,7 @@ class LiveCollaborationController:
             key = (node.GetID(), candidate)
             self.dirty_segments.add(key)
             self._schedule_segment_verification(key)
-        if ids_changed or bool(segment_id):
+        if ids_changed or metadata_changed_ids or bool(segment_id):
             self._refresh_label_combo()
             self._update_lock_controls()
         self._force_sync_refresh = True
@@ -6867,6 +7002,7 @@ class LiveCollaborationController:
                 self.baselines[key] = ChunkedMaskBaseline(self.volume_shape)
                 self.baseline_bounds[key] = None
                 self.force_snapshots.add(key)
+                self.metadata_updates.add(key)
                 self.dirty_segments.add(key)
             else:
                 self.baselines[key] = ChunkedMaskBaseline.from_crop(
@@ -7075,12 +7211,14 @@ class LiveCollaborationController:
             self.pending_segment_deletions.pop(segment_id, None)
             self.baselines.pop(key, None)
             self.baseline_bounds.pop(key, None)
+            self.metadata_updates.discard(key)
             self._segment_revisions.pop(key, None)
             self._segment_verifications.pop(key, None)
         for key in list(self.dirty_segments):
             node = slicer.mrmlScene.GetNodeByID(key[0])
             if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
                 self.dirty_segments.discard(key)
+                self.metadata_updates.discard(key)
                 continue
             previous = self.baselines.get(key)
             current_crop, current_bounds = self._read_mask_crop(node, key[1])
@@ -7095,6 +7233,7 @@ class LiveCollaborationController:
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
+                self.metadata_updates.discard(key)
                 continue
             if self._locked_by_other(key[1]):
                 if self._crop_differs_from_baseline(
@@ -7106,6 +7245,7 @@ class LiveCollaborationController:
                     self._restore_locked_segment(node, key[1], previous)
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
+                self.metadata_updates.discard(key)
                 continue
             if previous is None:
                 previous = ChunkedMaskBaseline(self.volume_shape)
@@ -7130,6 +7270,8 @@ class LiveCollaborationController:
                     self.volume_shape,
                     pending_operations,
                 )
+            if encoded is None and key in self.metadata_updates:
+                encoded = encode_metadata_update(self.volume_shape)
             if encoded is None:
                 self.dirty_segments.discard(key)
                 self.force_snapshots.discard(key)
@@ -7143,10 +7285,13 @@ class LiveCollaborationController:
                 "base_sequence": int(self.last_sequence),
                 **encoded,
             }
+            if key in self.metadata_updates:
+                operation["metadata_update"] = True
             self.outgoing.append(operation)
             self.outgoing_keys.add(key)
             self.dirty_segments.discard(key)
             self.force_snapshots.discard(key)
+            self.metadata_updates.discard(key)
         for operation in self.outgoing:
             operation_id = str(operation.get("client_operation_id") or "")
             if operation_id and operation_id not in existing_operation_ids:
@@ -7208,6 +7353,7 @@ class LiveCollaborationController:
                         "segment_id": segment_id,
                         "segment_name": segment.GetName() or segment_id,
                         "color_hex": self._segment_color_hex(segment),
+                        "metadata_update": True,
                         **encoded,
                     }
                 )
@@ -8798,6 +8944,9 @@ class LiveCollaborationController:
             elif segment_id not in known_segments:
                 action = f"{author} created label “{segment_name}”"
                 activity_type = "label created"
+            elif record.get("metadata_update"):
+                action = f"{author} updated label properties for “{segment_name}”"
+                activity_type = "label metadata"
             else:
                 action = f"{author} edited label “{segment_name}”"
                 activity_type = str(record.get("operation_kind") or "patch")
@@ -9121,16 +9270,27 @@ class LiveCollaborationController:
             self.segment_owners.setdefault(segment_id, author)
         segmentation = node.GetSegmentation()
         segment = segmentation.GetSegment(segment_id)
+        created = segment is None
         if segment is None:
             segment = slicer.vtkSegment()
-            segment.SetName(operation.get("segment_name") or segment_id)
             segmentation.AddSegment(segment, segment_id)
-        color = str(operation.get("color_hex") or "#4A90E2").lstrip("#")
-        if len(color) == 6:
-            try:
-                segment.SetColor(*(int(color[index : index + 2], 16) / 255.0 for index in (0, 2, 4)))
-            except Exception:
-                pass
+        # Voxel patches carry metadata only as context. Applying it on every
+        # patch lets a delayed paint operation revert a newer rename or color
+        # change. New segments need initial metadata; existing segments change
+        # it only for an explicit metadata update.
+        if created or bool(operation.get("metadata_update")):
+            segment.SetName(operation.get("segment_name") or segment_id)
+            color = str(operation.get("color_hex") or "#4A90E2").lstrip("#")
+            if len(color) == 6:
+                try:
+                    segment.SetColor(
+                        *(
+                            int(color[index : index + 2], 16) / 255.0
+                            for index in (0, 2, 4)
+                        )
+                    )
+                except Exception:
+                    pass
         self._remember_segment_metadata(node, segment_id)
         return segment
 
@@ -9171,6 +9331,7 @@ class LiveCollaborationController:
             try:
                 segment_id = operation["segment_id"]
                 key = (node.GetID(), segment_id)
+                metadata_before = self._current_segment_metadata(node, segment_id)
                 if operation.get("segment_deleted"):
                     self._segment_metadata[segment_id] = {
                         "segment_id": segment_id,
@@ -9187,6 +9348,7 @@ class LiveCollaborationController:
                     self.baseline_bounds.pop(key, None)
                     self.dirty_segments.discard(key)
                     self.force_snapshots.discard(key)
+                    self.metadata_updates.discard(key)
                     self.pending_segment_deletions.pop(segment_id, None)
                     self._segment_revisions.pop(key, None)
                     self._segment_verifications.pop(key, None)
@@ -9195,11 +9357,16 @@ class LiveCollaborationController:
                     self.segment_locks_state.pop(segment_id, None)
                     self.review_states_state.pop(segment_id, None)
                     node.Modified()
+                    actor = (
+                        "You"
+                        if operation.get("author") == self.user_name
+                        else operation.get("author") or "Collaborator"
+                    )
+                    self._append_activity(
+                        f"{actor} deleted label "
+                        f"{operation.get('segment_name') or segment_id}"
+                    )
                     if operation.get("author") != self.user_name:
-                        self._append_activity(
-                            f"{operation.get('author') or 'Collaborator'} deleted label "
-                            f"{operation.get('segment_name') or segment_id}"
-                        )
                         slicer.util.showStatusMessage(
                             f"Live: {operation.get('author')} deleted label "
                             f"{operation.get('segment_name') or segment_id}",
@@ -9212,6 +9379,26 @@ class LiveCollaborationController:
                     continue
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
+                if (
+                    key in self.metadata_updates
+                    and operation.get("author") != self.user_name
+                    and metadata_before is not None
+                ):
+                    # A local rename/color change that has not been published
+                    # yet is analogous to an unsent local voxel edit: keep it
+                    # visible and let its later ordered operation decide the
+                    # final shared state.
+                    local_segment = node.GetSegmentation().GetSegment(segment_id)
+                    local_segment.SetName(metadata_before["segment_name"])
+                    local_color = metadata_before["color_hex"].lstrip("#")
+                    local_segment.SetColor(
+                        *(
+                            int(local_color[index : index + 2], 16) / 255.0
+                            for index in (0, 2, 4)
+                        )
+                    )
+                    self._remember_segment_metadata(node, segment_id)
+                metadata_after = self._current_segment_metadata(node, segment_id)
                 operation_bounds = [
                     int(value) for value in operation["voxel_bbox"]
                 ]
@@ -9326,11 +9513,46 @@ class LiveCollaborationController:
                 self._known_segment_ids.add(segment_id)
                 self._remember_segment_revision(node, segment_id)
                 self._set_segment_collaboration_tags(segment_id)
-                if operation.get("author") != self.user_name:
-                    self._append_activity(
-                        f"{operation.get('author') or 'Collaborator'} updated label "
+                actor = (
+                    "You"
+                    if operation.get("author") == self.user_name
+                    else operation.get("author") or "Collaborator"
+                )
+                if operation.get("metadata_update"):
+                    if metadata_before is None:
+                        activity = (
+                            f"{actor} created label “"
+                            f"{operation.get('segment_name') or segment_id}”"
+                        )
+                    else:
+                        changes = []
+                        if metadata_after and (
+                            metadata_before.get("segment_name")
+                            != metadata_after.get("segment_name")
+                        ):
+                            changes.append(
+                                f"renamed “{metadata_before.get('segment_name')}” to "
+                                f"“{metadata_after.get('segment_name')}”"
+                            )
+                        if metadata_after and (
+                            metadata_before.get("color_hex")
+                            != metadata_after.get("color_hex")
+                        ):
+                            changes.append(
+                                f"changed its color to {metadata_after.get('color_hex')}"
+                            )
+                        activity = (
+                            f"{actor} " + " and ".join(changes)
+                            if changes
+                            else f"{actor} updated label properties for “{operation.get('segment_name') or segment_id}”"
+                        )
+                else:
+                    activity = (
+                        f"{actor} updated label "
                         f"{operation.get('segment_name') or segment_id} · sequence {sequence}"
                     )
+                self._append_activity(activity)
+                if operation.get("author") != self.user_name:
                     highlight_changed = changed
                     if (
                         operation.get("operation_kind") == "snapshot"

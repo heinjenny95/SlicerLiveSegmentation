@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.13.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.13.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -135,6 +135,20 @@ chat files whenever a state cache is stale. Presence leases survive transient
 heartbeat delays, and a late cleanup from an older connection cannot remove a
 newer session of the same user.
 
+Version 0.14.0 gives every newly created collaborative label a room-global
+identifier instead of publishing Slicer's scene-local `Segment_1`-style ID.
+This prevents two users who create labels concurrently from crossing voxel data,
+names, or colors. Label renames and color changes are explicit ordered room
+operations and update the standard Segment Editor immediately; delayed paint
+packets can no longer revert newer label properties. The live activity dock now
+includes the current user's acknowledged changes. Direct LAN and Remote HTTPS
+address controls appear directly below the connection selector, with the LAN
+host creating its private local room store, URL, and session code automatically.
+
+The safer global-label protocol is intentionally incompatible with earlier room
+formats. Every collaborator must install 0.14.0 and create a new room; an older
+room is rejected clearly instead of risking a wrong label assignment.
+
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
 subdirectory containing room metadata, ordered voxel operations, and expiring
@@ -155,7 +169,9 @@ to the same voxel, the operation ordered later by the shared transport wins.
   now** immediately requests participants, edits, chat, locks, and a health
   check without rescanning history or backups.
 - **Direct LAN with fallback:** one participant can start a lightweight LAN
-  relay from the module and export a `.livesegroom` invitation. Collaborators
+  relay from the module; that host creates a private local room store and the
+  displayed LAN URL and session code automatically. It does not create or
+  require a shared folder. Export a `.livesegroom` invitation so collaborators
   prefer that direct HTTP path and automatically use the same shared-folder
   room when the relay is temporarily unavailable. The access-code relay is
   unencrypted and is intended only for a trusted institutional LAN or VPN.

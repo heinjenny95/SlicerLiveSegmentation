@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS live_rooms (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
     volume_signature TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 3,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS live_operations (
     system_snapshot INTEGER NOT NULL DEFAULT 0,
     snapshot_label TEXT,
     segment_deleted INTEGER NOT NULL DEFAULT 0,
+    metadata_update INTEGER NOT NULL DEFAULT 0,
     undo_of_sequence INTEGER,
     changed_voxels INTEGER,
     created_at TEXT NOT NULL,
@@ -145,6 +147,15 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # Rooms created by an older server have scene-local label IDs and
+            # cannot be made collision-safe retroactively. Mark those migrated
+            # rows as legacy; new inserts always specify schema 3 explicitly.
+            self._ensure_column(
+                connection,
+                "live_rooms",
+                "schema_version",
+                "INTEGER NOT NULL DEFAULT 2",
+            )
             self._ensure_column(connection, "live_operations", "base_sequence", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "live_operations", "snapshot_group_id", "TEXT")
             self._ensure_column(connection, "live_operations", "snapshot_group_index", "INTEGER")
@@ -158,6 +169,12 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "live_operations", "changed_voxels", "INTEGER")
+            self._ensure_column(
+                connection,
+                "live_operations",
+                "metadata_update",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             self._ensure_column(connection, "live_operations", "undo_of_sequence", "INTEGER")
             self._ensure_column(connection, "live_chat_messages", "anchor", "TEXT")
             self._ensure_column(connection, "live_segment_locks", "expires_at", "TEXT")
