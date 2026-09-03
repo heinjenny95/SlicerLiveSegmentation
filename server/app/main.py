@@ -33,7 +33,7 @@ from .schemas import (
     LiveSegmentLockUpdate,
 )
 
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.13.1"
 COLLABORATION_PROTOCOL_VERSION = 2
 MINIMUM_COMPATIBLE_PLUGIN_VERSION = "0.11.2"
 
@@ -539,7 +539,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/live/rooms/{room_id}/presence")
     async def leave_live_room(
-        room_id: str, user: str = Depends(require_user)
+        room_id: str,
+        presence_session_id: str | None = None,
+        user: str = Depends(require_user),
     ) -> dict[str, bool]:
         with database.transaction() as connection:
             room = connection.execute(
@@ -548,7 +550,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if room is None:
                 raise HTTPException(status_code=404, detail="Live room not found")
             append_audit(connection, room_id, "room.leave", user)
-        await presence_registry.remove_presence(room_id, user)
+        await presence_registry.remove_presence(
+            room_id, user, presence_session_id=presence_session_id
+        )
         return {"left": True}
 
     @app.get("/api/live/rooms/{room_id}/messages")

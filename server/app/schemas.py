@@ -83,6 +83,7 @@ class LiveOperationCreate(BaseModel):
 
 
 class LivePresenceUpdate(BaseModel):
+    presence_session_id: str | None = Field(default=None, max_length=64)
     active_segment_id: str | None = Field(default=None, max_length=200)
     active_segment_name: str | None = Field(default=None, max_length=200)
     crosshair_ras: list[float] | None = Field(default=None, min_length=3, max_length=3)

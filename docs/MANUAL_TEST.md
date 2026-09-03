@@ -1,5 +1,21 @@
 # Manual two-user acceptance test
 
+## Long-running NAS presence and stale-cache recovery
+
+1. Install the same current release on two computers, use different display
+   names, and create a new shared-folder room on the target NAS.
+2. Leave both clients idle for at least two minutes. Verify that both participant
+   names remain visible. A slow heartbeat may say **Presence delayed**, but must
+   not immediately change to **Nobody else is connected**.
+3. Paint alternating edits on both computers for at least 30 operations. Verify
+   that every edit appears once, sequence numbers remain unique, and neither
+   client waits for a manual refresh.
+4. Leave and immediately rejoin on one computer. Verify that a delayed cleanup
+   from the previous session does not remove the new participant heartbeat.
+5. Send alternating chat messages while editing. Verify that a stale compact
+   state cache cannot hide an immutable message or segmentation operation.
+
+
 ## Safe recent shared-folder dropdown
 
 1. In a normal Slicer profile, join a room through a reachable shared folder

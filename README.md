@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.13.0.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.13.1.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.13.0`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.13.1`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -124,6 +124,16 @@ connections without an institutional intranet, shared drive, or VPN. A bundled
 Docker Compose + Caddy deployment provides automatic TLS and per-user tokens;
 plain HTTP is rejected for non-loopback server addresses unless the user
 explicitly enables the local-test override.
+
+Version 0.13.1 fixes false participant disappearance and severe delays observed
+on a real multi-computer NAS session. High-frequency presence and rebuildable
+hot-cache files no longer use replace-over-existing, which can stall for more
+than a minute on some SMB servers. Sequence allocation now cross-checks the
+immutable operation journal so a stale SMB cache cannot assign the same
+sequence number to two edits. Polling falls back to immutable operation and
+chat files whenever a state cache is stale. Presence leases survive transient
+heartbeat delays, and a late cleanup from an older connection cannot remove a
+newer session of the same user.
 
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
@@ -287,7 +297,7 @@ two-minute preflight beacon. See `docs/TWO_COMPUTER_PREFLIGHT.md`.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 62 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, crash-recovery, QA,
+- 66 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, crash-recovery, QA,
   chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.

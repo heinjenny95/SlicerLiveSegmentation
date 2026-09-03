@@ -15,7 +15,7 @@ class LivePresenceRegistry:
         room_id: str,
         user: str,
         details: dict | None = None,
-        expiry_seconds: float = 12,
+        expiry_seconds: float = 45,
     ) -> list[dict]:
         now = time.time()
         async with self._guard:
@@ -43,11 +43,21 @@ class LivePresenceRegistry:
                 result.append(entry)
             return result
 
-    async def remove_presence(self, room_id: str, user: str) -> None:
+    async def remove_presence(
+        self, room_id: str, user: str, presence_session_id: str | None = None
+    ) -> None:
         async with self._guard:
             users = self._presence.get(room_id)
             if users is None:
                 return
+            if presence_session_id:
+                current_session_id = str(
+                    users.get(user, {}).get("details", {}).get(
+                        "presence_session_id", ""
+                    )
+                )
+                if current_session_id and current_session_id != presence_session_id:
+                    return
             users.pop(user, None)
             if not users:
                 self._presence.pop(room_id, None)

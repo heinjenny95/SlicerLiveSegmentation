@@ -643,6 +643,7 @@ def run_probe():
             if not hasattr(controller.client, "_room_path"):
                 raise RuntimeError("Advanced smoke test requires shared-folder mode")
             from LiveSegmentationLib.collaboration import (
+                PRESENCE_DISPLAY_GRACE_SECONDS,
                 SharedFolderRoomClient,
                 encode_mask_delta,
             )
@@ -674,6 +675,32 @@ def run_probe():
                 raise RuntimeError("Rich collaborator presence did not appear")
             controller.collaborator_combo.setCurrentText("thomas-smoke")
             controller.jump_to_selected_user()
+
+            controller._update_presence([])
+            if "thomas-smoke" not in controller.presence_by_user:
+                raise RuntimeError("A single delayed heartbeat removed the collaborator")
+            if "Presence delayed" not in controller.users_label.text:
+                raise RuntimeError("Delayed presence did not produce an explicit warning")
+            controller._presence_last_observed["thomas-smoke"] -= (
+                PRESENCE_DISPLAY_GRACE_SECONDS + 1.0
+            )
+            controller._update_presence([])
+            if "thomas-smoke" in controller.presence_by_user:
+                raise RuntimeError("Expired collaborator remained in the presence roster")
+            peer.presence(
+                controller.room_id,
+                {
+                    "active_segment_id": segment_id,
+                    "active_segment_name": "Test segment",
+                },
+            )
+            controller._update_presence(
+                controller.client.presence(
+                    controller.room_id, controller._active_presence()
+                )
+            )
+            if "thomas-smoke" not in controller.presence_by_user:
+                raise RuntimeError("Collaborator presence did not recover")
 
             controller.chat_input.setText("Anchored spatial message")
             controller.send_chat_message()
@@ -780,6 +807,7 @@ def run_probe():
                 raise RuntimeError("Version timeline remained empty")
             advanced_features = {
                 "rich_presence": True,
+                "presence_delay_grace_and_recovery": True,
                 "spatial_chat": True,
                 "material_template": True,
                 "review_and_access_request": True,

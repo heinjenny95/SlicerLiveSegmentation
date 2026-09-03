@@ -596,7 +596,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
     payload = {
         "room_name": "internet collaboration",
         "volume_signature": "a" * 64,
-        "plugin_version": "0.13.0",
+        "plugin_version": "0.13.1",
         "protocol_version": 2,
     }
     alice = client.post(
@@ -632,7 +632,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.13.0"
+    assert health.json()["version"] == "0.13.1"
     assert health.json()["protocol_version"] == 2
     assert health.json()["minimum_plugin_version"] == "0.11.2"
     assert health.json()["authentication"] == "open-testing"
@@ -644,7 +644,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.13.0",
+            "server_version": "0.13.1",
             "protocol_version": 2,
             "minimum_plugin_version": "0.11.2",
             "server_time_epoch": time.time(),
@@ -654,7 +654,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.13.0",
+                    "plugin_version": "0.13.1",
                     "protocol_version": 2,
                     "volume_signature": "a" * 64,
                 }
@@ -997,15 +997,17 @@ def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
     assert [item["user"] for item in users] == ["alice"]
 
 
-def test_presence_falls_back_when_share_rejects_atomic_replace(tmp_path, monkeypatch):
+def test_presence_bypasses_slow_atomic_replace_on_network_share(tmp_path, monkeypatch):
     client = SharedFolderRoomClient(tmp_path, "network-user")
     room = client.join("restricted smb room", "2" * 64)
     client.presence(room["id"], {"active_segment_name": "First"})
     presence_path = client._presence_path(client._room_path)
     real_replace = collaboration_module.os.replace
+    presence_replace_calls = []
 
     def reject_presence_replace(source, destination):
         if Path(destination) == presence_path:
+            presence_replace_calls.append((source, destination))
             raise PermissionError(5, "Access is denied", str(destination))
         return real_replace(source, destination)
 
@@ -1016,10 +1018,86 @@ def test_presence_falls_back_when_share_rejects_atomic_replace(tmp_path, monkeyp
         {
             "active_segment_name": "Updated",
             "last_seen": users[0]["last_seen"],
+            "presence_session_id": client.presence_session_id,
             "user": "network-user",
         }
     ]
+    assert presence_replace_calls == []
     assert not list(presence_path.parent.glob(".tmp-*"))
+
+
+def test_delayed_leave_cannot_delete_newer_presence_session(tmp_path):
+    old_client = SharedFolderRoomClient(tmp_path, "alice")
+    room = old_client.join("presence reconnect", "3" * 64)
+    old_client.presence(room["id"], {})
+
+    new_client = SharedFolderRoomClient(tmp_path, "alice")
+    new_client.join("presence reconnect", "3" * 64)
+    new_client.presence(room["id"], {"active_segment_name": "New session"})
+    old_client.leave(room["id"])
+
+    presence_path = new_client._presence_path(new_client._room_path)
+    assert presence_path.is_file()
+    current = collaboration_module._read_json_file(presence_path)
+    assert current["presence_session_id"] == new_client.presence_session_id
+    assert current["active_segment_name"] == "New session"
+
+
+def test_stale_operation_cache_cannot_allocate_duplicate_sequence(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("stale operation cache", "4" * 64)
+    bob.join("stale operation cache", "4" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    first = empty.copy()
+    first[0, 0, 0] = 1
+    second = first.copy()
+    second[1, 1, 1] = 1
+    assert alice.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, first, operation_id="stale-alice-operation"),
+    )["sequence"] == 1
+
+    collaboration_module._write_shared_hot_cache(
+        bob._room_path / "sequence-state.json",
+        {"latest_sequence": 0, "recent_operations": [], "inline_operations": []},
+    )
+    assert bob.push_operation(
+        room["id"],
+        operation_payload("Organ", first, second, operation_id="stale-bob-operation"),
+    )["sequence"] == 2
+    operation_sequences = sorted(
+        bob._operation_sequence(path)
+        for path in bob._room_path.joinpath("operations").glob("*.json")
+    )
+    assert operation_sequences == [1, 2]
+
+
+def test_existing_duplicate_sequence_fails_safely_with_new_room_guidance(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    room = alice.join("damaged old room", "5" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed[0, 0, 0] = 1
+    alice.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, changed, operation_id="first-operation"),
+    )
+    original = next(alice._room_path.joinpath("operations").glob("*.json"))
+    duplicate = collaboration_module._read_json_file(original)
+    duplicate["client_operation_id"] = "colliding-operation"
+    duplicate_path = original.with_name(
+        "00000000000000000001--ffffffffffffffffffff.json"
+    )
+    collaboration_module._write_json_atomic(duplicate_path, duplicate)
+
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    report = bob.preflight("damaged old room", "5" * 64)
+    room_check = next(item for item in report["checks"] if item["id"] == "room-format")
+    assert room_check["status"] == "fail"
+    assert "Duplicate operation sequence(s): 1" in room_check["detail"]
+    with pytest.raises(LiveCollaborationError, match="Create a new room"):
+        bob.join("damaged old room", "5" * 64)
 
 
 def test_shared_folder_chat_is_permanent_and_idempotent(tmp_path):
@@ -1238,6 +1316,41 @@ def test_server_chat_locks_and_immediate_leave(client, headers):
         json={},
     ).json()
     assert [entry["user"] for entry in presence] == ["bob"]
+
+
+def test_server_delayed_leave_cannot_remove_newer_presence_session(client, headers):
+    room = client.post(
+        "/api/live/rooms/join",
+        headers=headers,
+        json={"room_name": "server reconnect", "volume_signature": "9" * 64},
+    ).json()
+    presence_url = f"/api/live/rooms/{room['id']}/presence"
+    client.post(
+        presence_url,
+        headers=headers,
+        json={"presence_session_id": "old-session"},
+    )
+    client.post(
+        presence_url,
+        headers=headers,
+        json={
+            "presence_session_id": "new-session",
+            "active_segment_name": "Current label",
+        },
+    )
+
+    delayed_leave = client.delete(
+        presence_url + "?presence_session_id=old-session", headers=headers
+    )
+    assert delayed_leave.status_code == 200
+    users = client.post(
+        presence_url,
+        headers={"X-LiveSeg-User": "bob"},
+        json={"presence_session_id": "bob-session"},
+    ).json()
+    alice = next(entry for entry in users if entry["user"] == "alice")
+    assert alice["presence_session_id"] == "new-session"
+    assert alice["active_segment_name"] == "Current label"
 
 
 def test_invitation_and_material_template_are_portable_and_secret_free():
@@ -1508,7 +1621,7 @@ def test_public_preflight_requires_forwarded_https_and_individual_token(tmp_path
     payload = {
         "room_name": "public room",
         "volume_signature": "a" * 64,
-        "plugin_version": "0.13.0",
+        "plugin_version": "0.13.1",
         "protocol_version": 2,
     }
     with TestClient(create_app(settings)) as public_client:

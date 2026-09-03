@@ -170,7 +170,7 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 62,
+            "automated_tests": 66,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
@@ -179,7 +179,7 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
                 "nonblocking-startup-shutdown-two-stage-latency-watchdog-"
                 "safe-recent-folder-history-direct-lan-fallback-spatial-comments-"
                 "quality-benchmark-review-comparison-collaborative-undo-metrics-"
-                "two-computer-preflight-public-https-policy"
+                "two-computer-preflight-public-https-policy-nas-presence-stale-cache-recovery"
             ),
             "two_process_slicer_live_sync_test": (
                 "passed-two-slicer-256-cubed-bidirectional-rapid-three-component-"

@@ -98,6 +98,8 @@ SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 30.0
 RECENT_SHARED_FOLDER_LIMIT = 8
 PREFLIGHT_PARTICIPANT_TTL_SECONDS = 120.0
 PREFLIGHT_TIMEOUT_SECONDS = 20.0
+PRESENCE_DELAY_WARNING_SECONDS = 3.0
+PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
 
 
 def _version_tuple(value):
@@ -485,13 +487,16 @@ def _bounded_inline_operations(operations):
 
 
 def _write_presence_json(path, payload):
-    """Update ephemeral presence on shares that reject replace-over-existing.
+    """Update an ephemeral presence lease without an SMB rename.
 
-    Some SMB deployments allow creating and updating a file but reject an
-    atomic rename when the destination already exists. Presence is transient
-    and readers already ignore incomplete JSON, so a direct-overwrite fallback
-    is safe here. Room metadata and segmentation operations continue to use
-    only atomic publication.
+    Presence is the only high-frequency, disposable room artifact.  Several
+    NAS/SMB implementations can hold ``replace(existing)`` for a minute or
+    longer even while ordinary reads and writes continue to work.  That left
+    the one presence worker stuck and made two active collaborators disappear
+    from each other's UI.  A per-user file has exactly one writer, therefore a
+    direct truncate/write is preferable here. Readers already retry short or
+    incomplete JSON. Durable room metadata and segmentation operations still
+    use atomic publication.
     """
     destination = Path(path)
     if not destination.parent.is_dir():
@@ -499,27 +504,48 @@ def _write_presence_json(path, payload):
             f"Presence folder is unavailable: {destination.parent}"
         )
     try:
-        return _write_json_atomic(destination, payload, durable=False)
-    except LiveCollaborationError as atomic_error:
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("w", encoding="utf-8", newline="\n") as output:
-                json.dump(
-                    payload,
-                    output,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                output.write("\n")
-                output.flush()
-        except OSError as direct_error:
-            raise LiveCollaborationError(
-                "Could not update presence in the shared folder "
-                f"{destination.parent}. Atomic replace failed: {atomic_error}. "
-                f"Direct overwrite failed: {direct_error}"
-            ) from direct_error
-        return destination
+        with destination.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(
+                payload,
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            output.write("\n")
+            output.flush()
+    except OSError as exc:
+        raise LiveCollaborationError(
+            f"Could not update presence in the shared folder {destination.parent}: {exc}"
+        ) from exc
+    return destination
+
+
+def _write_shared_hot_cache(path, payload, label="shared cache"):
+    """Write a rebuildable high-frequency cache without replace-over-existing.
+
+    The immutable operation/chat files are the source of truth.  These compact
+    state files only accelerate polling and can be rebuilt from that journal,
+    so avoiding a slow SMB rename is more important than crash durability.
+    Readers retry transient partial JSON and fall back to the immutable files.
+    """
+    destination = Path(path)
+    try:
+        with destination.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(
+                payload,
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            output.write("\n")
+            output.flush()
+    except OSError as exc:
+        raise LiveCollaborationError(
+            f"Could not update {label} in the shared folder {destination.parent}: {exc}"
+        ) from exc
+    return destination
 
 
 def volume_signature(array, spacing=None, origin=None, ijk_to_ras=None, sample_count=4096):
@@ -1019,6 +1045,7 @@ class LiveRoomClient:
             raise ValueError("Enter your display name")
         self.api_key = str(api_key or "").strip()
         self.timeout_seconds = float(timeout_seconds)
+        self.presence_session_id = uuid.uuid4().hex
 
     def _request(self, method, path, payload=None):
         body = None
@@ -1089,7 +1116,11 @@ class LiveRoomClient:
         return self._request("GET", f"/api/live/rooms/{room_id}/operations?{query}")
 
     def presence(self, room_id, details):
-        return self._request("POST", f"/api/live/rooms/{room_id}/presence", details)
+        return self._request(
+            "POST",
+            f"/api/live/rooms/{room_id}/presence",
+            {**(details or {}), "presence_session_id": self.presence_session_id},
+        )
 
     def health_check(self, room_id=None):
         del room_id
@@ -1099,7 +1130,12 @@ class LiveRoomClient:
         return result
 
     def leave(self, room_id):
-        return self._request("DELETE", f"/api/live/rooms/{room_id}/presence")
+        query = urllib.parse.urlencode(
+            {"presence_session_id": self.presence_session_id}
+        )
+        return self._request(
+            "DELETE", f"/api/live/rooms/{room_id}/presence?{query}"
+        )
 
     def send_chat(self, room_id, text, client_message_id, anchor=None):
         payload = {"text": text, "client_message_id": client_message_id}
@@ -1293,7 +1329,7 @@ class SharedFolderRoomClient:
         user_name,
         lock_timeout_seconds=10.0,
         stale_lock_seconds=60.0,
-        presence_ttl_seconds=30.0,
+        presence_ttl_seconds=60.0,
     ):
         self.shared_folder = normalize_shared_folder(shared_folder)
         self.user_name = str(user_name or "").strip()
@@ -1302,6 +1338,7 @@ class SharedFolderRoomClient:
         self.lock_timeout_seconds = float(lock_timeout_seconds)
         self.stale_lock_seconds = float(stale_lock_seconds)
         self.presence_ttl_seconds = float(presence_ttl_seconds)
+        self.presence_session_id = uuid.uuid4().hex
         self.rooms_root = self.shared_folder / "LiveSegmentation" / "rooms"
         self._room_id = None
         self._room_path = None
@@ -1336,13 +1373,16 @@ class SharedFolderRoomClient:
 
     def _latest_sequence(self, room_path):
         state_path = room_path / "sequence-state.json"
+        latest = 0
         if state_path.is_file():
             try:
                 state = _read_json_file(state_path)
-                return max(0, int(state.get("latest_sequence", 0)))
+                latest = max(0, int(state.get("latest_sequence", 0)))
             except (LiveCollaborationError, TypeError, ValueError):
                 pass
-        latest = 0
+        # Never trust the replaceable hot-cache file as the sole sequence
+        # authority.  SMB clients may keep an old generation cached long after
+        # another computer has published an immutable operation file.
         operations_path = room_path / "operations"
         try:
             candidates = operations_path.glob("*.json")
@@ -1355,6 +1395,20 @@ class SharedFolderRoomClient:
                 f"Could not list shared operations in {operations_path}: {exc}"
             ) from exc
         return latest
+
+    def _duplicate_operation_sequences(self, room_path):
+        counts = {}
+        operations_path = room_path / "operations"
+        try:
+            for path in operations_path.glob("*.json"):
+                sequence = self._operation_sequence(path)
+                if sequence is not None:
+                    counts[sequence] = counts.get(sequence, 0) + 1
+        except OSError as exc:
+            raise LiveCollaborationError(
+                f"Could not validate shared operation ordering: {exc}"
+            ) from exc
+        return sorted(sequence for sequence, count in counts.items() if count > 1)
 
     @staticmethod
     def _recent_feed_state(state_path, latest_key, entries_key):
@@ -1587,6 +1641,9 @@ class SharedFolderRoomClient:
         metadata_path = room_path / "room.json"
         metadata = _read_json_file(metadata_path) if metadata_path.is_file() else None
         room_exists = metadata is not None
+        duplicate_sequences = (
+            self._duplicate_operation_sequences(room_path) if room_exists else []
+        )
         schema_version = int(metadata.get("schema_version", 0) or 0) if metadata else 0
         room_compatible = not metadata or metadata.get("volume_signature") == str(signature)
         schema_compatible = not metadata or schema_version in {1, SHARED_FOLDER_SCHEMA_VERSION}
@@ -1617,11 +1674,23 @@ class SharedFolderRoomClient:
             ),
             _preflight_check(
                 "room-format",
-                "pass" if schema_compatible and plugin_compatible else "fail",
+                "pass"
+                if schema_compatible and plugin_compatible and not duplicate_sequences
+                else "fail",
                 "Room format and plugin",
                 f"Plugin {plugin_version}; room schema {schema_version if room_exists else 'new'}; "
-                f"minimum plugin {minimum}.",
-                "Install the same current Live Segmentation release on every computer."
+                f"minimum plugin {minimum}."
+                + (
+                    " Duplicate operation sequence(s): "
+                    + ", ".join(str(item) for item in duplicate_sequences)
+                    + "."
+                    if duplicate_sequences
+                    else ""
+                ),
+                "This room was damaged by a stale-cache collision in an older release. "
+                "Create a new room with version 0.13.1 or newer."
+                if duplicate_sequences
+                else "Install the same current Live Segmentation release on every computer."
                 if not schema_compatible or not plugin_compatible
                 else "",
             ),
@@ -1739,6 +1808,14 @@ class SharedFolderRoomClient:
                 "This room uses a newer Live Segmentation format and requires "
                 f"plugin version {minimum_version} or newer. Update the plugin on "
                 "every computer before joining this room."
+            )
+        duplicate_sequences = self._duplicate_operation_sequences(room_path)
+        if duplicate_sequences:
+            raise LiveCollaborationError(
+                "This room contains duplicate operation sequence(s) "
+                + ", ".join(str(item) for item in duplicate_sequences)
+                + " from an older stale-cache collision. Its ordering is ambiguous. "
+                "Create a new room with Live Segmentation 0.13.1 or newer."
             )
         self._room_id = room_key
         self._room_path = room_path
@@ -1872,12 +1949,10 @@ class SharedFolderRoomClient:
                         f"Label is locked by {lock_state.get('owner') or 'another user'}"
                     )
             base_sequence = int(operation.get("base_sequence", 0) or 0)
-            try:
-                latest_sequence = max(0, int(state.get("latest_sequence", 0)))
-            except (TypeError, ValueError):
-                latest_sequence = 0
-            if latest_sequence <= 0 and not state:
-                latest_sequence = self._latest_sequence(room_path)
+            # Cross-check the cache against immutable files on every write.
+            # This prevents two computers from allocating the same sequence
+            # when one SMB redirector still serves an older state-file cache.
+            latest_sequence = self._latest_sequence(room_path)
             sequence = latest_sequence + 1
             stored = {
                 **operation,
@@ -1893,6 +1968,29 @@ class SharedFolderRoomClient:
                 pass
             destination = operations_path / f"{sequence:020d}--{operation_hash}.json"
             recent_operations = list(state.get("recent_operations") or [])
+            known_recent_files = {
+                str(item.get("file") or "")
+                for item in recent_operations
+                if isinstance(item, dict)
+            }
+            try:
+                for existing_path in operations_path.glob("*.json"):
+                    existing_sequence = self._operation_sequence(existing_path)
+                    if (
+                        existing_sequence is not None
+                        and existing_path.name not in known_recent_files
+                    ):
+                        recent_operations.append(
+                            {
+                                "sequence": existing_sequence,
+                                "file": existing_path.name,
+                                "operation_hash": existing_path.stem.split("--", 1)[-1],
+                            }
+                        )
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not reconcile shared operations: {exc}"
+                ) from exc
             recent_operations = [
                 item for item in recent_operations if int(item.get("sequence", 0)) != sequence
             ]
@@ -1922,7 +2020,11 @@ class SharedFolderRoomClient:
                     _write_json_atomic(
                         previous_destination, previous_operation, durable=False
                     )
-            _write_json_atomic(
+            # Publish the immutable operation before the replaceable polling
+            # cache.  A peer can therefore discover it even while its SMB
+            # client still shows an older sequence-state.json generation.
+            _write_json_atomic(destination, stored, durable=False)
+            _write_shared_hot_cache(
                 state_path,
                 {
                     "latest_sequence": sequence,
@@ -1930,11 +2032,11 @@ class SharedFolderRoomClient:
                     "recent_operations": recent_operations,
                     "inline_operations": inline_operations,
                 },
-                durable=False,
+                label="live-operation cache",
             )
-        # The state file above is the latency-sensitive, complete operation
-        # journal. Append-only history, retry index, and owner metadata are
-        # derived immediately in one background lane.
+        # The immutable operation above is the source of truth. Retry index and
+        # owner metadata are derived in one background lane; the compact state
+        # file remains only a replaceable polling accelerator.
         self._queue_operation_artifacts(room_path, stored)
         if defer_conflicts:
             def analyze_later():
@@ -1982,11 +2084,28 @@ class SharedFolderRoomClient:
                 f"Shared operations folder is unavailable: {operations_path}"
             )
         state_path = room_path / "sequence-state.json"
-        state = _read_json_file(state_path) if state_path.is_file() else {}
+        try:
+            state = _read_json_file(state_path) if state_path.is_file() else {}
+        except LiveCollaborationError:
+            state = {}
         try:
             latest = max(0, int(state.get("latest_sequence", 0)))
         except (TypeError, ValueError):
             latest = 0
+        immutable_entries = []
+        if latest <= after_sequence:
+            try:
+                immutable_entries = [
+                    (sequence, path)
+                    for path in operations_path.glob("*.json")
+                    if (sequence := self._operation_sequence(path)) is not None
+                ]
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not list shared operations: {exc}"
+                ) from exc
+            if immutable_entries:
+                latest = max(latest, max(sequence for sequence, _ in immutable_entries))
         if latest <= after_sequence:
             return []
         inline_by_sequence = {
@@ -2029,13 +2148,22 @@ class SharedFolderRoomClient:
                 selected = []
                 recent_covers_request = False
         if not recent_covers_request:
-            try:
-                for path in operations_path.glob("*.json"):
-                    sequence = self._operation_sequence(path)
-                    if sequence is not None and sequence > after_sequence:
-                        selected.append((sequence, path))
-            except OSError as exc:
-                raise LiveCollaborationError(f"Could not list shared operations: {exc}") from exc
+            if not immutable_entries:
+                try:
+                    immutable_entries = [
+                        (sequence, path)
+                        for path in operations_path.glob("*.json")
+                        if (sequence := self._operation_sequence(path)) is not None
+                    ]
+                except OSError as exc:
+                    raise LiveCollaborationError(
+                        f"Could not list shared operations: {exc}"
+                    ) from exc
+            selected.extend(
+                (sequence, path)
+                for sequence, path in immutable_entries
+                if sequence > after_sequence
+            )
         selected = sorted(selected)[:limit]
 
         def read_operation(item):
@@ -2109,6 +2237,10 @@ class SharedFolderRoomClient:
             "user": self.user_name,
             "last_seen": _utc_iso(),
             "last_seen_epoch": time.time(),
+            "presence_session_id": str(
+                (details or {}).get("presence_session_id")
+                or self.presence_session_id
+            ),
             **(details or {}),
         }
         _write_presence_json(self._presence_path(room_path), data)
@@ -2128,15 +2260,22 @@ class SharedFolderRoomClient:
             ) from exc
         return {"status": "ok", "room_id": self._room_id}
 
-    def leave(self, room_id):
+    def leave(self, room_id, presence_session_id=None):
         room_path = self._require_room(room_id)
         try:
             self._append_audit(room_path, "room.leave")
         except Exception:
             pass
         try:
-            self._presence_path(room_path).unlink(missing_ok=True)
-        except OSError:
+            presence_path = self._presence_path(room_path)
+            current = _read_json_file(presence_path) if presence_path.is_file() else {}
+            expected_session = str(presence_session_id or self.presence_session_id)
+            current_session = str(current.get("presence_session_id") or "")
+            # A delayed cleanup from an earlier connection must not delete the
+            # heartbeat written by a newer session of the same user.
+            if not current_session or current_session == expected_session:
+                presence_path.unlink(missing_ok=True)
+        except (OSError, LiveCollaborationError):
             pass
         self._room_id = None
         self._room_path = None
@@ -2147,9 +2286,8 @@ class SharedFolderRoomClient:
         latest, _ = self._recent_feed_state(
             room_path / "chat-state.json", "latest_sequence", "recent_messages"
         )
-        if latest:
-            return latest
-        latest = 0
+        # As with segmentation operations, immutable chat files outrank a
+        # possibly stale SMB cache generation.
         try:
             paths = room_path.joinpath("chat").glob("*.json")
             for path in paths:
@@ -2221,14 +2359,14 @@ class SharedFolderRoomClient:
                 {"sequence": sequence, "file": destination.name},
                 durable=False,
             )
-            _write_json_atomic(
+            _write_shared_hot_cache(
                 room_path / "chat-state.json",
                 {
                     "latest_sequence": sequence,
                     "updated_at": _utc_iso(),
                     "recent_messages": recent_messages,
                 },
-                durable=False,
+                label="chat cache",
             )
         self._append_audit_async(
             room_path,
@@ -2249,6 +2387,20 @@ class SharedFolderRoomClient:
         latest, recent = self._recent_feed_state(
             room_path / "chat-state.json", "latest_sequence", "recent_messages"
         )
+        immutable_entries = []
+        if latest <= after_sequence:
+            try:
+                immutable_entries = [
+                    (sequence, path)
+                    for path in chat_path.glob("*.json")
+                    if (sequence := self._message_sequence(path)) is not None
+                ]
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not list shared chat messages: {exc}"
+                ) from exc
+            if immutable_entries:
+                latest = max(latest, max(sequence for sequence, _ in immutable_entries))
         if latest <= after_sequence:
             return []
         recent = sorted(recent, key=lambda item: int(item["sequence"]))
@@ -2265,13 +2417,22 @@ class SharedFolderRoomClient:
                 selected = []
                 recent_covers_request = False
         if not recent_covers_request:
-            try:
-                for path in chat_path.glob("*.json"):
-                    sequence = self._message_sequence(path)
-                    if sequence is not None and sequence > after_sequence:
-                        selected.append((sequence, path))
-            except OSError as exc:
-                raise LiveCollaborationError(f"Could not list shared chat messages: {exc}") from exc
+            if not immutable_entries:
+                try:
+                    immutable_entries = [
+                        (sequence, path)
+                        for path in chat_path.glob("*.json")
+                        if (sequence := self._message_sequence(path)) is not None
+                    ]
+                except OSError as exc:
+                    raise LiveCollaborationError(
+                        f"Could not list shared chat messages: {exc}"
+                    ) from exc
+            selected.extend(
+                (sequence, path)
+                for sequence, path in immutable_entries
+                if sequence > after_sequence
+            )
         selected = sorted(selected)[: max(1, min(int(limit), 5000))]
 
         def read_message(item):
@@ -3301,10 +3462,21 @@ class LanRoomClient:
         self.user_name = str(user_name or "").strip()
         self.access_code = str(access_code or "").strip()
         self.timeout_seconds = float(timeout_seconds)
+        self.presence_session_id = uuid.uuid4().hex
         if not self.user_name:
             raise ValueError("Enter your display name")
         if not self.access_code:
             raise ValueError("Enter or import the LAN session code")
+
+    def presence(self, room_id, details):
+        return self._rpc(
+            "presence",
+            room_id,
+            {**(details or {}), "presence_session_id": self.presence_session_id},
+        )
+
+    def leave(self, room_id):
+        return self._rpc("leave", room_id, self.presence_session_id)
 
     def _rpc(self, method, *args, **kwargs):
         payload = json.dumps(
@@ -3805,6 +3977,9 @@ class LiveCollaborationController:
         self._join_context = None
         self._worker_results = queue.Queue()
         self._last_presence_send = 0.0
+        self._presence_worker_started_at = 0.0
+        self._presence_stall_status_second = -1
+        self._presence_last_observed = {}
         self._last_metadata_fetch = 0.0
         self._last_sync_poll = 0.0
         self._last_chat_poll = 0.0
@@ -6025,6 +6200,9 @@ class LiveCollaborationController:
             self.segment_locks_state.clear()
             self.pending_lock_changes.clear()
             self.presence_by_user.clear()
+            self._presence_last_observed.clear()
+            self._presence_worker_started_at = 0.0
+            self._presence_stall_status_second = -1
             self.room_roles_state.clear()
             self.review_states_state.clear()
             self.access_requests_state.clear()
@@ -6064,6 +6242,9 @@ class LiveCollaborationController:
             self._lock_pull_worker = None
             self._maintenance_worker = None
             self._last_presence_send = 0.0
+            self._presence_worker_started_at = 0.0
+            self._presence_stall_status_second = -1
+            self._presence_last_observed.clear()
             self._last_metadata_fetch = 0.0
             self._last_sync_poll = 0.0
             self._last_chat_poll = 0.0
@@ -6260,6 +6441,9 @@ class LiveCollaborationController:
         self.segment_locks_state.clear()
         self.pending_lock_changes.clear()
         self.presence_by_user.clear()
+        self._presence_last_observed.clear()
+        self._presence_worker_started_at = 0.0
+        self._presence_stall_status_second = -1
         self.room_roles_state.clear()
         self.review_states_state.clear()
         self.access_requests_state.clear()
@@ -7089,6 +7273,19 @@ class LiveCollaborationController:
             return
         if not self.connected:
             return
+        presence_worker_alive = (
+            self._presence_worker is not None
+            and self._presence_worker.is_alive()
+        )
+        if presence_worker_alive and self._presence_worker_started_at:
+            presence_delay = monotonic_now - self._presence_worker_started_at
+            if presence_delay >= PRESENCE_DELAY_WARNING_SECONDS:
+                delay_second = int(presence_delay)
+                if delay_second != self._presence_stall_status_second:
+                    self._presence_stall_status_second = delay_second
+                    # Do not turn one delayed NAS/server heartbeat into the
+                    # misleading claim that every collaborator disconnected.
+                    self._update_presence([])
         if _uses_shared_folder(self.client) and self._last_transport_result_at:
             response_silence = monotonic_now - self._last_transport_result_at
             response_state = shared_folder_response_state(response_silence)
@@ -7239,6 +7436,8 @@ class LiveCollaborationController:
         presence_idle = self._presence_worker is None or not self._presence_worker.is_alive()
         if presence_idle and (force_realtime or now - self._last_presence_send >= 0.75):
             self._last_presence_send = now
+            self._presence_worker_started_at = time.monotonic()
+            self._presence_stall_status_second = -1
             self._presence_worker = threading.Thread(
                 target=self._presence_lane,
                 args=(
@@ -7998,6 +8197,9 @@ class LiveCollaborationController:
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
             lane = str(result.get("lane") or "sync")
+            if lane == "presence":
+                self._presence_worker_started_at = 0.0
+                self._presence_stall_status_second = -1
             self.session_metrics.record(lane, float(result.get("duration", 0.0)))
             if isinstance(self.client, HybridRoomClient):
                 fallback_count = int(self.client.fallback_count)
@@ -9174,13 +9376,32 @@ class LiveCollaborationController:
             self.session_metrics.increment("operations_applied", applied_count)
 
     def _update_presence(self, users):
-        others = [entry for entry in users if entry.get("user") != self.user_name]
-        selected = self._combo_current_text(self.collaborator_combo)
-        self.presence_by_user = {
+        now = time.monotonic()
+        reported = {
             str(entry.get("user")): dict(entry)
-            for entry in others
-            if entry.get("user")
+            for entry in users
+            if entry.get("user") and entry.get("user") != self.user_name
         }
+        previous = dict(self.presence_by_user)
+        for user, entry in reported.items():
+            entry.pop("_presence_delayed", None)
+            entry.pop("_presence_delay_seconds", None)
+            self._presence_last_observed[user] = now
+        for user, entry in previous.items():
+            if user in reported:
+                continue
+            last_observed = float(self._presence_last_observed.get(user, 0.0))
+            delay = now - last_observed if last_observed else float("inf")
+            if delay <= PRESENCE_DISPLAY_GRACE_SECONDS:
+                delayed = dict(entry)
+                delayed["_presence_delayed"] = True
+                delayed["_presence_delay_seconds"] = round(delay, 1)
+                reported[user] = delayed
+            else:
+                self._presence_last_observed.pop(user, None)
+        others = [reported[user] for user in sorted(reported, key=str.casefold)]
+        selected = self._combo_current_text(self.collaborator_combo)
+        self.presence_by_user = {str(entry["user"]): dict(entry) for entry in others}
         self.collaborator_combo.blockSignals(True)
         self.collaborator_combo.clear()
         for user in sorted(self.presence_by_user, key=str.casefold):
@@ -9192,13 +9413,29 @@ class LiveCollaborationController:
         if not others:
             self.users_label.setText("Nobody else is connected")
         else:
-            labels = []
+            online_labels = []
+            delayed_labels = []
             for entry in others:
                 target = entry.get("active_segment_name") or entry.get("active_segment_id")
                 peer_version = str(entry.get("plugin_version") or "unknown version")
                 label = f"{entry['user']} (v{peer_version})"
-                labels.append(f"{label} — {target}" if target else label)
-            self.users_label.setText("Online: " + "  •  ".join(labels))
+                label = f"{label} — {target}" if target else label
+                if entry.get("_presence_delayed"):
+                    delayed_labels.append(
+                        f"{label} (last seen "
+                        f"{float(entry.get('_presence_delay_seconds', 0.0)):.0f} s ago)"
+                    )
+                else:
+                    online_labels.append(label)
+            lines = []
+            if online_labels:
+                lines.append("Online: " + "  •  ".join(online_labels))
+            if delayed_labels:
+                lines.append(
+                    "Presence delayed — waiting for NAS/server: "
+                    + "  •  ".join(delayed_labels)
+                )
+            self.users_label.setText("\n".join(lines))
             mismatched = [
                 entry
                 for entry in others

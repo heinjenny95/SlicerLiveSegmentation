@@ -1,4 +1,50 @@
-# Live Segmentation 0.13.0
+# Live Segmentation 0.13.1
+
+Version 0.13.1 repairs participant presence and live-feed latency failures
+reproduced on a real two-computer NAS session.
+
+## Reliable presence leases
+
+- Shared-folder presence uses a direct per-user lease update instead of an
+  atomic replace-over-existing. The tested NAS delayed those replacements for
+  more than a minute while ordinary operations still worked.
+- The participant line preserves a recently observed collaborator during a
+  transient heartbeat stall and explicitly shows `Presence delayed` instead
+  of falsely claiming that nobody else is connected.
+- Shared-folder and HTTPS/LAN presence records carry a unique connection-session
+  identifier. A delayed cleanup from an earlier leave/rejoin cycle cannot delete
+  the heartbeat belonging to the newer session.
+- The shared-folder lease lifetime is 60 seconds and the server-side lease is
+  45 seconds, allowing short rendering or storage stalls without masking a
+  confirmed disconnect forever.
+
+## Stale SMB cache recovery and lower latency
+
+- Shared-folder sequence allocation now cross-checks immutable operation files
+  instead of trusting `sequence-state.json` alone. This prevents two computers
+  from allocating the same sequence when one SMB client serves a stale cache.
+- Every operation is published to its immutable journal file before the compact
+  polling cache. The replaceable operation and chat cache files use a lightweight
+  direct update and are always rebuildable from immutable files.
+- Receivers fall back to the immutable operation or chat directory whenever the
+  compact state cache has not advanced. Fresh state still uses the existing
+  one-file fast path.
+
+## Verification
+
+- 66 automated tests pass, including stale operation-cache allocation, direct
+  NAS-safe presence writes, and leave/rejoin session isolation for shared-folder
+  and server modes.
+- An isolated eight-operation probe against the actual NAS produced unique
+  sequences 1–8. On this workstation, paired presence updates took at most
+  0.016 seconds, operation publication at most 0.047 seconds, and immediate
+  reads at most 0.016 seconds; the temporary diagnostic room was removed.
+- The duplicated sequence observed in the affected test room is now detected
+  by the regression scenario and cannot be produced by current clients.
+
+---
+
+# Previous release: Live Segmentation 0.13.0
 
 Version 0.13.0 adds publication-ready connection preflight and a supported
 self-hosted internet transport. Collaborators no longer need the same intranet,
