@@ -2,11 +2,11 @@ cmake_minimum_required(VERSION 3.16.3...3.19.7 FATAL_ERROR)
 
 project(SlicerLiveSegmentation)
 
-set(EXTENSION_VERSION "0.12.1")
+set(EXTENSION_VERSION "0.13.0")
 set(EXTENSION_HOMEPAGE "https://github.com/heinjenny95/SlicerLiveSegmentation")
 set(EXTENSION_CATEGORY "Segmentation")
 set(EXTENSION_CONTRIBUTORS "Jenny Hein (KIT)")
-set(EXTENSION_DESCRIPTION "Live collaboration for standard 3D Slicer segmentation nodes through a shared folder, direct LAN relay, or optional server.")
+set(EXTENSION_DESCRIPTION "Live collaboration for standard 3D Slicer segmentation nodes through a shared folder, direct LAN relay, or public HTTPS server.")
 set(EXTENSION_ICONURL "")
 set(EXTENSION_SCREENSHOTURLS "")
 set(EXTENSION_DEPENDS "NA")

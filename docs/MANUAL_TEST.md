@@ -208,6 +208,14 @@
 
 ## Advanced collaboration
 
+Before joining, run the publication preflight on computer A, then computer B,
+then computer A again. Confirm both computers report the other participant and
+the same plugin/protocol generation and source dataset. Repeat once with a
+different source volume and confirm joining is prevented. For Remote HTTPS
+server mode, verify a public `https://` endpoint and individual token pass;
+verify a non-loopback `http://` endpoint is rejected unless the session-only
+local-test override is checked.
+
 1. Move Alice's crosshair and slice views. On Thomas, select Alice and test
    **Jump to user** and **Follow view**. Confirm no voxel data changes.
 2. Paint on Alice and confirm Thomas sees a short-lived colored outline exactly

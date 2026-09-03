@@ -5,6 +5,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/__init__.py
   LiveSegmentationLib/collaboration.py
   LiveSegmentationLib/features.py
+  LiveSegmentationLib/version.py
 )
 
 set(MODULE_PYTHON_RESOURCES

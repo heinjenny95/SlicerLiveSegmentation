@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.12.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.13.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.12.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.13.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -114,6 +114,16 @@ Version 0.12.1 makes the module panel responsive on narrow and lower-resolution
 displays. Wide action rows wrap into compact grids, while long lists continue to
 use Slicer's normal scrolling. The measured minimum module-content width is 288
 pixels instead of 741 pixels in version 0.12.0.
+
+Version 0.13.0 adds a non-mutating two-computer **Check connection** preflight
+before joining. It validates endpoint/folder reachability, atomic shared-folder
+permissions, plugin and wire-protocol compatibility, source-volume identity,
+clock skew, authentication, transport security, and recent visibility of the
+other computer. The Remote HTTPS server mode works across ordinary internet
+connections without an institutional intranet, shared drive, or VPN. A bundled
+Docker Compose + Caddy deployment provides automatic TLS and per-user tokens;
+plain HTTP is rejected for non-loopback server addresses unless the user
+explicitly enables the local-test override.
 
 Drive letters may differ between computers as long as both paths refer to the
 same shared directory. The extension creates a `LiveSegmentation/rooms`
@@ -255,21 +265,29 @@ labels when scientifically appropriate, monitor Slicer process memory, and first
 test the intended volume, label count, undo settings, and network share on a
 representative workstation.
 
-## Optional collaboration server
+## Remote internet collaboration
 
-The connection selector also offers **Collaboration server**. This transport is
-optional and uses the same ordered-operation protocol. A localhost URL is only
-reachable on that one computer; collaborators on different computers need a
-shared network address.
+The connection selector offers **Remote HTTPS server**. This transport uses the
+same ordered-operation protocol and works for collaborators outside KIT or any
+other institutional network. A localhost URL is only reachable on that one
+computer. Internet collaborators enter the same public HTTPS URL and their own
+per-user access token; they do not need a shared folder.
 
-For institutional deployment, use per-user bearer tokens, a TLS reverse proxy,
-and the HTTPS enforcement option described in `docs/SERVER_DEPLOYMENT.md`. The
-legacy shared API key does not verify individual identities.
+The source release includes a reproducible public deployment under
+`deploy/public`: Caddy provides and renews TLS, the application server remains
+private inside Docker, and the token generator creates separate credentials.
+See `docs/SERVER_DEPLOYMENT.md`. The legacy shared API key does not verify
+individual identities and is not suitable for public exposure.
+
+Before joining through any transport, both computers should run **Check
+connection**. The check does not create or join the room. Run it on computer A,
+then B, then once more on A to confirm that each machine sees the other's
+two-minute preflight beacon. See `docs/TWO_COMPUTER_PREFLIGHT.md`.
 
 ## Verification
 
 - Ruff and Python compilation pass.
-- 54 automated transport, API, direct-LAN/fallback, crash-recovery, QA,
+- 62 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, crash-recovery, QA,
   chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.

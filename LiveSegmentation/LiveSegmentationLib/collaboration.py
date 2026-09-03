@@ -14,6 +14,7 @@ import getpass
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import os
 import queue
@@ -52,6 +53,11 @@ try:
         stable_user_color,
         validate_material_template,
     )
+    from .version import (
+        COLLABORATION_PROTOCOL_VERSION,
+        MINIMUM_COMPATIBLE_PLUGIN_VERSION,
+        PLUGIN_VERSION,
+    )
 except ImportError:  # regular-Python transport tests import this file directly
     from features import (  # type: ignore
         REVIEW_STATES,
@@ -68,10 +74,15 @@ except ImportError:  # regular-Python transport tests import this file directly
         stable_user_color,
         validate_material_template,
     )
+    from version import (  # type: ignore
+        COLLABORATION_PROTOCOL_VERSION,
+        MINIMUM_COMPATIBLE_PLUGIN_VERSION,
+        PLUGIN_VERSION,
+    )
 
 LIVE_ENCODING = "zlib-packbits-v1"
 SHARED_FOLDER_SCHEMA_VERSION = 2
-SHARED_FOLDER_MINIMUM_PLUGIN_VERSION = "0.11.2"
+SHARED_FOLDER_MINIMUM_PLUGIN_VERSION = MINIMUM_COMPATIBLE_PLUGIN_VERSION
 MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
@@ -85,6 +96,197 @@ SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 15.0
 SHARED_FOLDER_SLOW_RESPONSE_SECONDS = 10.0
 SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 30.0
 RECENT_SHARED_FOLDER_LIMIT = 8
+PREFLIGHT_PARTICIPANT_TTL_SECONDS = 120.0
+PREFLIGHT_TIMEOUT_SECONDS = 20.0
+
+
+def _version_tuple(value):
+    """Return a comparable numeric prefix for a release version."""
+    numbers = re.findall(r"\d+", str(value or ""))
+    return tuple(int(item) for item in numbers[:3]) or (0,)
+
+
+def validate_remote_server_url(value, allow_insecure_http=False):
+    """Validate the publication-facing server transport security policy."""
+    normalized = normalize_server_url(value)
+    parsed = urllib.parse.urlparse(normalized)
+    host = str(parsed.hostname or "").strip().casefold()
+    loopback = host == "localhost"
+    if not loopback:
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+    if parsed.scheme != "https" and not loopback and not bool(allow_insecure_http):
+        raise ValueError(
+            "Remote collaboration servers must use HTTPS. Enable insecure HTTP only "
+            "for an explicitly trusted local test server."
+        )
+    return normalized
+
+
+def _preflight_check(check_id, status, title, detail, action=""):
+    return {
+        "id": str(check_id),
+        "status": str(status),
+        "title": str(title),
+        "detail": str(detail),
+        "action": str(action or ""),
+    }
+
+
+def finalize_preflight_report(report):
+    """Normalize checks and derive one pass/warning/fail result."""
+    checks = [dict(item) for item in report.get("checks") or []]
+    statuses = {str(item.get("status") or "warning") for item in checks}
+    status = "fail" if "fail" in statuses else "warning" if "warning" in statuses else "pass"
+    return {
+        "format": "live-segmentation-preflight-v1",
+        **report,
+        "status": status,
+        "checks": checks,
+    }
+
+
+def capability_preflight_report(raw, transport, latency_seconds, secure_transport=True):
+    """Convert a server/relay capability response into actionable checks."""
+    raw = dict(raw or {})
+    checks = [
+        _preflight_check(
+            "connection",
+            "pass",
+            "Connection",
+            f"The collaboration endpoint answered in {float(latency_seconds) * 1000.0:.0f} ms.",
+        ),
+        _preflight_check(
+            "transport-security",
+            "pass" if secure_transport else "warning",
+            "Transport security",
+            "HTTPS protects credentials and collaboration data in transit."
+            if secure_transport
+            else "This connection is unencrypted and suitable only for a trusted LAN or local test.",
+            "Use the Remote HTTPS server mode for internet collaboration."
+            if not secure_transport
+            else "",
+        ),
+    ]
+    remote_protocol = int(raw.get("protocol_version", 0) or 0)
+    checks.append(
+        _preflight_check(
+            "protocol",
+            "pass" if remote_protocol == COLLABORATION_PROTOCOL_VERSION else "fail",
+            "Collaboration protocol",
+            f"Local protocol {COLLABORATION_PROTOCOL_VERSION}; remote protocol "
+            f"{remote_protocol or 'unknown'}.",
+            "Install the same current Live Segmentation release on both computers."
+            if remote_protocol != COLLABORATION_PROTOCOL_VERSION
+            else "",
+        )
+    )
+    remote_version = str(raw.get("server_version") or raw.get("version") or "")
+    checks.append(
+        _preflight_check(
+            "endpoint-version",
+            "pass" if remote_version == PLUGIN_VERSION else "warning",
+            "Endpoint version",
+            f"Plugin {PLUGIN_VERSION}; endpoint {remote_version or 'unknown'}.",
+            "Update the server and plugin to the same current release."
+            if remote_version != PLUGIN_VERSION
+            else "",
+        )
+    )
+    minimum = str(raw.get("minimum_plugin_version") or "")
+    compatible = not minimum or _version_tuple(PLUGIN_VERSION) >= _version_tuple(minimum)
+    checks.append(
+        _preflight_check(
+            "plugin-version",
+            "pass" if compatible else "fail",
+            "Plugin version",
+            f"This computer uses {PLUGIN_VERSION}; the endpoint requires {minimum or 'no stated minimum'}.",
+            "Update Live Segmentation before joining." if not compatible else "",
+        )
+    )
+    room_exists = bool(raw.get("room_exists"))
+    compatible_room = bool(raw.get("room_compatible", True))
+    checks.append(
+        _preflight_check(
+            "source-volume",
+            "pass" if compatible_room else "fail",
+            "Source volume",
+            "The room already exists and its source-volume signature matches."
+            if room_exists and compatible_room
+            else "The room does not exist yet; this dataset can initialize it."
+            if not room_exists
+            else "The existing room belongs to a different source volume.",
+            "Load exactly the same source dataset or choose another room name."
+            if not compatible_room
+            else "",
+        )
+    )
+    peers = [
+        item
+        for item in raw.get("preflight_participants") or []
+        if str(item.get("user") or "") != str(raw.get("request_user") or "")
+    ]
+    incompatible_peers = [
+        item
+        for item in peers
+        if int(item.get("protocol_version", 0) or 0) != COLLABORATION_PROTOCOL_VERSION
+        or str(item.get("plugin_version") or "") != PLUGIN_VERSION
+        or str(item.get("volume_signature") or "") != str(raw.get("requested_volume_signature") or "")
+    ]
+    checks.append(
+        _preflight_check(
+            "peer-computer",
+            "fail" if incompatible_peers else "pass" if peers else "warning",
+            "Second computer",
+            f"Detected {len(peers)} other compatible preflight participant(s)."
+            if peers and not incompatible_peers
+            else f"Detected {len(incompatible_peers)} participant(s) with a protocol or dataset mismatch."
+            if incompatible_peers
+            else "No second computer has run this preflight for the same room in the last two minutes.",
+            "Run Check connection on the other computer, then rerun it here."
+            if not peers
+            else "Install the same release and load the same source data on every computer."
+            if incompatible_peers
+            else "",
+        )
+    )
+    server_time = raw.get("server_time_epoch")
+    if server_time is not None:
+        offset = float(server_time) - time.time()
+        checks.append(
+            _preflight_check(
+                "clock",
+                "warning" if abs(offset) > 5.0 else "pass",
+                "Computer clock",
+                f"Clock difference is approximately {offset:+.1f} seconds.",
+                "Synchronize both computers with automatic internet time."
+                if abs(offset) > 5.0
+                else "",
+            )
+        )
+    authentication = str(raw.get("authentication") or "")
+    if authentication:
+        checks.append(
+            _preflight_check(
+                "authentication",
+                "warning" if authentication == "open-testing" else "pass",
+                "Authentication",
+                f"Server authentication mode: {authentication}.",
+                "Configure per-user access tokens before exposing this server to the internet."
+                if authentication == "open-testing"
+                else "",
+            )
+        )
+    return finalize_preflight_report(
+        {
+            "transport": str(transport),
+            "latency_seconds": round(float(latency_seconds), 4),
+            "remote_version": raw.get("server_version") or raw.get("version"),
+            "checks": checks,
+        }
+    )
 
 
 def shared_folder_response_state(elapsed_seconds):
@@ -851,6 +1053,34 @@ class LiveRoomClient:
             {"room_name": room_name, "volume_signature": signature},
         )
 
+    def preflight(
+        self,
+        room_name,
+        signature,
+        plugin_version=PLUGIN_VERSION,
+        protocol_version=COLLABORATION_PROTOCOL_VERSION,
+    ):
+        started = time.monotonic()
+        result = self._request(
+            "POST",
+            "/api/live/preflight",
+            {
+                "room_name": room_name,
+                "volume_signature": signature,
+                "plugin_version": plugin_version,
+                "protocol_version": int(protocol_version),
+            },
+        )
+        result = dict(result or {})
+        result["request_user"] = self.user_name
+        result["requested_volume_signature"] = str(signature)
+        return capability_preflight_report(
+            result,
+            "remote-https-server",
+            time.monotonic() - started,
+            secure_transport=urllib.parse.urlparse(self.server_url).scheme == "https",
+        )
+
     def push_operation(self, room_id, operation):
         return self._request("POST", f"/api/live/rooms/{room_id}/operations", operation)
 
@@ -1293,6 +1523,154 @@ class SharedFolderRoomClient:
                 daemon=True,
             )
             self._artifact_worker.start()
+
+    def preflight(
+        self,
+        room_name,
+        signature,
+        plugin_version=PLUGIN_VERSION,
+        protocol_version=COLLABORATION_PROTOCOL_VERSION,
+    ):
+        """Probe a shared location and room without joining or creating the room."""
+        started = time.monotonic()
+        room_key = self._room_key(room_name)
+        preflight_path = (
+            self.shared_folder / "LiveSegmentation" / "preflight" / room_key
+        )
+        participants_path = preflight_path / "participants"
+        try:
+            participants_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise LiveCollaborationError(
+                f"The shared folder is not writable: {self.shared_folder}: {exc}"
+            ) from exc
+
+        participant_name = (
+            f"{_safe_file_component(self.user_name, 'user', 28)}--"
+            f"{hashlib.sha256(self.user_name.encode('utf-8')).hexdigest()[:12]}.json"
+        )
+        participant_path = participants_path / participant_name
+        participant = {
+            "user": self.user_name,
+            "plugin_version": str(plugin_version),
+            "protocol_version": int(protocol_version),
+            "volume_signature": str(signature),
+            "updated_at": _utc_iso(),
+            "updated_epoch": time.time(),
+        }
+        _write_json_atomic(participant_path, participant, durable=False)
+        if _read_json_file(participant_path) != participant:
+            raise LiveCollaborationError("Shared-folder read/write preflight was inconsistent")
+        try:
+            server_mtime = participant_path.stat().st_mtime
+        except OSError as exc:
+            raise LiveCollaborationError(f"Could not stat shared preflight file: {exc}") from exc
+        clock_offset = float(server_mtime) - float(participant["updated_epoch"])
+
+        participants = []
+        estimated_server_now = time.time() + clock_offset
+        try:
+            candidate_paths = list(participants_path.glob("*.json"))
+        except OSError as exc:
+            raise LiveCollaborationError(f"Could not list shared preflight participants: {exc}") from exc
+        for path in candidate_paths:
+            try:
+                if estimated_server_now - path.stat().st_mtime > PREFLIGHT_PARTICIPANT_TTL_SECONDS:
+                    continue
+                data = _read_json_file(path)
+                if isinstance(data, dict):
+                    participants.append(data)
+            except (LiveCollaborationError, OSError, TypeError, ValueError):
+                continue
+
+        room_path = self.rooms_root / room_key
+        metadata_path = room_path / "room.json"
+        metadata = _read_json_file(metadata_path) if metadata_path.is_file() else None
+        room_exists = metadata is not None
+        schema_version = int(metadata.get("schema_version", 0) or 0) if metadata else 0
+        room_compatible = not metadata or metadata.get("volume_signature") == str(signature)
+        schema_compatible = not metadata or schema_version in {1, SHARED_FOLDER_SCHEMA_VERSION}
+        minimum = str(
+            metadata.get("minimum_plugin_version") or SHARED_FOLDER_MINIMUM_PLUGIN_VERSION
+        ) if metadata else SHARED_FOLDER_MINIMUM_PLUGIN_VERSION
+        plugin_compatible = _version_tuple(plugin_version) >= _version_tuple(minimum)
+        peers = [item for item in participants if item.get("user") != self.user_name]
+        incompatible_peers = [
+            item
+            for item in peers
+            if int(item.get("protocol_version", 0) or 0) != int(protocol_version)
+            or str(item.get("plugin_version") or "") != str(plugin_version)
+            or str(item.get("volume_signature") or "") != str(signature)
+        ]
+        checks = [
+            _preflight_check(
+                "connection",
+                "pass",
+                "Shared-folder connection",
+                f"Atomic read/write succeeded in {((time.monotonic() - started) * 1000.0):.0f} ms.",
+            ),
+            _preflight_check(
+                "permissions",
+                "pass",
+                "Permissions",
+                "This computer can create, replace, read, and list collaboration files.",
+            ),
+            _preflight_check(
+                "room-format",
+                "pass" if schema_compatible and plugin_compatible else "fail",
+                "Room format and plugin",
+                f"Plugin {plugin_version}; room schema {schema_version if room_exists else 'new'}; "
+                f"minimum plugin {minimum}.",
+                "Install the same current Live Segmentation release on every computer."
+                if not schema_compatible or not plugin_compatible
+                else "",
+            ),
+            _preflight_check(
+                "source-volume",
+                "pass" if room_compatible else "fail",
+                "Source volume",
+                "The existing room uses the same source-volume signature."
+                if room_exists and room_compatible
+                else "The room does not exist yet; this dataset can initialize it."
+                if not room_exists
+                else "The existing room belongs to a different source volume.",
+                "Load exactly the same dataset or use another room name."
+                if not room_compatible
+                else "",
+            ),
+            _preflight_check(
+                "peer-computer",
+                "fail" if incompatible_peers else "pass" if peers else "warning",
+                "Second computer",
+                f"Detected {len(peers)} other compatible preflight participant(s)."
+                if peers and not incompatible_peers
+                else f"Detected {len(incompatible_peers)} participant(s) with a protocol or dataset mismatch."
+                if incompatible_peers
+                else "No second computer has run this check for the same room in the last two minutes.",
+                "Run Check connection on the other computer, then rerun it here."
+                if not peers
+                else "Use the same release and source data on all computers."
+                if incompatible_peers
+                else "",
+            ),
+            _preflight_check(
+                "clock",
+                "warning" if abs(clock_offset) > 5.0 else "pass",
+                "Computer/share clock",
+                f"Estimated clock difference is {clock_offset:+.1f} seconds.",
+                "Enable automatic clock synchronization on both computers."
+                if abs(clock_offset) > 5.0
+                else "",
+            ),
+        ]
+        return finalize_preflight_report(
+            {
+                "transport": "shared-folder",
+                "latency_seconds": round(time.monotonic() - started, 4),
+                "remote_version": None,
+                "checks": checks,
+            }
+        )
 
     def join(self, room_name, signature):
         room_key = self._room_key(room_name)
@@ -2762,6 +3140,7 @@ class SharedFolderRoomClient:
 
 
 LAN_RELAY_METHODS = {
+    "preflight",
     "join",
     "push_operation",
     "operations",
@@ -2848,7 +3227,10 @@ class LanRelayServer:
         client = self._client(payload.get("user"))
         args = payload.get("args") or []
         kwargs = payload.get("kwargs") or {}
-        return getattr(client, method)(*args, **kwargs)
+        result = getattr(client, method)(*args, **kwargs)
+        if method == "preflight" and isinstance(result, dict):
+            result["remote_version"] = PLUGIN_VERSION
+        return result
 
     def start(self):
         if self._httpd is not None:
@@ -2956,6 +3338,65 @@ class LanRoomClient:
         if not isinstance(result, dict) or "result" not in result:
             raise LiveCollaborationError("The LAN relay returned an invalid response")
         return result["result"]
+
+    def preflight(
+        self,
+        room_name,
+        signature,
+        plugin_version=PLUGIN_VERSION,
+        protocol_version=COLLABORATION_PROTOCOL_VERSION,
+    ):
+        started = time.monotonic()
+        report = dict(
+            self._rpc(
+                "preflight",
+                room_name,
+                signature,
+                plugin_version,
+                int(protocol_version),
+            )
+            or {}
+        )
+        checks = list(report.get("checks") or [])
+        checks.insert(
+            0,
+            _preflight_check(
+                "direct-lan",
+                "pass",
+                "Direct LAN relay",
+                f"Authenticated relay request completed in {(time.monotonic() - started) * 1000.0:.0f} ms.",
+            ),
+        )
+        checks.insert(
+            1,
+            _preflight_check(
+                "relay-version",
+                "pass" if report.get("remote_version") == PLUGIN_VERSION else "fail",
+                "LAN host version",
+                f"Plugin {PLUGIN_VERSION}; LAN host {report.get('remote_version') or 'unknown'}.",
+                "Install the same current release on the LAN host and every participant."
+                if report.get("remote_version") != PLUGIN_VERSION
+                else "",
+            ),
+        )
+        checks.insert(
+            2,
+            _preflight_check(
+                "transport-security",
+                "warning",
+                "LAN transport security",
+                "The built-in LAN relay is unencrypted and intended only for a trusted LAN or VPN.",
+                "For collaborators outside the local network, use a Remote HTTPS server.",
+            ),
+        )
+        return finalize_preflight_report(
+            {
+                **report,
+                "transport": "direct-lan",
+                "latency_seconds": round(time.monotonic() - started, 4),
+                "checks": checks,
+            }
+        )
 
     def __getattr__(self, name):
         if name not in LAN_RELAY_METHODS:
@@ -3119,6 +3560,75 @@ class HybridRoomClient:
         self.fallback_count += 1
         return self._fallback_room
 
+    def preflight(
+        self,
+        room_name,
+        signature,
+        plugin_version=PLUGIN_VERSION,
+        protocol_version=COLLABORATION_PROTOCOL_VERSION,
+    ):
+        def run_lan():
+            return self.lan_client.preflight(
+                room_name, signature, plugin_version, protocol_version
+            )
+
+        def run_fallback():
+            if self.fallback_client is None:
+                return None
+            return self.fallback_client.preflight(
+                room_name, signature, plugin_version, protocol_version
+            )
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {"direct": executor.submit(run_lan)}
+            if self.fallback_client is not None:
+                futures["fallback"] = executor.submit(run_fallback)
+            for name, future in futures.items():
+                try:
+                    results[name] = future.result()
+                except Exception as exc:
+                    results[name] = finalize_preflight_report(
+                        {
+                            "transport": name,
+                            "checks": [
+                                _preflight_check(
+                                    f"{name}-connection",
+                                    "fail",
+                                    "Direct LAN" if name == "direct" else "Fallback folder",
+                                    str(exc),
+                                    "Check the address, code, firewall, and network route."
+                                    if name == "direct"
+                                    else "Check that the shared folder is reachable and writable.",
+                                )
+                            ],
+                        }
+                    )
+        direct = results["direct"]
+        fallback = results.get("fallback")
+        checks = [
+            {**item, "id": f"direct-{item.get('id')}"}
+            for item in direct.get("checks") or []
+        ]
+        if fallback is not None:
+            checks.extend(
+                {**item, "id": f"fallback-{item.get('id')}", "title": f"Fallback: {item.get('title')}"}
+                for item in fallback.get("checks") or []
+            )
+        report = finalize_preflight_report(
+            {
+                "transport": "direct-lan-with-shared-folder-fallback"
+                if fallback is not None
+                else "direct-lan",
+                "checks": checks,
+                "direct_lan": direct,
+                "fallback": fallback,
+            }
+        )
+        if direct.get("status") == "fail" and fallback and fallback.get("status") != "fail":
+            report["status"] = "warning"
+        return report
+
     def leave(self, room_id):
         result = None
         for client in (self.lan_client, self.fallback_client):
@@ -3253,6 +3763,7 @@ class LiveCollaborationController:
         self.initial_sync_complete = False
         self.segmentation_node_id = None
         self.volume_shape = None
+        self.source_volume_signature = None
         self.baselines = {}
         self.baseline_bounds = {}
         self.dirty_segments = set()
@@ -3285,6 +3796,9 @@ class LiveCollaborationController:
         self._lock_pull_worker = None
         self._maintenance_worker = None
         self._join_worker = None
+        self._preflight_worker = None
+        self._preflight_running = False
+        self._preflight_started_at = 0.0
         self._joining = False
         self._join_started_at = 0.0
         self._join_status_second = -1
@@ -3382,7 +3896,8 @@ class LiveCollaborationController:
         layout = qt.QVBoxLayout(self.group)
         explanation = qt.QLabel(
             "Join the same room to see each other's segmentation changes automatically. "
-            "Use a shared/network folder without a server, or connect to a collaboration server."
+            "Use a shared/network folder, a trusted local LAN, or a Remote HTTPS server "
+            "for collaborators anywhere on the internet."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -3395,7 +3910,7 @@ class LiveCollaborationController:
         self.transport_combo = qt.QComboBox()
         self.transport_combo.addItem("Shared/network folder")
         self.transport_combo.addItem("Direct LAN + shared-folder fallback")
-        self.transport_combo.addItem("Collaboration server")
+        self.transport_combo.addItem("Remote HTTPS server")
         self.transport_combo.setCurrentIndex(2 if default_transport == "server" else 0)
         identity_layout.addRow("Name", self.user_edit)
         identity_layout.addRow("Room", self.room_edit)
@@ -3439,6 +3954,13 @@ class LiveCollaborationController:
         self.join_button.clicked.connect(self.toggle_connection)
         connection_actions = qt.QGridLayout()
         connection_actions.addWidget(self.join_button, 0, 0, 1, 2)
+        self.preflight_button = qt.QPushButton("Check connection")
+        self.preflight_button.setToolTip(
+            "Test reachability, permissions, protocol, plugin compatibility, source data, "
+            "clock skew, and whether the second computer can see the same room"
+        )
+        self.preflight_button.clicked.connect(self.run_connection_preflight)
+        connection_actions.addWidget(self.preflight_button, 1, 0, 1, 2)
         self.refresh_button = qt.QPushButton("Sync now")
         self.refresh_button.setToolTip(
             "Immediately request new edits, participants, chat, and label locks. "
@@ -3446,14 +3968,14 @@ class LiveCollaborationController:
         )
         self.refresh_button.enabled = False
         self.refresh_button.clicked.connect(self.refresh_now)
-        connection_actions.addWidget(self.refresh_button, 1, 0)
+        connection_actions.addWidget(self.refresh_button, 2, 0)
         self.benchmark_button = qt.QPushButton("Benchmark")
         self.benchmark_button.setToolTip(
             "Measure non-destructive health and live-feed round trips for this room"
         )
         self.benchmark_button.enabled = False
         self.benchmark_button.clicked.connect(self.run_connection_benchmark)
-        connection_actions.addWidget(self.benchmark_button, 1, 1)
+        connection_actions.addWidget(self.benchmark_button, 2, 1)
         connection_actions.setColumnStretch(0, 1)
         connection_actions.setColumnStretch(1, 1)
         layout.addLayout(connection_actions)
@@ -3465,6 +3987,13 @@ class LiveCollaborationController:
         self.users_label = qt.QLabel("Nobody else is connected")
         self.users_label.setWordWrap(True)
         layout.addWidget(self.users_label)
+        self.preflight_text = qt.QPlainTextEdit()
+        self.preflight_text.setReadOnly(True)
+        self.preflight_text.setMaximumHeight(165)
+        self.preflight_text.setPlaceholderText(
+            "Run Check connection on both computers before joining. The check does not create or enter the room."
+        )
+        layout.addWidget(self.preflight_text)
         presence_actions = qt.QGridLayout()
         self.collaborator_combo = qt.QComboBox()
         self.collaborator_combo.setToolTip("Select an online collaborator")
@@ -3868,14 +4397,25 @@ class LiveCollaborationController:
         layout.addWidget(recovery_group)
 
         self.server_settings = ctk.ctkCollapsibleButton()
-        self.server_settings.text = "Server settings"
+        self.server_settings.text = "Remote HTTPS server"
         self.server_settings.collapsed = True
         advanced_layout = qt.QFormLayout(self.server_settings)
         self.server_edit = qt.QLineEdit(default_server)
         self.api_key_edit = qt.QLineEdit()
         self.api_key_edit.echoMode = qt.QLineEdit.Password
-        advanced_layout.addRow("Collaboration server", self.server_edit)
-        advanced_layout.addRow("API key (optional)", self.api_key_edit)
+        self.allow_insecure_http_checkbox = qt.QCheckBox(
+            "Allow insecure HTTP for a trusted local test only"
+        )
+        self.allow_insecure_http_checkbox.checked = False
+        self.server_security_label = qt.QLabel(
+            "For internet use, enter the same public https:// address and an individual "
+            "access token on every computer. No institutional intranet or shared drive is required."
+        )
+        self.server_security_label.setWordWrap(True)
+        advanced_layout.addRow("Server URL", self.server_edit)
+        advanced_layout.addRow("Access token", self.api_key_edit)
+        advanced_layout.addRow(self.allow_insecure_http_checkbox)
+        advanced_layout.addRow(self.server_security_label)
         layout.addWidget(self.server_settings)
 
         self.lan_settings = ctk.ctkCollapsibleButton()
@@ -5136,6 +5676,156 @@ class LiveCollaborationController:
         except Exception as exc:
             self._show_error(f"Could not import invitation: {exc}", popup=True)
 
+    def _allow_insecure_server_http(self):
+        checked = self.allow_insecure_http_checkbox.checked
+        return bool(checked() if callable(checked) else checked)
+
+    def _build_connection_client(self, user_name, transport_mode):
+        """Build the selected transport without joining or touching room state."""
+        if transport_mode == "shared-folder":
+            location = self._text(self.shared_folder_edit)
+            return SharedFolderRoomClient(location, user_name), location
+        if transport_mode == "direct-lan":
+            host_locally = self.lan_host_checkbox.checked
+            host_locally = host_locally() if callable(host_locally) else host_locally
+            if host_locally and self.lan_server is None:
+                self.toggle_lan_host()
+                if self.lan_server is None:
+                    raise ValueError("The local LAN relay could not be started")
+            lan_url = self._text(self.lan_url_edit)
+            lan_client = LanRoomClient(
+                lan_url,
+                user_name,
+                self._text(self.lan_access_code_edit),
+            )
+            shared_folder = self._text(self.shared_folder_edit)
+            fallback_client = (
+                SharedFolderRoomClient(shared_folder, user_name)
+                if shared_folder
+                else None
+            )
+            return HybridRoomClient(lan_client, fallback_client), "\0".join(
+                (lan_url, shared_folder)
+            )
+        server_url = validate_remote_server_url(
+            self._text(self.server_edit),
+            allow_insecure_http=self._allow_insecure_server_http(),
+        )
+        return (
+            LiveRoomClient(
+                server_url,
+                user_name,
+                self._text(self.api_key_edit),
+            ),
+            server_url,
+        )
+
+    @staticmethod
+    def _preflight_lane(session_token, result_queue, client, room_name, signature):
+        started = time.monotonic()
+        try:
+            report = client.preflight(
+                room_name,
+                signature,
+                PLUGIN_VERSION,
+                COLLABORATION_PROTOCOL_VERSION,
+            )
+            result_queue.put(
+                {
+                    "lane": "preflight",
+                    "session_token": session_token,
+                    "report": report,
+                    "duration": time.monotonic() - started,
+                }
+            )
+        except Exception as exc:
+            result_queue.put(
+                {
+                    "lane": "preflight",
+                    "session_token": session_token,
+                    "error": str(exc),
+                    "duration": time.monotonic() - started,
+                }
+            )
+
+    def run_connection_preflight(self, checked=False):
+        del checked
+        if self._preflight_running or self.connected or self._joining:
+            return
+        try:
+            user_name = self._text(self.user_edit)
+            if not user_name:
+                raise ValueError("Enter your display name")
+            room_name = self._text(self.room_edit)
+            if not room_name:
+                raise ValueError("Enter a room name that all collaborators will use")
+            signature = self._current_volume_signature()
+            client, _location = self._build_connection_client(
+                user_name, self._transport_mode()
+            )
+            self._preflight_running = True
+            self._preflight_started_at = time.monotonic()
+            self._set_connection_inputs_enabled(False)
+            self.join_button.enabled = False
+            self.preflight_button.setText("Checking…")
+            self.preflight_text.setPlainText(
+                "Checking connection, permissions, protocol, source volume, clock, and peer visibility…"
+            )
+            self.status_label.setText("● Running connection check in background…")
+            self.status_label.setStyleSheet("color: #b26a00;")
+            self.timer.start()
+            self._preflight_worker = threading.Thread(
+                target=self._preflight_lane,
+                args=(
+                    self._session_token,
+                    self._worker_results,
+                    client,
+                    room_name,
+                    signature,
+                ),
+                name="LiveSegmentation-preflight",
+                daemon=True,
+            )
+            self._preflight_worker.start()
+        except Exception as exc:
+            self._preflight_running = False
+            self._preflight_started_at = 0.0
+            self._set_connection_inputs_enabled(True)
+            self.join_button.enabled = True
+            self.preflight_button.setText("Check connection")
+            self._show_error(f"Connection check could not start: {exc}", popup=True)
+
+    def _show_preflight_report(self, report):
+        status = str(report.get("status") or "fail")
+        status_label = {
+            "pass": "READY",
+            "warning": "READY WITH WARNINGS",
+            "fail": "NOT READY",
+        }.get(status, "NOT READY")
+        lines = [
+            f"{status_label} — {report.get('transport') or 'connection'}",
+            "Run this check on both computers; rerun the first computer to confirm peer visibility.",
+            "",
+        ]
+        symbols = {"pass": "[PASS]", "warning": "[WARN]", "fail": "[FAIL]"}
+        for check in report.get("checks") or []:
+            check_status = str(check.get("status") or "warning")
+            lines.append(
+                f"{symbols.get(check_status, '[WARN]')} {check.get('title')}: {check.get('detail')}"
+            )
+            if check.get("action"):
+                lines.append(f"       Action: {check['action']}")
+        self.preflight_text.setPlainText("\n".join(lines))
+        if status == "pass":
+            self.status_label.setText("● Connection check passed — ready to join")
+            self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
+        elif status == "warning":
+            self.status_label.setText("● Connection works, but review the warnings below")
+            self.status_label.setStyleSheet("color: #b26a00; font-weight: bold;")
+        else:
+            self.status_label.setText("● Connection check failed — fix the items below")
+            self.status_label.setStyleSheet("color: #c5221f; font-weight: bold;")
+
     def _set_connection_inputs_enabled(self, enabled):
         enabled = bool(enabled)
         self.user_edit.enabled = enabled
@@ -5146,11 +5836,13 @@ class LiveCollaborationController:
         self.shared_folder_clear_button.enabled = enabled
         self.server_edit.enabled = enabled
         self.api_key_edit.enabled = enabled
+        self.allow_insecure_http_checkbox.enabled = enabled
         self.lan_url_edit.enabled = enabled
         self.lan_access_code_edit.enabled = enabled
         self.lan_host_checkbox.enabled = enabled
         self.lan_port_spin.enabled = enabled
         self.lan_host_button.enabled = enabled
+        self.preflight_button.enabled = enabled and not self._preflight_running
 
     @staticmethod
     def _leave_client_in_background(client, room_id):
@@ -5178,6 +5870,9 @@ class LiveCollaborationController:
         self._join_status_second = -1
         self._join_context = None
         self._join_worker = None
+        self._preflight_running = False
+        self._preflight_worker = None
+        self._preflight_started_at = 0.0
         self.connection_healthy = False
         self._set_connection_inputs_enabled(True)
         self.owner.set_live_inputs_enabled(True)
@@ -5239,43 +5934,9 @@ class LiveCollaborationController:
                     "The selected source volume does not match the imported invitation"
                 )
             transport_mode = self._transport_mode()
-            if transport_mode == "shared-folder":
-                client = SharedFolderRoomClient(
-                    self._text(self.shared_folder_edit),
-                    user_name,
-                )
-                connection_location = self._text(self.shared_folder_edit)
-            elif transport_mode == "direct-lan":
-                host_locally = self.lan_host_checkbox.checked
-                host_locally = (
-                    host_locally() if callable(host_locally) else host_locally
-                )
-                if host_locally and self.lan_server is None:
-                    self.toggle_lan_host()
-                    if self.lan_server is None:
-                        raise ValueError("The local LAN relay could not be started")
-                lan_client = LanRoomClient(
-                    self._text(self.lan_url_edit),
-                    user_name,
-                    self._text(self.lan_access_code_edit),
-                )
-                shared_folder = self._text(self.shared_folder_edit)
-                fallback_client = (
-                    SharedFolderRoomClient(shared_folder, user_name)
-                    if shared_folder
-                    else None
-                )
-                client = HybridRoomClient(lan_client, fallback_client)
-                connection_location = "\0".join(
-                    (self._text(self.lan_url_edit), shared_folder)
-                )
-            else:
-                client = LiveRoomClient(
-                    self._text(self.server_edit),
-                    user_name,
-                    self._text(self.api_key_edit),
-                )
-                connection_location = self._text(self.server_edit)
+            client, connection_location = self._build_connection_client(
+                user_name, transport_mode
+            )
             self._join_context = {
                 "user_name": user_name,
                 "room_name": room_name,
@@ -5336,6 +5997,7 @@ class LiveCollaborationController:
             self.user_name = context["user_name"]
             self.segmentation_node_id = segmentation_node.GetID()
             self.volume_shape = tuple(context["volume_shape"])
+            self.source_volume_signature = str(context["volume_signature"])
             self.last_sequence = 0
             self.initial_sequence = int(room.get("latest_sequence", 0))
             self.initial_sync_complete = self.initial_sequence == 0
@@ -5549,6 +6211,9 @@ class LiveCollaborationController:
         self._join_status_second = -1
         self._join_context = None
         self._join_worker = None
+        self._preflight_running = False
+        self._preflight_worker = None
+        self._preflight_started_at = 0.0
         self.connected = False
         self.connection_healthy = False
         self._connection_validation_pending = False
@@ -5569,6 +6234,7 @@ class LiveCollaborationController:
         self.user_name = None
         self.segmentation_node_id = None
         self.volume_shape = None
+        self.source_volume_signature = None
         self.last_sequence = 0
         self.initial_sequence = 0
         self.initial_sync_complete = False
@@ -5635,14 +6301,8 @@ class LiveCollaborationController:
             self.owner.clear_live_segmentation(segmentation_node_id)
         except Exception:
             pass
-        self.user_edit.enabled = True
-        self.room_edit.enabled = True
-        self.transport_combo.enabled = True
-        self.shared_folder_edit.enabled = True
-        self.shared_folder_button.enabled = True
-        self.shared_folder_clear_button.enabled = True
-        self.server_edit.enabled = True
-        self.api_key_edit.enabled = True
+        self._set_connection_inputs_enabled(True)
+        self.preflight_button.setText("Check connection")
         self.backup_enabled_checkbox.enabled = True
         self._on_backup_settings_changed()
         self.owner.set_live_inputs_enabled(True)
@@ -5676,6 +6336,7 @@ class LiveCollaborationController:
         self.review_queue_tree.clear()
         self.backup_tree.clear()
         self.diagnostics_text.clear()
+        self.preflight_text.clear()
         self.quality_text.clear()
         self.performance_label.setText("No live performance samples yet")
         if self.activity_dock_text is not None:
@@ -6313,6 +6974,13 @@ class LiveCollaborationController:
         details = self._current_location()
         details["color"] = [round(value, 4) for value in stable_user_color(self.user_name)]
         details["role"] = self._current_role()
+        details["plugin_version"] = PLUGIN_VERSION
+        details["protocol_version"] = COLLABORATION_PROTOCOL_VERSION
+        details["transport"] = self._transport_mode()
+        if self.source_volume_signature:
+            details["volume_signature_hash"] = hashlib.sha256(
+                self.source_volume_signature.encode("utf-8")
+            ).hexdigest()[:16]
         try:
             _, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
             node = self._segmentation_node()
@@ -6364,6 +7032,37 @@ class LiveCollaborationController:
     def on_timer(self):
         self._drain_worker_results()
         monotonic_now = time.monotonic()
+        if self._preflight_running:
+            elapsed = monotonic_now - self._preflight_started_at
+            self.preflight_button.setText(
+                f"Checking… {int(max(0.0, elapsed))} s"
+            )
+            if elapsed >= PREFLIGHT_TIMEOUT_SECONDS:
+                self._session_token += 1
+                self._preflight_running = False
+                self._preflight_worker = None
+                self._preflight_started_at = 0.0
+                self._set_connection_inputs_enabled(True)
+                self.join_button.enabled = True
+                self.preflight_button.setText("Check connection")
+                self._show_preflight_report(
+                    finalize_preflight_report(
+                        {
+                            "transport": self._transport_mode(),
+                            "checks": [
+                                _preflight_check(
+                                    "connection",
+                                    "fail",
+                                    "Connection timeout",
+                                    f"The destination did not answer within {int(PREFLIGHT_TIMEOUT_SECONDS)} seconds.",
+                                    "Check the address or folder, firewall, VPN/network route, and credentials.",
+                                )
+                            ],
+                        }
+                    )
+                )
+                self.timer.stop()
+            return
         if self._joining:
             elapsed = (
                 monotonic_now - self._join_started_at
@@ -7263,6 +7962,38 @@ class LiveCollaborationController:
                     self._cancel_join(result["error"])
                 else:
                     self._finish_join(result["client"], result["room"])
+                continue
+            if result.get("lane") == "preflight":
+                if result.get("session_token") != self._session_token:
+                    continue
+                self._preflight_running = False
+                self._preflight_worker = None
+                self._preflight_started_at = 0.0
+                self._set_connection_inputs_enabled(
+                    not self.connected and not self._joining
+                )
+                self.join_button.enabled = not self.connected and not self._joining
+                self.preflight_button.setText("Check connection")
+                if "error" in result:
+                    report = finalize_preflight_report(
+                        {
+                            "transport": self._transport_mode(),
+                            "checks": [
+                                _preflight_check(
+                                    "connection",
+                                    "fail",
+                                    "Connection",
+                                    result["error"],
+                                    "Check the address or folder, credentials, firewall, and network route.",
+                                )
+                            ],
+                        }
+                    )
+                else:
+                    report = dict(result.get("report") or {})
+                self._show_preflight_report(report)
+                if not self.connected and not self._joining:
+                    self.timer.stop()
                 continue
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
@@ -8464,8 +9195,21 @@ class LiveCollaborationController:
             labels = []
             for entry in others:
                 target = entry.get("active_segment_name") or entry.get("active_segment_id")
-                labels.append(f"{entry['user']} — {target}" if target else entry["user"])
+                peer_version = str(entry.get("plugin_version") or "unknown version")
+                label = f"{entry['user']} (v{peer_version})"
+                labels.append(f"{label} — {target}" if target else label)
             self.users_label.setText("Online: " + "  •  ".join(labels))
+            mismatched = [
+                entry
+                for entry in others
+                if int(entry.get("protocol_version", 0) or 0)
+                != COLLABORATION_PROTOCOL_VERSION
+            ]
+            if mismatched:
+                self.users_label.setText(
+                    self._text(self.users_label)
+                    + "\n⚠ Protocol mismatch: install the same current plugin release on every computer."
+                )
         follow = self.follow_checkbox.checked
         follow = follow() if callable(follow) else follow
         target = self._combo_current_text(self.collaborator_combo)

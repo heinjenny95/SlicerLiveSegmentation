@@ -1,0 +1,53 @@
+services:
+  liveseg-server:
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    environment:
+      LIVESEG_DATA_ROOT: /data
+      LIVESEG_USER_TOKENS_JSON: ${LIVESEG_USER_TOKENS_JSON:?Generate deploy/public/.env first}
+      LIVESEG_REQUIRE_HTTPS: "true"
+      LIVESEG_MAX_UPLOAD_BYTES: ${LIVESEG_MAX_UPLOAD_BYTES:-67108864}
+    volumes:
+      - liveseg-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - liveseg-internal
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    environment:
+      LIVESEG_DOMAIN: ${LIVESEG_DOMAIN:?Set a public DNS name in deploy/public/.env}
+      LIVESEG_EMAIL: ${LIVESEG_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      liveseg-server:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - liveseg-internal
+
+networks:
+  liveseg-internal:
+
+volumes:
+  liveseg-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,14 @@
+{$LIVESEG_DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 64MB
+    }
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    reverse_proxy liveseg-server:8000
+}
+

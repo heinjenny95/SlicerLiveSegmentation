@@ -18,6 +18,21 @@ class LiveRoomJoin(BaseModel):
         return value
 
 
+class LivePreflightRequest(BaseModel):
+    room_name: str = Field(min_length=1, max_length=120)
+    volume_signature: str = Field(min_length=16, max_length=160)
+    plugin_version: str = Field(min_length=1, max_length=40)
+    protocol_version: int = Field(ge=1, le=1000)
+
+    @field_validator("room_name", "volume_signature", "plugin_version")
+    @classmethod
+    def strip_preflight_values(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be blank")
+        return value
+
+
 class LiveOperationCreate(BaseModel):
     client_operation_id: str = Field(min_length=8, max_length=120)
     segment_id: str = Field(min_length=1, max_length=200)
@@ -76,6 +91,10 @@ class LivePresenceUpdate(BaseModel):
     layout: int | None = None
     color: list[float] | None = Field(default=None, min_length=3, max_length=3)
     role: str | None = Field(default=None, max_length=40)
+    plugin_version: str | None = Field(default=None, max_length=40)
+    protocol_version: int | None = Field(default=None, ge=1, le=1000)
+    volume_signature_hash: str | None = Field(default=None, max_length=64)
+    transport: str | None = Field(default=None, max_length=80)
 
 
 class LiveChatMessageCreate(BaseModel):

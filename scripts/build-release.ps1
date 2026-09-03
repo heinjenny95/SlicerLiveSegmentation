@@ -6,7 +6,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     throw 'Run scripts\setup.ps1 first.'
 }
 
-& $venvPython -m ruff check (Join-Path $projectRoot 'server') (Join-Path $projectRoot 'LiveSegmentation') (Join-Path $projectRoot 'scripts\build_release.py') (Join-Path $projectRoot 'scripts\benchmark_shared_folder_latency.py') (Join-Path $projectRoot 'scripts\slicer_live_segmentation_smoke_test.py') (Join-Path $projectRoot 'scripts\slicer_ui_width_smoke_test.py')
+& $venvPython -m ruff check (Join-Path $projectRoot 'server') (Join-Path $projectRoot 'LiveSegmentation') (Join-Path $projectRoot 'scripts')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & (Join-Path $projectRoot 'scripts\test.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -26,6 +26,7 @@ from collaboration import (  # noqa: E402
     LanRelayServer,
     LanRoomClient,
     LiveCollaborationError,
+    LiveRoomClient,
     SharedFolderRoomClient,
     _atomic_temporary_path,
     _is_transient_shared_read_error,
@@ -38,6 +39,7 @@ from collaboration import (  # noqa: E402
     encode_mask_crop_snapshot,
     encode_mask_delta,
     update_recent_shared_folders,
+    validate_remote_server_url,
     volume_signature,
 )
 from fastapi.testclient import TestClient  # noqa: E402
@@ -50,6 +52,8 @@ from features import (  # noqa: E402
     segmentation_quality_report,
     validate_material_template,
 )
+
+from scripts.generate_user_tokens import generate_user_tokens  # noqa: E402
 
 
 def operation_payload(segment_id, previous, current, replace=False, operation_id="client-op-1"):
@@ -101,6 +105,55 @@ def test_recent_shared_folder_history_moves_successful_path_to_front():
         r"d:/shared",
         limit=2,
     ) == [r"d:/shared", r"\\server\old"]
+
+
+def test_remote_server_security_requires_https_except_loopback_or_explicit_test():
+    assert validate_remote_server_url("https://collaboration.example.org") == (
+        "https://collaboration.example.org"
+    )
+    assert validate_remote_server_url("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        validate_remote_server_url("http://collaboration.example.org")
+    assert validate_remote_server_url(
+        "http://192.168.1.20:8000", allow_insecure_http=True
+    ) == "http://192.168.1.20:8000"
+
+
+def test_token_generator_creates_unique_identity_bound_secrets():
+    tokens = generate_user_tokens(["Alice", "Bob"])
+    assert set(tokens.values()) == {"Alice", "Bob"}
+    assert len(tokens) == 2
+    assert all(len(token) >= 40 for token in tokens)
+    with pytest.raises(ValueError, match="Duplicate"):
+        generate_user_tokens(["Alice", " alice "])
+
+
+def test_shared_folder_preflight_finds_second_computer_without_joining(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    signature = "a" * 64
+
+    first = alice.preflight("publication room", signature)
+    assert first["status"] == "warning"
+    assert not (alice.rooms_root / alice._room_key("publication room")).exists()
+
+    second = bob.preflight("publication room", signature)
+    assert second["status"] == "pass"
+    second_peer = next(check for check in second["checks"] if check["id"] == "peer-computer")
+    assert second_peer["status"] == "pass"
+
+    refreshed = alice.preflight("publication room", signature)
+    assert refreshed["status"] == "pass"
+
+
+def test_shared_folder_preflight_reports_peer_dataset_mismatch(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    alice.preflight("mismatch room", "a" * 64)
+    report = bob.preflight("mismatch room", "b" * 64)
+    peer = next(check for check in report["checks"] if check["id"] == "peer-computer")
+    assert report["status"] == "fail"
+    assert peer["status"] == "fail"
 
 
 def deletion_payload(segment_id, shape, operation_id="delete-segment-1"):
@@ -537,6 +590,81 @@ def test_live_room_join_ordered_idempotent_operations_and_presence(client, heade
     presence = {item["user"]: item for item in bob_presence.json()}
     assert presence["alice"]["active_segment_name"] == "Leber"
     assert presence["bob"]["active_segment_name"] == "Tumor"
+
+
+def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(client):
+    payload = {
+        "room_name": "internet collaboration",
+        "volume_signature": "a" * 64,
+        "plugin_version": "0.13.0",
+        "protocol_version": 2,
+    }
+    alice = client.post(
+        "/api/live/preflight", json=payload, headers={"X-LiveSeg-User": "alice"}
+    )
+    assert alice.status_code == 200
+    assert alice.json()["room_exists"] is False
+    assert [item["user"] for item in alice.json()["preflight_participants"]] == ["alice"]
+
+    bob = client.post(
+        "/api/live/preflight", json=payload, headers={"X-LiveSeg-User": "bob"}
+    )
+    assert bob.status_code == 200
+    assert {item["user"] for item in bob.json()["preflight_participants"]} == {
+        "alice",
+        "bob",
+    }
+
+    joined = client.post(
+        "/api/live/rooms/join",
+        json={"room_name": payload["room_name"], "volume_signature": "b" * 64},
+        headers={"X-LiveSeg-User": "alice"},
+    )
+    assert joined.status_code == 200
+    mismatch = client.post(
+        "/api/live/preflight", json=payload, headers={"X-LiveSeg-User": "alice"}
+    )
+    assert mismatch.status_code == 200
+    assert mismatch.json()["room_exists"] is True
+    assert mismatch.json()["room_compatible"] is False
+
+
+def test_health_advertises_public_server_compatibility_and_security(client):
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["version"] == "0.13.0"
+    assert health.json()["protocol_version"] == 2
+    assert health.json()["minimum_plugin_version"] == "0.11.2"
+    assert health.json()["authentication"] == "open-testing"
+    assert isinstance(health.json()["server_time_epoch"], float)
+
+
+def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeypatch):
+    remote = LiveRoomClient("https://collaboration.example.org", "alice", "private-token")
+
+    def response(_method, _path, _payload):
+        return {
+            "server_version": "0.13.0",
+            "protocol_version": 2,
+            "minimum_plugin_version": "0.11.2",
+            "server_time_epoch": time.time(),
+            "authentication": "user-tokens",
+            "room_exists": True,
+            "room_compatible": True,
+            "preflight_participants": [
+                {
+                    "user": "bob",
+                    "plugin_version": "0.13.0",
+                    "protocol_version": 2,
+                    "volume_signature": "a" * 64,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(remote, "_request", response)
+    report = remote.preflight("internet room", "a" * 64)
+    assert report["status"] == "pass"
+    assert report["transport"] == "remote-https-server"
 
 
 def test_server_transport_preserves_label_deletion_tombstone(client, headers):
@@ -1371,6 +1499,43 @@ def test_server_per_user_tokens_bind_identity(tmp_path):
         assert joined.status_code == 200
 
 
+def test_public_preflight_requires_forwarded_https_and_individual_token(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "public.sqlite3",
+        user_tokens={"alice-secret": "Alice"},
+        require_https=True,
+    )
+    payload = {
+        "room_name": "public room",
+        "volume_signature": "a" * 64,
+        "plugin_version": "0.13.0",
+        "protocol_version": 2,
+    }
+    with TestClient(create_app(settings)) as public_client:
+        rejected = public_client.post(
+            "/api/live/preflight",
+            headers={
+                "Authorization": "Bearer alice-secret",
+                "X-LiveSeg-User": "Alice",
+                "X-Forwarded-Proto": "http",
+            },
+            json=payload,
+        )
+        assert rejected.status_code == 426
+        accepted = public_client.post(
+            "/api/live/preflight",
+            headers={
+                "Authorization": "Bearer alice-secret",
+                "X-LiveSeg-User": "Alice",
+                "X-Forwarded-Proto": "https",
+            },
+            json=payload,
+        )
+        assert accepted.status_code == 200
+        assert accepted.json()["authentication"] == "user-tokens"
+        assert accepted.json()["https_required"] is True
+
+
 def test_direct_lan_invitation_round_trip_contains_fallback_and_session_code():
     invitation = build_invitation(
         "direct-lan",
@@ -1434,6 +1599,15 @@ def test_direct_lan_relay_supports_two_clients_and_rejects_wrong_code(tmp_path):
     try:
         alice = LanRoomClient(url, "alice", "correct-code")
         bob = LanRoomClient(url, "bob", "correct-code")
+        first_check = alice.preflight("lan-room", "dataset-signature")
+        assert first_check["status"] == "warning"
+        second_check = bob.preflight("lan-room", "dataset-signature")
+        peer_check = next(
+            check
+            for check in second_check["checks"]
+            if check["id"] == "peer-computer"
+        )
+        assert peer_check["status"] == "pass"
         alice_room = alice.join("lan-room", "dataset-signature")
         bob_room = bob.join("lan-room", "dataset-signature")
         assert alice_room["id"] == bob_room["id"]

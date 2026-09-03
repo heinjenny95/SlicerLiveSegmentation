@@ -12,6 +12,7 @@ SlicerNNInteractiveIR/
 server/data/
 server/server/data/
 server/.env
+deploy/public/.env
 *.log
 *.seg.nrrd
 *.nrrd

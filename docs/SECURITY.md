@@ -1,7 +1,8 @@
 # Security and privacy
 
-This development release is intended for controlled research environments and
-trusted internal networks.
+This research release supports both controlled internal networks and a
+self-hosted public HTTPS server. Public use requires TLS and individual bearer
+tokens; the shared-folder and Direct LAN transports remain trusted-network modes.
 
 ## Implemented safeguards
 
@@ -12,6 +13,10 @@ trusted internal networks.
 - optional per-user bearer tokens that bind authentication to a fixed identity;
 - compatibility-only shared bearer API key mode;
 - optional HTTPS enforcement behind a reverse proxy;
+- default client rejection of non-loopback HTTP server URLs;
+- reproducible Caddy deployment with automatic TLS and no public Uvicorn port;
+- non-mutating preflight checks for protocol, dataset, clock, peer visibility,
+  authentication mode, and transport security;
 - persistent room roles, review state, conflict decisions, and audit events;
 - bounded server request fields and payload sizes;
 - release allowlist excluding databases, image data, virtual environments, and

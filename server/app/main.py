@@ -5,6 +5,8 @@ import binascii
 import json
 import secrets
 import sqlite3
+import threading
+import time
 import uuid
 import zlib
 from contextlib import asynccontextmanager
@@ -23,12 +25,17 @@ from .schemas import (
     LiveMaterialTemplate,
     LiveOperationCreate,
     LiveOwnerTransfer,
+    LivePreflightRequest,
     LivePresenceUpdate,
     LiveReviewUpdate,
     LiveRoleUpdate,
     LiveRoomJoin,
     LiveSegmentLockUpdate,
 )
+
+SERVER_VERSION = "0.13.0"
+COLLABORATION_PROTOCOL_VERSION = 2
+MINIMUM_COMPATIBLE_PLUGIN_VERSION = "0.11.2"
 
 
 def iso_now() -> str:
@@ -89,6 +96,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database = Database(resolved_settings.database_path)
     presence_registry = LivePresenceRegistry()
+    preflight_registry: dict[str, dict[str, dict[str, Any]]] = {}
+    preflight_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -100,7 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Live Segmentation Server",
-        version="0.12.1",
+        version=SERVER_VERSION,
         description="Optional relay for the Live Segmentation 3D Slicer extension.",
         lifespan=lifespan,
     )
@@ -168,8 +177,75 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "version": app.version}
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": app.version,
+            "protocol_version": COLLABORATION_PROTOCOL_VERSION,
+            "minimum_plugin_version": MINIMUM_COMPATIBLE_PLUGIN_VERSION,
+            "server_time_epoch": datetime.now(timezone.utc).timestamp(),
+            "authentication": (
+                "user-tokens"
+                if resolved_settings.user_tokens
+                else "api-key"
+                if resolved_settings.api_key
+                else "open-testing"
+            ),
+            "https_required": bool(resolved_settings.require_https),
+        }
+
+    @app.post("/api/live/preflight")
+    def live_preflight(
+        payload: LivePreflightRequest, user: str = Depends(require_user)
+    ) -> dict[str, Any]:
+        now_epoch = time.time()
+        room_key = payload.room_name.casefold()
+        with preflight_lock:
+            participants = preflight_registry.setdefault(room_key, {})
+            participants[user] = {
+                "user": user,
+                "plugin_version": payload.plugin_version,
+                "protocol_version": payload.protocol_version,
+                "volume_signature": payload.volume_signature,
+                "updated_epoch": now_epoch,
+            }
+            participants = {
+                participant_user: details
+                for participant_user, details in participants.items()
+                if now_epoch - float(details.get("updated_epoch", 0.0)) <= 120.0
+            }
+            preflight_registry[room_key] = participants
+            public_participants = [dict(item) for item in participants.values()]
+        with database.connect() as connection:
+            room = connection.execute(
+                "SELECT name, volume_signature FROM live_rooms WHERE name = ? COLLATE NOCASE",
+                (payload.room_name,),
+            ).fetchone()
+        room_exists = room is not None
+        room_compatible = not room_exists or room["volume_signature"] == payload.volume_signature
+        return {
+            "status": "ok",
+            "transport": "remote-https-server",
+            "server_version": app.version,
+            "protocol_version": COLLABORATION_PROTOCOL_VERSION,
+            "minimum_plugin_version": MINIMUM_COMPATIBLE_PLUGIN_VERSION,
+            "server_time_epoch": now_epoch,
+            "authentication": (
+                "user-tokens"
+                if resolved_settings.user_tokens
+                else "api-key"
+                if resolved_settings.api_key
+                else "open-testing"
+            ),
+            "https_required": bool(resolved_settings.require_https),
+            "room_exists": room_exists,
+            "room_compatible": room_compatible,
+            "room_name": room["name"] if room_exists else payload.room_name,
+            "client_plugin_version": payload.plugin_version,
+            "request_user": user,
+            "requested_volume_signature": payload.volume_signature,
+            "preflight_participants": public_participants,
+        }
 
     @app.post("/api/live/rooms/join")
     async def join_live_room(

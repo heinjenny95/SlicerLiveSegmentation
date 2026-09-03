@@ -7,13 +7,12 @@ import vtk
 import vtkSegmentationCorePython as vtkSegmentationCore
 from LiveSegmentationLib.collaboration import LiveCollaborationController
 from LiveSegmentationLib.features import stable_user_color, validate_material_template
+from LiveSegmentationLib.version import PLUGIN_VERSION
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleTest,
     ScriptedLoadableModuleWidget,
 )
-
-PLUGIN_VERSION = "0.12.1"
 
 
 def clear_legacy_connection_settings():
@@ -42,7 +41,7 @@ class LiveSegmentation(ScriptedLoadableModule):
         self.parent.contributors = ["Live Segmentation contributors"]
         self.parent.helpText = (
             "Synchronize a standard 3D Slicer Segmentation node through a shared "
-            "network folder or an optional collaboration server. Segmentation tools "
+            "network folder, trusted direct LAN relay, or remote HTTPS server. Segmentation tools "
             "remain separate and can edit the selected node through Slicer's MRML scene."
         )
         self.parent.acknowledgementText = (
@@ -733,4 +732,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.12.1")
+        self.assertEqual(PLUGIN_VERSION, "0.13.0")

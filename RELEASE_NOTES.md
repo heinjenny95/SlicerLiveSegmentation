@@ -1,4 +1,51 @@
-# Live Segmentation 0.12.1
+# Live Segmentation 0.13.0
+
+Version 0.13.0 adds publication-ready connection preflight and a supported
+self-hosted internet transport. Collaborators no longer need the same intranet,
+VPN, or shared drive when a public HTTPS server is available.
+
+## Two-computer preflight
+
+- **Check connection** runs before joining and never creates a room, presence
+  session, segmentation, chat entry, or audit event.
+- The background check validates reachability and latency, authenticated relay
+  or server access, shared-folder atomic write/read/list permissions, plugin and
+  collaboration-protocol compatibility, existing-room source-volume identity,
+  clock skew, and recent visibility of the second computer.
+- Shared-folder, Direct LAN, and remote-server transports publish isolated
+  two-minute preflight beacons. A/B/A testing gives both computers direct proof
+  that they see the same destination, protocol generation, and dataset.
+- Active presence now advertises plugin and protocol versions. The participant
+  line displays peer versions and warns clearly when protocols differ.
+
+## Public HTTPS collaboration
+
+- The server connection is now named **Remote HTTPS server** and explains that
+  external collaborators need only the public URL and their own access token.
+- Non-loopback plain HTTP server URLs are rejected by default. A session-only
+  checkbox permits insecure HTTP solely for an explicitly trusted local test;
+  the separate Direct LAN mode remains restricted to a trusted LAN or VPN.
+- `deploy/public` contains a Docker Compose + Caddy stack. Caddy terminates and
+  renews TLS, applies security headers and a body-size boundary, and keeps
+  Uvicorn private to the Docker network.
+- `scripts/generate_user_tokens.py` creates a Git-ignored private `.env` and one
+  cryptographically random token per named collaborator.
+- `/health` and authenticated `/api/live/preflight` report server time, software
+  and protocol versions, minimum compatible plugin version, authentication
+  mode, HTTPS policy, room existence, and source compatibility without exposing
+  credentials or room content.
+
+## Verification
+
+- 62 automated tests pass, including shared-folder A/B/A preflight, peer dataset
+  mismatch, server non-mutation and peer detection, HTTPS enforcement, server
+  capability reporting, and authenticated Direct LAN preflight.
+- Ruff and compileall pass; public deployment files and the shared version module
+  are included in the deterministic source release.
+
+---
+
+# Previous release: Live Segmentation 0.12.1
 
 Version 0.12.1 fixes the module panel occupying an excessive fraction of the
 screen on narrow and lower-resolution displays.
