@@ -1568,9 +1568,16 @@ def test_sequence_lock_retries_transient_windows_permission_error(tmp_path, monk
     assert transient_failures["remaining"] == 0
 
 
-def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
-    alice = SharedFolderRoomClient(tmp_path, "alice", presence_ttl_seconds=0.3)
-    bob = SharedFolderRoomClient(tmp_path, "bob", presence_ttl_seconds=0.3)
+def test_shared_folder_presence_expires_and_partial_files_are_ignored(
+    tmp_path, monkeypatch
+):
+    presence_ttl_seconds = 5.0
+    alice = SharedFolderRoomClient(
+        tmp_path, "alice", presence_ttl_seconds=presence_ttl_seconds
+    )
+    bob = SharedFolderRoomClient(
+        tmp_path, "bob", presence_ttl_seconds=presence_ttl_seconds
+    )
     room = alice.join("presence room", "1" * 64)
     bob.join("presence room", "1" * 64)
     alice.presence(room["id"], {"active_segment_name": "Liver"})
@@ -1583,7 +1590,12 @@ def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
     )
     assert alice.operations(room["id"], 0) == []
 
-    time.sleep(0.5)
+    real_time = time.time
+    monkeypatch.setattr(
+        collaboration_module.time,
+        "time",
+        lambda: real_time() + presence_ttl_seconds + 1.0,
+    )
     users = alice.presence(room["id"], {})
     assert [item["user"] for item in users] == ["alice"]
 
