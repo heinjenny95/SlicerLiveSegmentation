@@ -355,6 +355,7 @@ def run_probe():
         edit_latency_seconds = None
         receive_latency_seconds = None
         rapid_component_voxels = None
+        cross_label_integrity = None
         if mode == "produce":
             wait_for_return_edit = (
                 os.environ.get("LIVE_SEGMENTATION_SMOKE_WAIT_FOR_RETURN_EDIT", "0")
@@ -578,6 +579,222 @@ def run_probe():
                     "Rapid same-label synchronization lost a component: "
                     f"received {rapid_component_voxels} of 24 voxels"
                 )
+
+        if (
+            mode == "produce"
+            and os.environ.get("LIVE_SEGMENTATION_SMOKE_CROSS_LABELS", "0") == "1"
+        ):
+            from LiveSegmentationLib.collaboration import apply_mask_delta
+
+            mandibles_id = f"2.25.{uuid.uuid4().int}"
+            brain_id = f"2.25.{uuid.uuid4().int}"
+            mandibles = slicer.vtkSegment()
+            mandibles.SetName("Mandibles")
+            mandibles.SetColor(1.0, 0.0, 0.0)
+            brain = slicer.vtkSegment()
+            brain.SetName("Brain")
+            brain.SetColor(0.0, 0.0, 1.0)
+
+            first_started = time.monotonic()
+            segmentation.GetSegmentation().AddSegment(mandibles, mandibles_id)
+            first_add_seconds = time.monotonic() - first_started
+            second_started = time.monotonic()
+            segmentation.GetSegmentation().AddSegment(brain, brain_id)
+            second_add_seconds = time.monotonic() - second_started
+            if segmentation.GetSegmentation().GetSegment(brain_id) is None:
+                raise RuntimeError("Second rapid Add segment did not create Brain")
+            if max(first_add_seconds, second_add_seconds) >= 0.25:
+                raise RuntimeError(
+                    "Adding two consecutive labels blocked Slicer: "
+                    f"first={first_add_seconds:.3f}s second={second_add_seconds:.3f}s"
+                )
+
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                pump_events(0.10)
+                room_operations = controller.client.operations(controller.room_id, 0)
+                announced = {
+                    item["segment_id"]
+                    for item in room_operations
+                    if item.get("metadata_update")
+                }
+                if {mandibles_id, brain_id}.issubset(announced):
+                    break
+            if not {mandibles_id, brain_id}.issubset(announced):
+                raise RuntimeError("Two consecutive labels were not both announced")
+
+            # Reproduce the dangerous ordering exactly: Brain changes, but the
+            # visible Segment Editor row already points at Mandibles when Slicer
+            # emits an ID-less SourceRepresentationModified notification.
+            editor.setCurrentSegmentID(mandibles_id)
+            brain_bounds = [7, 9, 7, 9, 7, 9]
+            controller._applying_remote = True
+            try:
+                if not widget.update_segment_binary_labelmap_crop(
+                    np.zeros((2, 2, 2), dtype=np.uint8),
+                    np.ones((2, 2, 2), dtype=np.uint8),
+                    brain_bounds,
+                    segmentation,
+                    brain_id,
+                    volume,
+                ):
+                    raise RuntimeError("Could not create the Brain integrity probe")
+            finally:
+                controller._applying_remote = False
+            controller._on_segmentation_modified(
+                segmentation.GetSegmentation(), None, None
+            )
+
+            deadline = time.time() + 8
+            mandibles_voxels = brain_voxels = -1
+            while time.time() < deadline:
+                pump_events(0.10)
+                room_operations = controller.client.operations(controller.room_id, 0)
+                reconstructed = {
+                    mandibles_id: np.zeros(image.shape, dtype=np.uint8),
+                    brain_id: np.zeros(image.shape, dtype=np.uint8),
+                }
+                for item in room_operations:
+                    segment_id_value = str(item.get("segment_id") or "")
+                    if segment_id_value in reconstructed:
+                        reconstructed[segment_id_value] = apply_mask_delta(
+                            reconstructed[segment_id_value], item
+                        )
+                mandibles_voxels = int(reconstructed[mandibles_id].sum())
+                brain_voxels = int(reconstructed[brain_id].sum())
+                if mandibles_voxels == 0 and brain_voxels == 8:
+                    break
+            if mandibles_voxels != 0 or brain_voxels != 8:
+                raise RuntimeError(
+                    "Cross-label corruption detected: "
+                    f"Mandibles={mandibles_voxels}, Brain={brain_voxels}"
+                )
+            cross_label_integrity = {
+                "first_add_seconds": round(first_add_seconds, 4),
+                "second_add_seconds": round(second_add_seconds, 4),
+                "mandibles_voxels": mandibles_voxels,
+                "brain_voxels": brain_voxels,
+                "idless_event_selected_label": mandibles_id,
+                "actual_changed_label": brain_id,
+            }
+
+        if os.environ.get("LIVE_SEGMENTATION_SMOKE_CROSS_LABEL_PAIR", "0") == "1":
+            from LiveSegmentationLib.collaboration import apply_mask_delta
+
+            mandibles_id = "2.25.140200000000000000000000000000000000001"
+            brain_id = "2.25.140200000000000000000000000000000000004"
+            if mode == "produce":
+                if segmentation.GetSegmentation().GetSegment(mandibles_id) is None:
+                    mandibles = slicer.vtkSegment()
+                    mandibles.SetName("Mandibles")
+                    mandibles.SetColor(1.0, 0.0, 0.0)
+                    segmentation.GetSegmentation().AddSegment(mandibles, mandibles_id)
+                if segmentation.GetSegmentation().GetSegment(brain_id) is None:
+                    brain = slicer.vtkSegment()
+                    brain.SetName("Brain")
+                    brain.SetColor(0.0, 0.0, 1.0)
+                    segmentation.GetSegmentation().AddSegment(brain, brain_id)
+
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                pump_events(0.10)
+                if all(
+                    segmentation.GetSegmentation().GetSegment(item) is not None
+                    for item in (mandibles_id, brain_id)
+                ):
+                    break
+            if not all(
+                segmentation.GetSegmentation().GetSegment(item) is not None
+                for item in (mandibles_id, brain_id)
+            ):
+                raise RuntimeError("Both cross-label test labels did not synchronize")
+
+            marker_root = Path(shared_folder)
+            marker_name = "".join(
+                character if character.isalnum() else "-" for character in room_name
+            )
+            own_marker = marker_root / f".{marker_name}-{mode}.ready"
+            peer_mode = "consume" if mode == "produce" else "produce"
+            peer_marker = marker_root / f".{marker_name}-{peer_mode}.ready"
+            own_marker.write_text("ready", encoding="utf-8")
+            deadline = time.time() + 12
+            while time.time() < deadline and not peer_marker.is_file():
+                pump_events(0.08)
+            if not peer_marker.is_file():
+                raise RuntimeError("Second Slicer did not reach the parallel-label barrier")
+
+            target_id = mandibles_id if mode == "produce" else brain_id
+            target_bounds = (
+                [0, 2, 5, 7, 0, 2]
+                if mode == "produce"
+                else [8, 10, 0, 2, 8, 10]
+            )
+            editor.setCurrentSegmentID(target_id)
+            if not widget.update_segment_binary_labelmap_crop(
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                np.ones((2, 2, 2), dtype=np.uint8),
+                target_bounds,
+                segmentation,
+                target_id,
+                volume,
+            ):
+                raise RuntimeError(f"Parallel edit failed for {target_id}")
+
+            deadline = time.time() + 12
+            local_counts = {}
+            shared_counts = {}
+            while time.time() < deadline:
+                pump_events(0.10)
+                room_operations = controller.client.operations(controller.room_id, 0)
+                shared_masks = {
+                    mandibles_id: np.zeros(image.shape, dtype=np.uint8),
+                    brain_id: np.zeros(image.shape, dtype=np.uint8),
+                }
+                for item in room_operations:
+                    item_id = str(item.get("segment_id") or "")
+                    if item_id in shared_masks:
+                        shared_masks[item_id] = apply_mask_delta(
+                            shared_masks[item_id], item
+                        )
+                shared_counts = {
+                    item_id: int(mask.sum()) for item_id, mask in shared_masks.items()
+                }
+                local_counts = {
+                    item_id: int(
+                        np.asarray(
+                            widget.segment_mask_in_reference_geometry(
+                                segmentation, item_id, volume, image.shape
+                            ),
+                            dtype=np.uint8,
+                        ).sum()
+                    )
+                    for item_id in (mandibles_id, brain_id)
+                }
+                if set(local_counts.values()) == {8} and set(shared_counts.values()) == {8}:
+                    break
+            if local_counts != {mandibles_id: 8, brain_id: 8} or shared_counts != {
+                mandibles_id: 8,
+                brain_id: 8,
+            }:
+                raise RuntimeError(
+                    "Parallel labels crossed identities: "
+                    f"local={local_counts}, shared={shared_counts}"
+                )
+            mandibles = segmentation.GetSegmentation().GetSegment(mandibles_id)
+            brain = segmentation.GetSegmentation().GetSegment(brain_id)
+            if mandibles.GetName() != "Mandibles" or brain.GetName() != "Brain":
+                raise RuntimeError("Parallel labels exchanged their names")
+            if tuple(round(value, 3) for value in mandibles.GetColor()) != (1.0, 0.0, 0.0):
+                raise RuntimeError("Mandibles lost its red color")
+            if tuple(round(value, 3) for value in brain.GetColor()) != (0.0, 0.0, 1.0):
+                raise RuntimeError("Brain lost its blue color")
+            cross_label_integrity = {
+                "role": mode,
+                "local_counts": local_counts,
+                "shared_counts": shared_counts,
+                "mandibles_color": list(mandibles.GetColor()),
+                "brain_color": list(brain.GetColor()),
+            }
 
         collaboration_extras = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_EXTRAS", "0") == "1":
@@ -1506,6 +1723,7 @@ def run_probe():
             "edit_latency_seconds": edit_latency_seconds,
             "receive_latency_seconds": receive_latency_seconds,
             "rapid_component_voxels": rapid_component_voxels,
+            "cross_label_integrity": cross_label_integrity,
             "incremental_patch_probe_voxels": patch_voxels,
             "lifecycle": lifecycle,
             "backup": backup,

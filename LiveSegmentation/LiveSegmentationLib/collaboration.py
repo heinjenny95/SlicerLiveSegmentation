@@ -100,6 +100,7 @@ PREFLIGHT_PARTICIPANT_TTL_SECONDS = 120.0
 PREFLIGHT_TIMEOUT_SECONDS = 20.0
 PRESENCE_DELAY_WARNING_SECONDS = 3.0
 PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
+INITIAL_SYNC_OPERATION_BATCH = 6
 
 
 def new_collaboration_segment_id():
@@ -1777,21 +1778,31 @@ class SharedFolderRoomClient:
         room_path = self.rooms_root / room_key
         try:
             room_path.mkdir(parents=True, exist_ok=True)
-            (room_path / "operations").mkdir(exist_ok=True)
-            (room_path / "operation-index").mkdir(exist_ok=True)
-            (room_path / "presence").mkdir(exist_ok=True)
-            (room_path / "chat").mkdir(exist_ok=True)
-            (room_path / "chat-index").mkdir(exist_ok=True)
-            (room_path / "locks").mkdir(exist_ok=True)
-            (room_path / "segment-index").mkdir(exist_ok=True)
-            (room_path / "backups").mkdir(exist_ok=True)
-            (room_path / "snapshots").mkdir(exist_ok=True)
-            (room_path / "operation-archives").mkdir(exist_ok=True)
-            (room_path / "conflicts").mkdir(exist_ok=True)
-            (room_path / "roles").mkdir(exist_ok=True)
-            (room_path / "reviews").mkdir(exist_ok=True)
-            (room_path / "access-requests").mkdir(exist_ok=True)
-            (room_path / "audit").mkdir(exist_ok=True)
+            # Each mkdir is a separate SMB round trip. Creating/checking these
+            # independent directories serially made a healthy institutional NAS
+            # look frozen for several seconds during every join.
+            directory_names = (
+                "operations",
+                "operation-index",
+                "presence",
+                "chat",
+                "chat-index",
+                "locks",
+                "segment-index",
+                "backups",
+                "snapshots",
+                "operation-archives",
+                "conflicts",
+                "roles",
+                "reviews",
+                "access-requests",
+                "audit",
+            )
+            _parallel_map(
+                lambda name: (room_path / name).mkdir(exist_ok=True),
+                directory_names,
+                max_workers=MAX_PARALLEL_IO_WORKERS,
+            )
         except OSError as exc:
             raise LiveCollaborationError(
                 f"The shared folder is not writable: {self.shared_folder}: {exc}"
@@ -4726,6 +4737,14 @@ class LiveCollaborationController:
         node_name = node.GetName() if node is not None else "shared segmentation"
         return f"● Live via {transport} in room “{self.room_name}” — editing “{node_name}”"
 
+    def _initial_sync_status_text(self):
+        completed = min(int(self.last_sequence), int(self.initial_sequence))
+        total = max(1, int(self.initial_sequence))
+        return (
+            "● Connected — loading shared segmentation… "
+            f"{completed} / {total} changes"
+        )
+
     def _update_transport_fields(self, index=None):
         del index
         mode = self._transport_mode()
@@ -6130,7 +6149,6 @@ class LiveCollaborationController:
         started = time.monotonic()
         try:
             room = client.join(room_name, signature)
-            client.health_check(room["id"])
             self._worker_results.put(
                 {
                     "lane": "join",
@@ -6416,8 +6434,12 @@ class LiveCollaborationController:
                 ):
                     button.enabled = True
             self._refresh_label_combo()
-            self.status_label.setText(self._live_status_text())
-            self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
+            if self.initial_sync_complete:
+                self.status_label.setText(self._live_status_text())
+                self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
+            else:
+                self.status_label.setText(self._initial_sync_status_text())
+                self.status_label.setStyleSheet("color: #b26a00; font-weight: bold;")
             self._update_presence(room.get("presence") or [])
             self._append_activity(
                 f"Joined room {self.room_name} via {context['transport_mode']}"
@@ -6858,37 +6880,40 @@ class LiveCollaborationController:
             state["delay"] = delay
             state["next"] = now + delay
 
-    def _probe_selected_segment_revision(self):
-        """Catch interactive edits whose normal segmentation event is delayed."""
+    def _probe_segment_revisions(self):
+        """Find changed labels by their own data revisions, never by UI selection.
+
+        Several Slicer effects emit ``SourceRepresentationModified`` without a
+        segment ID. The active row can already point at another label when that
+        deferred event is handled. Treating the active row as the event source
+        can therefore publish Brain voxels under Mandibles. Cheap per-segment
+        revision tokens keep event and label identity independent.
+        """
         if self._applying_remote or not self.initial_sync_complete:
             return
-        try:
-            node, segment_id = self.owner.get_selected_segmentation_node_and_segment_id()
-        except Exception:
+        node = self._segmentation_node()
+        if node is None:
             return
-        if node is None or node.GetID() != self.segmentation_node_id or not segment_id:
-            return
-        key = (node.GetID(), str(segment_id))
-        current_metadata = self._current_segment_metadata(node, segment_id)
-        previous_metadata = self._segment_metadata.get(str(segment_id))
-        if (
-            current_metadata is not None
-            and previous_metadata is not None
-            and current_metadata != previous_metadata
-        ):
-            self._segment_metadata[str(segment_id)] = current_metadata
-            self.metadata_updates.add(key)
-            self.dirty_segments.add(key)
-            self._force_sync_refresh = True
-        revision = self._segment_revision(node, segment_id)
-        if revision is None:
-            return
-        previous = self._segment_revisions.get(key)
-        self._segment_revisions[key] = revision
-        if previous is not None and revision != previous:
-            self.dirty_segments.add(key)
-            self._schedule_segment_verification(key)
-            self._force_sync_refresh = True
+        for segment_id in node.GetSegmentation().GetSegmentIDs():
+            segment_id = str(segment_id)
+            key = (node.GetID(), segment_id)
+            current_metadata = self._current_segment_metadata(node, segment_id)
+            previous_metadata = self._segment_metadata.get(segment_id)
+            if (
+                current_metadata is not None
+                and previous_metadata is not None
+                and current_metadata != previous_metadata
+            ):
+                self._segment_metadata[segment_id] = current_metadata
+                self.metadata_updates.add(key)
+                self.dirty_segments.add(key)
+                self._force_sync_refresh = True
+            revision = self._segment_revision(node, segment_id)
+            previous = self._segment_revisions.get(key)
+            if revision is not None and previous is not None and revision != previous:
+                self.dirty_segments.add(key)
+                self._schedule_segment_verification(key)
+                self._force_sync_refresh = True
 
     def _stop_shared_folder_watcher(self):
         watcher = self._shared_folder_watcher
@@ -7063,21 +7088,22 @@ class LiveCollaborationController:
         event_segment_ids = {
             str(value) for value in (event_segment_ids or ()) if str(value or "")
         }
-        candidates = event_segment_ids & current_ids
-        removal_event = bool(event_segment_ids & removed_ids)
-        if not candidates and not removal_event:
-            try:
-                selected_node, selected_segment_id = (
-                    self.owner.get_selected_segmentation_node_and_segment_id()
-                )
-                if selected_node == node and selected_segment_id in current_ids:
-                    candidates.add(str(selected_segment_id))
-            except Exception:
-                pass
-        if not candidates and not removal_event:
-            # Non-interactive modules may not expose an active Segment Editor
-            # label. Preserve compatibility by checking all labels only then.
-            candidates = current_ids
+        # Segment identity comes from the event payload or from that segment's
+        # own representation revision. Never infer it from the currently
+        # selected Segment Editor row: selection may change before a deferred
+        # source-representation event is delivered.
+        revision_changed_ids = set()
+        for current_segment_id in current_ids:
+            key = (node.GetID(), current_segment_id)
+            previous_revision = self._segment_revisions.get(key)
+            current_revision = self._segment_revision(node, current_segment_id)
+            if (
+                previous_revision is not None
+                and current_revision is not None
+                and current_revision != previous_revision
+            ):
+                revision_changed_ids.add(current_segment_id)
+        candidates = (event_segment_ids & current_ids) | revision_changed_ids | added_ids
         for candidate in candidates:
             key = (node.GetID(), candidate)
             self.dirty_segments.add(key)
@@ -7563,7 +7589,7 @@ class LiveCollaborationController:
                 f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
             )
             return
-        self._probe_selected_segment_revision()
+        self._probe_segment_revisions()
         now = time.time()
         self._queue_due_segment_verifications(monotonic_now)
 
@@ -7610,9 +7636,18 @@ class LiveCollaborationController:
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
         if pull_idle and (force_sync or now - self._last_sync_poll >= 0.10):
             self._last_sync_poll = now
+            operation_limit = (
+                INITIAL_SYNC_OPERATION_BATCH if not self.initial_sync_complete else 500
+            )
             self._edit_pull_worker = threading.Thread(
                 target=self._edit_pull_lane,
-                args=(self._session_token, self.client, self.room_id, int(self.last_sequence)),
+                args=(
+                    self._session_token,
+                    self.client,
+                    self.room_id,
+                    int(self.last_sequence),
+                    operation_limit,
+                ),
                 name="LiveSegmentation-edit-pull",
                 daemon=True,
             )
@@ -7822,14 +7857,18 @@ class LiveCollaborationController:
                 }
             )
 
-    def _edit_pull_lane(self, session_token, client, room_id, after_sequence):
+    def _edit_pull_lane(
+        self, session_token, client, room_id, after_sequence, operation_limit=500
+    ):
         started = time.monotonic()
         try:
             self._worker_results.put(
                 {
                     "lane": "edit-pull",
                     "session_token": session_token,
-                    "operations": client.operations(room_id, after_sequence),
+                    "operations": client.operations(
+                        room_id, after_sequence, limit=int(operation_limit)
+                    ),
                     "duration": time.monotonic() - started,
                 }
             )
@@ -8660,7 +8699,12 @@ class LiveCollaborationController:
             if result.get("backup"):
                 backup_ok = self._create_project_backup(result["backup"])
             if self.connected and backup_ok and result.get("lane") != "maintenance":
-                if self._last_sync_duration >= 2.5:
+                if not self.initial_sync_complete:
+                    self.status_label.setText(self._initial_sync_status_text())
+                    self.status_label.setStyleSheet(
+                        "color: #b26a00; font-weight: bold;"
+                    )
+                elif self._last_sync_duration >= 2.5:
                     self.status_label.setText(
                         f"● Slow connection ({self._last_sync_duration:.1f} s) — "
                         + self._live_status_text().lstrip("● ")

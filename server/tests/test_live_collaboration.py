@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import time
@@ -155,6 +156,91 @@ def test_segmentation_observer_coalesces_work_into_next_qt_turn(monkeypatch):
     controller._unobserve_segmentation()
     stale_callback()
     assert len(processed) == 2
+
+
+def test_unspecified_segmentation_event_uses_changed_revision_not_selected_label():
+    class FakeSegmentation:
+        def __init__(self):
+            self.ids = ["2.25.1", "2.25.4"]
+
+        def GetSegmentIDs(self):
+            return list(self.ids)
+
+    class FakeNode:
+        def __init__(self):
+            self.segmentation = FakeSegmentation()
+
+        def GetID(self):
+            return "vtkMRMLSegmentationNode1"
+
+        def GetSegmentation(self):
+            return self.segmentation
+
+    class WrongSelectionOwner:
+        def get_selected_segmentation_node_and_segment_id(self):
+            raise AssertionError("UI selection must not determine changed-label identity")
+
+    node = FakeNode()
+    controller = LiveCollaborationController.__new__(LiveCollaborationController)
+    controller.owner = WrongSelectionOwner()
+    controller.user_name = "thomas"
+    controller.initial_sync_complete = True
+    controller._known_segment_ids = {"2.25.1", "2.25.4"}
+    controller._segment_metadata = {
+        segment_id: {
+            "segment_id": segment_id,
+            "segment_name": "Mandibles" if segment_id == "2.25.1" else "Brain",
+            "color_hex": "#FF0000" if segment_id == "2.25.1" else "#0000FF",
+        }
+        for segment_id in controller._known_segment_ids
+    }
+    controller._segment_revisions = {
+        (node.GetID(), "2.25.1"): (10, 10, (0, 2, 0, 2, 0, 2)),
+        (node.GetID(), "2.25.4"): (10, 10, (0, 2, 0, 2, 0, 2)),
+    }
+    current_revisions = {
+        "2.25.1": (10, 10, (0, 2, 0, 2, 0, 2)),
+        "2.25.4": (11, 11, (0, 2, 0, 2, 0, 2)),
+    }
+    controller._segment_revision = lambda _node, segment_id: current_revisions[segment_id]
+    controller._current_segment_metadata = (
+        lambda _node, segment_id: dict(controller._segment_metadata[segment_id])
+    )
+    controller._adopt_unique_segment_id = lambda _node, segment_id: segment_id
+    controller.dirty_segments = set()
+    controller.force_snapshots = set()
+    controller.metadata_updates = set()
+    controller.segment_owners = {}
+    controller.pending_segment_deletions = {}
+    controller._segment_verifications = {}
+    controller._force_sync_refresh = False
+    controller._refresh_label_combo = lambda: None
+    controller._update_lock_controls = lambda: None
+
+    controller._process_segmentation_events(
+        node, event_segment_ids=set(), unspecified_event=True
+    )
+
+    assert (node.GetID(), "2.25.4") in controller.dirty_segments
+    assert (node.GetID(), "2.25.1") not in controller.dirty_segments
+
+
+def test_edit_pull_lane_limits_initial_sync_batch():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def operations(self, room_id, after_sequence, limit=500):
+            self.calls.append((room_id, after_sequence, limit))
+            return []
+
+    controller = LiveCollaborationController.__new__(LiveCollaborationController)
+    controller._worker_results = queue.Queue()
+    client = FakeClient()
+    controller._edit_pull_lane(7, client, "room-id", 12, operation_limit=6)
+
+    assert client.calls == [("room-id", 12, 6)]
+    assert controller._worker_results.get_nowait()["operations"] == []
 
 
 def test_shared_folder_watchdogs_allow_institutional_smb_latency():
@@ -854,7 +940,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.1"
+    assert health.json()["version"] == "0.14.2"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -866,7 +952,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.1",
+            "server_version": "0.14.2",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -876,7 +962,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.1",
+                    "plugin_version": "0.14.2",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }

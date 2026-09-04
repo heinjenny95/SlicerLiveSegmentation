@@ -1,4 +1,47 @@
-# Live Segmentation 0.14.1
+# Live Segmentation 0.14.2
+
+Version 0.14.2 prevents edits from crossing label identities and makes joining
+shared-folder rooms faster, responsive, and explicit about initial loading.
+
+## Strict label identity
+
+- ID-less `SourceRepresentationModified` events are resolved by comparing every
+  segment's own binary-labelmap revision. The selected Segment Editor row is
+  never used as a substitute segment ID.
+- Metadata, voxel deltas, display colors, and names therefore remain attached to
+  the immutable room-global segment ID even when collaborators edit different
+  labels simultaneously or switch selections while Slicer is finishing an
+  effect.
+- Consecutive Add segment actions remain deferred outside Slicer's native event
+  callback and are regression-tested without an intervening wait.
+
+## Responsive room entry
+
+- Independent shared-room directory checks run concurrently instead of making
+  fifteen serial SMB round trips.
+- The redundant post-join health request was removed; a successful join already
+  validates the room and the normal background health lane starts immediately.
+- Existing room operations load in batches of six. The status visibly reports
+  `Connected — loading shared segmentation… x / y changes` and changes to the
+  fully live state only after the join watermark is reached.
+
+## Verification
+
+- 76 automated transport/controller tests pass, including a regression that
+  presents an ID-less Brain event while Mandibles is selected and proves only
+  Brain becomes dirty.
+- A real Slicer 5.12.3 run added two labels back-to-back without blocking and
+  published an eight-voxel Brain edit under Brain while Mandibles was selected.
+- Two simultaneous Slicer 5.12.3 processes edited red Mandibles and blue Brain
+  labels in parallel. Both local MRML replicas and the shared operation journal
+  converged to exactly eight voxels per label with the correct names and colors.
+
+This maintenance release keeps collaboration protocol 3 and remains compatible
+with rooms created by version 0.14.0 or newer.
+
+---
+
+# Previous release: Live Segmentation 0.14.1
 
 Version 0.14.1 fixes a deterministic native Slicer crash caused by changing a
 segment's identifier from inside Slicer's own `SegmentAdded` notification.

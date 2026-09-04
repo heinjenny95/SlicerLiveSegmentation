@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.1.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.2.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.1`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.2`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -153,6 +153,17 @@ IDs are preserved instead of being removed and reinserted, and opening or
 clearing Segment Editor no longer exposes a partially updated room replica.
 This maintenance release keeps collaboration protocol 3 and remains compatible
 with rooms created by version 0.14.0.
+
+Version 0.14.2 fixes cross-label corruption caused by Slicer notifications that
+do not identify their source segment. Live Segmentation now detects changes from
+each segment's own data revision and never guesses their identity from the
+currently selected Segment Editor row. A real two-Slicer regression run edited
+red Mandibles and blue Brain labels concurrently and confirmed that both clients
+and the shared journal retained two isolated eight-voxel masks with the correct
+names and colors. Consecutive label creation stays non-blocking. Shared-folder
+room setup now checks independent directories in parallel, and existing history
+loads in small progress-labelled batches so joining remains understandable and
+responsive on higher-latency NAS storage.
 
 The safer global-label protocol is intentionally incompatible with earlier room
 formats. Every collaborator must install 0.14.0 or newer and create a new room; an older
