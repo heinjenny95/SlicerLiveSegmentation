@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -969,7 +970,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.3"
+    assert health.json()["version"] == "0.14.4"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -981,7 +982,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.3",
+            "server_version": "0.14.4",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -991,7 +992,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.3",
+                    "plugin_version": "0.14.4",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
@@ -2100,6 +2101,43 @@ def test_session_metrics_and_crash_journal_are_sanitized_and_context_bound(tmp_p
     assert journal.read({**context, "room_name": "room-b"}) == []
     journal.clear()
     assert not journal.path.exists()
+
+
+def test_crash_journal_retries_transient_windows_replace_lock(tmp_path, monkeypatch):
+    journal = PendingOperationJournal(tmp_path / "pending.json")
+    journal._REPLACE_RETRY_DELAYS = (0.0, 0.0, 0.0, 0.0)
+    real_replace = os.replace
+    attempts = []
+
+    def intermittently_locked(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 3:
+            raise PermissionError(5, "temporarily locked", str(destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", intermittently_locked)
+    operation = {"client_operation_id": "retry-op"}
+    assert journal.write({"room_name": "room-a"}, [operation]) is True
+    assert journal.read({"room_name": "room-a"}) == [operation]
+    assert len(attempts) == 3
+    assert journal.last_error == ""
+
+
+def test_crash_journal_failure_keeps_live_sync_nonfatal(tmp_path, monkeypatch):
+    journal = PendingOperationJournal(tmp_path / "pending.json")
+    journal._REPLACE_RETRY_DELAYS = (0.0, 0.0)
+    original = {"client_operation_id": "already-safe"}
+    assert journal.write({"room_name": "room-a"}, [original]) is True
+
+    def always_locked(source, destination):
+        raise PermissionError(5, "temporarily locked", str(destination))
+
+    monkeypatch.setattr(os, "replace", always_locked)
+    replacement = {"client_operation_id": "new-op"}
+    assert journal.write({"room_name": "room-a"}, [replacement]) is False
+    assert journal.read({"room_name": "room-a"}) == [original]
+    assert "temporarily locked" in journal.last_error
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_segmentation_quality_report_finds_empty_disconnected_and_overlap():

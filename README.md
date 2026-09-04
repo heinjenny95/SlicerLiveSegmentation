@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.3.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.4.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.3`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.4`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -165,7 +165,7 @@ room setup now checks independent directories in parallel, and existing history
 loads in small progress-labelled batches so joining remains understandable and
 responsive on higher-latency NAS storage.
 
-Version 0.14.3 uses the exact segment ID carried by Slicer's source-
+Version 0.14.4 uses the exact segment ID carried by Slicer's source-
 representation event and prevents shared internal binary-labelmap layers from
 making a sibling label look edited. Live-room Segment Editor sessions use
 overlap-safe editing, so two people may paint the same voxels into different

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -96,30 +97,66 @@ class PendingOperationJournal:
     """
 
     FORMAT = "live-segmentation-pending-operations-v1"
+    _REPLACE_RETRY_DELAYS = (0.0, 0.01, 0.025, 0.05, 0.10)
 
     def __init__(self, path):
         self.path = Path(path)
+        self.last_error = ""
+        self._write_lock = threading.RLock()
 
     def write(self, context, operations):
-        operations = [dict(item) for item in operations or []]
-        if not operations:
-            self.clear()
-            return
-        payload = {
-            "format": self.FORMAT,
-            "updated_at_epoch": time.time(),
-            "context": dict(context or {}),
-            "operations": operations,
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(
-            f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-        )
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.path)
+        """Persist pending edits without ever interrupting live synchronization.
+
+        On Windows, antivirus/indexing software and a second Slicer instance can
+        briefly open the destination without delete sharing. ``os.replace`` then
+        raises ``PermissionError`` even though both the directory and file are
+        writable. Retry that transient condition and keep the previous valid
+        journal if it persists; crash recovery is optional and must never abort
+        the live timer.
+        """
+        with self._write_lock:
+            operations = [dict(item) for item in operations or []]
+            if not operations:
+                return self.clear()
+            payload = {
+                "format": self.FORMAT,
+                "updated_at_epoch": time.time(),
+                "context": dict(context or {}),
+                "operations": operations,
+            }
+            temporary = self.path.with_name(
+                f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                last_error = None
+                for delay in self._REPLACE_RETRY_DELAYS:
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        os.replace(temporary, self.path)
+                        self.last_error = ""
+                        return True
+                    except PermissionError as exc:
+                        last_error = exc
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) not in (5, 32, 33):
+                            last_error = exc
+                            break
+                        last_error = exc
+                self.last_error = str(last_error or "Could not replace crash journal")
+            except OSError as exc:
+                self.last_error = str(exc)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
 
     def read(self, expected_context=None):
         if not self.path.is_file():
@@ -138,10 +175,14 @@ class PendingOperationJournal:
         return [dict(item) for item in payload.get("operations") or [] if isinstance(item, dict)]
 
     def clear(self):
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        with self._write_lock:
+            try:
+                self.path.unlink(missing_ok=True)
+                self.last_error = ""
+                return True
+            except OSError as exc:
+                self.last_error = str(exc)
+                return False
 
 
 def segmentation_quality_report(masks, min_component_voxels=20):

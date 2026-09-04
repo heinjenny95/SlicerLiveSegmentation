@@ -1,3 +1,30 @@
+# Live Segmentation 0.14.4
+
+Version 0.14.4 is a Windows stability hotfix for the optional local crash-
+recovery journal.
+
+## No more transient recovery-journal error popups
+
+- Windows may temporarily deny an atomic JSON replacement while antivirus,
+  indexing software, or another Slicer instance has the destination open.
+- Local journal writes now retry short-lived sharing violations and serialize
+  writes made inside one Slicer process.
+- If the local file remains locked, the previous valid recovery journal is
+  preserved and the temporary file is cleaned up. Live synchronization,
+  segmentation, chat, presence, and remote saving continue normally.
+- A persistent journal problem is shown only as a non-modal status inside the
+  collapsed **Crash recovery** section; it no longer escapes through Slicer's
+  timer as a flashing traceback/error notification.
+
+## Verification
+
+- 82 automated tests pass, including simulated transient and persistent Windows
+  file locks around the recovery journal.
+- The regression verifies retry success, preservation of the last valid journal,
+  cleanup of temporary files, and non-fatal fallback behavior.
+
+---
+
 # Live Segmentation 0.14.3
 
 Version 0.14.3 fixes the remaining shared-labelmap identity failure, makes

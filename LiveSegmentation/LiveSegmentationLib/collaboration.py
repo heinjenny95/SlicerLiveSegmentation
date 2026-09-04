@@ -5015,7 +5015,15 @@ class LiveCollaborationController:
             if operation_id and operation_id not in seen:
                 pending.append(dict(operation))
                 seen.add(operation_id)
-        self._operation_journal.write(self._journal_context, pending)
+        journal_written = self._operation_journal.write(
+            self._journal_context, pending
+        )
+        if not journal_written:
+            self.recovery_status_label.setText(
+                "Crash recovery is temporarily unavailable; live synchronization "
+                "continues normally."
+            )
+            return
         if pending:
             self.recovery_status_label.setText(
                 f"Crash journal contains {len(pending)} unacknowledged edit(s)."
