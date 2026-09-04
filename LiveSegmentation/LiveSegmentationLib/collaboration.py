@@ -87,6 +87,7 @@ MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
+SEQUENCE_HEAD_FILENAME = "sequence-head.json"
 SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 # Institutional SMB shares may need several seconds for a cold DNS, VPN,
 # authentication, or Windows redirector reconnect.  Both deadlines are hard
@@ -113,9 +114,12 @@ AUTO_BACKUP_IDLE_SECONDS = 30.0
 # important: even a "cheap" labelmap inspection on Slicer's GUI thread can
 # contend with AI inference and rendering on microscopy-scale data.
 SEGMENT_EVENT_COALESCE_MILLISECONDS = 20
+CONTROLLER_TIMER_INTERVAL_MILLISECONDS = 50
+LIVE_EDIT_POLL_INTERVAL_SECONDS = 0.05
 SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
 AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
 JOURNAL_WRITE_RETRY_SECONDS = 5.0
+FULL_PROJECT_BACKUP_SETTINGS_VERSION = 2
 
 
 def new_collaboration_segment_id():
@@ -754,6 +758,34 @@ def _baseline_region(baseline, bounds):
         return baseline.region(bounds)
     z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
     return np.asarray(baseline, dtype=np.uint8)[z0:z1, y0:y1, x0:x1].copy()
+
+
+def resolve_exclusive_claim_region(
+    server_before, current_visible, claimed_voxels, preserve_local_changes=True
+):
+    """Clear a losing label where a later ordered operation claims voxels.
+
+    A genuinely unsent local difference remains visible until it is published
+    and receives its own later global sequence. Synchronized overlap is always
+    removed immediately.
+    """
+    server_before = np.asarray(server_before, dtype=np.uint8)
+    current_visible = np.asarray(current_visible, dtype=np.uint8)
+    claimed_voxels = np.asarray(claimed_voxels, dtype=bool)
+    if not (
+        server_before.shape == current_visible.shape == claimed_voxels.shape
+    ):
+        raise ValueError("Exclusive label regions must have identical shapes")
+    local_changes = (
+        current_visible != server_before
+        if preserve_local_changes
+        else np.zeros(server_before.shape, dtype=bool)
+    )
+    server_after = server_before.copy()
+    server_after[claimed_voxels] = 0
+    visible_after = server_after.copy()
+    visible_after[local_changes] = current_visible[local_changes]
+    return server_after, visible_after, local_changes
 
 
 def _baseline_dense(baseline):
@@ -1420,13 +1452,41 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError("Join the shared room before synchronizing")
         return self._room_path
 
+    @staticmethod
+    def _sequence_head_path(room_path):
+        return Path(room_path) / SEQUENCE_HEAD_FILENAME
+
+    @classmethod
+    def _read_sequence_head(cls, room_path):
+        """Read the tiny polling watermark without loading recent voxel payloads."""
+        path = cls._sequence_head_path(room_path)
+        if not path.is_file():
+            return None
+        try:
+            data = _read_json_file(path)
+            return max(0, int(data.get("latest_sequence", 0) or 0))
+        except (LiveCollaborationError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _write_sequence_head(cls, room_path, latest_sequence):
+        """Publish a compact change watermark after the complete hot feed."""
+        return _write_shared_hot_cache(
+            cls._sequence_head_path(room_path),
+            {
+                "latest_sequence": max(0, int(latest_sequence)),
+                "updated_at": _utc_iso(),
+            },
+            label="live-operation watermark",
+        )
+
     def _latest_sequence(self, room_path):
         state_path = room_path / "sequence-state.json"
-        latest = 0
+        latest = self._read_sequence_head(room_path) or 0
         if state_path.is_file():
             try:
                 state = _read_json_file(state_path)
-                latest = max(0, int(state.get("latest_sequence", 0)))
+                latest = max(latest, max(0, int(state.get("latest_sequence", 0))))
             except (LiveCollaborationError, TypeError, ValueError):
                 pass
         # Never trust the replaceable hot-cache file as the sole sequence
@@ -1846,6 +1906,8 @@ class SharedFolderRoomClient:
                         "segment-deletion-tombstone-v1",
                         "global-segment-identity-v1",
                         "explicit-segment-metadata-v1",
+                        "exclusive-voxel-ownership-v1",
+                        "compact-sequence-watermark-v1",
                     ],
                     "name": str(room_name).strip(),
                     "room_id": room_key,
@@ -1880,6 +1942,13 @@ class SharedFolderRoomClient:
                 + " from an older stale-cache collision. Its ordering is ambiguous. "
                 "Create a new room with Live Segmentation 0.14.0 or newer."
             )
+        # Seed/migrate the compact watermark once at join. Even an empty room
+        # can then stay on the tiny 0-sequence polling path instead of opening
+        # the larger state cache and listing its directory until the first edit.
+        with self._sequence_lock(room_path):
+            latest_sequence = self._latest_sequence(room_path)
+            if self._read_sequence_head(room_path) != latest_sequence:
+                self._write_sequence_head(room_path, latest_sequence)
         self._room_id = room_key
         self._room_path = room_path
         self._segment_owners_cache = {}
@@ -1902,7 +1971,7 @@ class SharedFolderRoomClient:
             "name": metadata.get("name") or str(room_name).strip(),
             "created": created,
             "created_by": metadata.get("created_by"),
-            "latest_sequence": self._latest_sequence(room_path),
+            "latest_sequence": latest_sequence,
             "presence": self._read_presence(room_path),
         }
 
@@ -2025,10 +2094,29 @@ class SharedFolderRoomClient:
                         f"Label is locked by {lock_state.get('owner') or 'another user'}"
                     )
             base_sequence = int(operation.get("base_sequence", 0) or 0)
-            # Cross-check the cache against immutable files on every write.
-            # This prevents two computers from allocating the same sequence
-            # when one SMB redirector still serves an older state-file cache.
-            latest_sequence = self._latest_sequence(room_path)
+            try:
+                state_latest = max(0, int(state.get("latest_sequence", 0) or 0))
+            except (TypeError, ValueError):
+                state_latest = 0
+            head_latest = self._read_sequence_head(room_path)
+            hot_latest = max(state_latest, int(head_latest or 0))
+            next_prefix = f"{hot_latest + 1:020d}--*.json"
+            try:
+                next_slot_taken = next(operations_path.glob(next_prefix), None) is not None
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not validate the next shared operation slot: {exc}"
+                ) from exc
+            caches_disagree = head_latest is not None and state_latest != int(head_latest)
+            # Healthy current rooms need only two tiny JSON reads plus one
+            # exact sequence-slot query. A full listing of all historical
+            # operation files on every brush stroke made mature NAS rooms
+            # progressively slower. We retain the expensive reconciliation
+            # only for interrupted writes, old rooms, or a detected collision.
+            if caches_disagree or head_latest is None or next_slot_taken:
+                latest_sequence = self._latest_sequence(room_path)
+            else:
+                latest_sequence = hot_latest
             sequence = latest_sequence + 1
             stored = {
                 **operation,
@@ -2049,24 +2137,31 @@ class SharedFolderRoomClient:
                 for item in recent_operations
                 if isinstance(item, dict)
             }
-            try:
-                for existing_path in operations_path.glob("*.json"):
-                    existing_sequence = self._operation_sequence(existing_path)
-                    if (
-                        existing_sequence is not None
-                        and existing_path.name not in known_recent_files
-                    ):
-                        recent_operations.append(
-                            {
-                                "sequence": existing_sequence,
-                                "file": existing_path.name,
-                                "operation_hash": existing_path.stem.split("--", 1)[-1],
-                            }
-                        )
-            except OSError as exc:
-                raise LiveCollaborationError(
-                    f"Could not reconcile shared operations: {exc}"
-                ) from exc
+            recent_sequences = {
+                int(item.get("sequence", 0) or 0)
+                for item in recent_operations
+                if isinstance(item, dict)
+            }
+            cache_is_contiguous = latest_sequence == 0 or latest_sequence in recent_sequences
+            if not cache_is_contiguous:
+                try:
+                    for existing_path in operations_path.glob("*.json"):
+                        existing_sequence = self._operation_sequence(existing_path)
+                        if (
+                            existing_sequence is not None
+                            and existing_path.name not in known_recent_files
+                        ):
+                            recent_operations.append(
+                                {
+                                    "sequence": existing_sequence,
+                                    "file": existing_path.name,
+                                    "operation_hash": existing_path.stem.split("--", 1)[-1],
+                                }
+                            )
+                except OSError as exc:
+                    raise LiveCollaborationError(
+                        f"Could not reconcile shared operations: {exc}"
+                    ) from exc
             recent_operations = [
                 item for item in recent_operations if int(item.get("sequence", 0)) != sequence
             ]
@@ -2110,6 +2205,10 @@ class SharedFolderRoomClient:
                 },
                 label="live-operation cache",
             )
+            # Idle receivers poll only this small watermark.  The previous
+            # implementation reread up to 256 KiB of inline voxel payloads ten
+            # times per second even when the room had not changed.
+            self._write_sequence_head(room_path, sequence)
         # The immutable operation above is the source of truth. Retry index and
         # owner metadata are derived in one background lane; the compact state
         # file remains only a replaceable polling accelerator.
@@ -2160,15 +2259,45 @@ class SharedFolderRoomClient:
                 f"Shared operations folder is unavailable: {operations_path}"
             )
         state_path = room_path / "sequence-state.json"
+        head_latest = self._read_sequence_head(room_path)
+        immutable_entries = []
+        # Once a current client has published the small watermark, an idle
+        # receiver no longer rereads the much larger inline-operation cache on
+        # every 100 ms poll.  A periodic immutable scan still repairs an SMB
+        # client that temporarily cached an older watermark generation.
+        if head_latest is not None and head_latest <= after_sequence:
+            monotonic_now = time.monotonic()
+            if (
+                monotonic_now - self._last_operation_recovery_scan
+                < IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS
+            ):
+                return []
+            self._last_operation_recovery_scan = monotonic_now
+            try:
+                immutable_entries = [
+                    (sequence, path)
+                    for path in operations_path.glob("*.json")
+                    if (sequence := self._operation_sequence(path)) is not None
+                ]
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not list shared operations: {exc}"
+                ) from exc
+            immutable_latest = max(
+                (sequence for sequence, _ in immutable_entries), default=0
+            )
+            if immutable_latest <= after_sequence:
+                return []
+            head_latest = immutable_latest
         try:
             state = _read_json_file(state_path) if state_path.is_file() else {}
         except LiveCollaborationError:
             state = {}
         try:
-            latest = max(0, int(state.get("latest_sequence", 0)))
+            state_latest = max(0, int(state.get("latest_sequence", 0)))
         except (TypeError, ValueError):
-            latest = 0
-        immutable_entries = []
+            state_latest = 0
+        latest = max(state_latest, int(head_latest or 0))
         if latest <= after_sequence:
             monotonic_now = time.monotonic()
             if (
@@ -2218,7 +2347,8 @@ class SharedFolderRoomClient:
             and Path(str(item.get("file") or "")).name == str(item.get("file") or "")
         ]
         recent = sorted(recent, key=lambda item: int(item["sequence"]))
-        recent_covers_request = bool(recent) and (
+        cache_may_lag = head_latest is not None and state_latest < int(head_latest)
+        recent_covers_request = not cache_may_lag and bool(recent) and (
             after_sequence >= int(recent[0]["sequence"]) - 1
         )
         if recent_covers_request:
@@ -3216,6 +3346,7 @@ class SharedFolderRoomClient:
                 },
                 durable=False,
             )
+            self._write_sequence_head(room_path, sequence)
             manifest = {
                 "id": group_id,
                 "created_at": _utc_iso(),
@@ -3432,6 +3563,20 @@ class SharedFolderRoomClient:
         finally:
             probe.unlink(missing_ok=True)
         usage = shutil.disk_usage(room_path)
+        try:
+            backup_storage_bytes = sum(
+                path.stat().st_size
+                for path in room_path.joinpath("backups").glob("*")
+                if path.is_file()
+            )
+            room_storage_bytes = sum(
+                path.stat().st_size
+                for path in room_path.rglob("*")
+                if path.is_file()
+            )
+        except OSError:
+            backup_storage_bytes = 0
+            room_storage_bytes = 0
         return {
             "status": "ok",
             "latency_seconds": round(time.monotonic() - started, 4),
@@ -3440,6 +3585,11 @@ class SharedFolderRoomClient:
             "history_archives": len(list(room_path.joinpath("operation-archives").glob("*.zip"))),
             "snapshots": len(list(room_path.joinpath("snapshots").glob("*.json"))),
             "backups": len(list(room_path.joinpath("backups").glob("*.mrb"))),
+            "room_storage_bytes": int(room_storage_bytes),
+            "backup_storage_bytes": int(backup_storage_bytes),
+            "live_storage_bytes": int(
+                max(0, room_storage_bytes - backup_storage_bytes)
+            ),
             "room_path": str(room_path),
         }
 
@@ -4517,16 +4667,40 @@ class LiveCollaborationController:
         self._setup_chat_dock()
 
         backup_group = ctk.ctkCollapsibleButton()
-        backup_group.text = "Automatic project backups"
+        backup_group.text = "Complete project backups (large)"
         backup_group.collapsed = True
         backup_form = qt.QFormLayout(backup_group)
+        try:
+            backup_settings_version = int(
+                settings.value(
+                    self.SETTINGS_PREFIX + "fullProjectBackupSettingsVersion", 0
+                )
+            )
+        except (TypeError, ValueError):
+            backup_settings_version = 0
+        if backup_settings_version < FULL_PROJECT_BACKUP_SETTINGS_VERSION:
+            # Earlier releases enabled complete .mrb scene bundles by default
+            # every five minutes.  A microscopy source volume can make each
+            # bundle hundreds of megabytes and saturate the same NAS used by
+            # the live feed.  Continuous operation history remains automatic;
+            # full scene bundles are now an explicit opt-in.
+            settings.setValue(self.SETTINGS_PREFIX + "automaticBackups", False)
+            settings.setValue(self.SETTINGS_PREFIX + "backupIntervalMinutes", 60)
+            settings.setValue(self.SETTINGS_PREFIX + "backupRetention", 3)
+            settings.setValue(
+                self.SETTINGS_PREFIX + "fullProjectBackupSettingsVersion",
+                FULL_PROJECT_BACKUP_SETTINGS_VERSION,
+            )
+            settings.sync()
         default_backups = str(
-            settings.value(self.SETTINGS_PREFIX + "automaticBackups", "true")
+            settings.value(self.SETTINGS_PREFIX + "automaticBackups", "false")
         ).lower() not in {"0", "false", "no"}
         default_backup_minutes = int(
-            settings.value(self.SETTINGS_PREFIX + "backupIntervalMinutes", 5)
+            settings.value(self.SETTINGS_PREFIX + "backupIntervalMinutes", 60)
         )
-        self.backup_enabled_checkbox = qt.QCheckBox("Save complete Slicer project bundles")
+        self.backup_enabled_checkbox = qt.QCheckBox(
+            "Automatically save complete .mrb bundles (may be very large)"
+        )
         self.backup_enabled_checkbox.checked = default_backups
         self.backup_interval_spin = qt.QSpinBox()
         self.backup_interval_spin.minimum = 1
@@ -4534,7 +4708,8 @@ class LiveCollaborationController:
         self.backup_interval_spin.value = max(1, min(default_backup_minutes, 1440))
         self.backup_interval_spin.suffix = " min"
         self.backup_status_label = qt.QLabel(
-            "Backups are retained in the joined shared room's backups folder."
+            "Compact live history is saved continuously. Complete .mrb scene "
+            "bundles are optional because they also contain the source volume."
         )
         self.backup_status_label.setWordWrap(True)
         backup_form.addRow(self.backup_enabled_checkbox)
@@ -4544,7 +4719,7 @@ class LiveCollaborationController:
         self.backup_retention_spin.minimum = 1
         self.backup_retention_spin.maximum = 1000
         self.backup_retention_spin.value = int(
-            settings.value(self.SETTINGS_PREFIX + "backupRetention", 50)
+            settings.value(self.SETTINGS_PREFIX + "backupRetention", 3)
         )
         backup_form.addRow("Keep unpinned", self.backup_retention_spin)
         self.backup_enabled_checkbox.toggled.connect(self._on_backup_settings_changed)
@@ -4836,7 +5011,7 @@ class LiveCollaborationController:
         self.timer = qt.QTimer()
         # Watchers handle the normal hot path. This short timer remains the
         # compatibility fallback for network filesystems without notifications.
-        self.timer.setInterval(75)
+        self.timer.setInterval(CONTROLLER_TIMER_INTERVAL_MILLISECONDS)
         self.timer.timeout.connect(self.on_timer)
 
     @staticmethod
@@ -5578,10 +5753,14 @@ class LiveCollaborationController:
         combo_count = self.label_combo.count
         combo_count = combo_count() if callable(combo_count) else combo_count
         existing = [
-            str(self.label_combo.itemData(index))
+            (
+                str(self.label_combo.itemData(index)),
+                str(self.label_combo.itemText(index)),
+            )
             for index in range(int(combo_count))
         ]
-        if existing == [segment_id for segment_id, _ in entries]:
+        if existing == entries:
+            self.label_combo.enabled = bool(self.connected and entries)
             return
         self.label_combo.blockSignals(True)
         self.label_combo.clear()
@@ -5629,7 +5808,10 @@ class LiveCollaborationController:
             int(retention),
         )
         if not enabled:
-            self.backup_status_label.setText("Automatic project backups are off.")
+            self.backup_status_label.setText(
+                "Compact live history is saved continuously. Automatic complete "
+                ".mrb bundles are off; Back up now remains available."
+            )
         else:
             effective_seconds, large_volume_safety = (
                 self._automatic_backup_interval_seconds(float(interval) * 60.0)
@@ -6925,11 +7107,12 @@ class LiveCollaborationController:
                 )
             )
         @vtk.calldata_type(vtk.VTK_STRING)
-        def source_callback(caller, event, segment_id, controller=self):
+        def source_callback(caller, event, segment_id=None, controller=self):
             # vtkSegmentation provides the exact segment ID as call data.  It
-            # is essential here: several segments may share one internal
-            # binary-labelmap layer and therefore the same VTK modification
-            # time, but only this segment was edited by Segment Editor.
+            # normally identifies the edited label. Some Slicer writers emit
+            # the same event without call data; queue that as an unspecified
+            # event and let the per-label revision fallback resolve it instead
+            # of raising a transient TypeError in Slicer's event loop.
             controller._on_segmentation_modified(
                 caller, event, str(segment_id or "")
             )
@@ -7244,8 +7427,8 @@ class LiveCollaborationController:
         """Keep all shared-folder probing away from Qt's GUI thread.
 
         QFileSystemWatcher can synchronously touch a disconnected SMB/UNC path
-        both when arming and when removing a watch.  The 75 ms timer already
-        drives background pull lanes, so a watcher is unnecessary for latency
+        both when arming and when removing a watch. The short controller timer
+        already drives background pull lanes, so a watcher is unnecessary for latency
         and unsafe for application startup/shutdown.
         """
         self._stop_shared_folder_watcher()
@@ -7981,7 +8164,9 @@ class LiveCollaborationController:
             self._edit_push_worker.start()
 
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
-        if pull_idle and (force_sync or now - self._last_sync_poll >= 0.10):
+        if pull_idle and (
+            force_sync or now - self._last_sync_poll >= LIVE_EDIT_POLL_INTERVAL_SECONDS
+        ):
             self._last_sync_poll = now
             operation_limit = (
                 INITIAL_SYNC_OPERATION_BATCH
@@ -9810,6 +9995,92 @@ class LiveCollaborationController:
         self.session_metrics.operation_acknowledged(operation_id)
         self._sync_operation_journal()
 
+    def _apply_exclusive_voxel_claims(
+        self, node, winning_segment_id, operation_bounds, claimed_voxels
+    ):
+        """Apply global last-operation-wins ownership across all labels.
+
+        Slicer can store segments in independent binary-labelmap layers, so a
+        remote write to one label does not automatically erase the same voxels
+        from siblings. The globally ordered operation sequence is authoritative:
+        positive voxels in the current operation clear synchronized ownership
+        from every other label. Unsequenced local differences remain visible
+        and will win later if their subsequent operation receives a newer
+        sequence number.
+        """
+        claimed = np.asarray(claimed_voxels, dtype=bool)
+        if node is None or not np.any(claimed):
+            return
+        segmentation = node.GetSegmentation()
+        for other_segment_id in list(segmentation.GetSegmentIDs()):
+            other_segment_id = str(other_segment_id)
+            if other_segment_id == str(winning_segment_id):
+                continue
+            other_key = (node.GetID(), other_segment_id)
+            baseline = self.baselines.get(other_key)
+            if baseline is None:
+                # A label that has not entered the ordered shared state yet is
+                # an unsent local edit. Do not erase it before it gets a turn.
+                continue
+            server_before = _baseline_region(baseline, operation_bounds)
+            if not np.any(server_before[claimed]):
+                continue
+            current_visible = self._read_mask_region(
+                node, other_segment_id, operation_bounds
+            )
+            server_after, visible_after, local_changes = (
+                resolve_exclusive_claim_region(
+                    server_before,
+                    current_visible,
+                    claimed,
+                    preserve_local_changes=self.initial_sync_complete,
+                )
+            )
+            if np.any(current_visible != visible_after):
+                crop_updater = getattr(
+                    self.owner, "update_segment_binary_labelmap_crop", None
+                )
+                applied_incrementally = bool(
+                    callable(crop_updater)
+                    and crop_updater(
+                        current_visible,
+                        visible_after,
+                        operation_bounds,
+                        node,
+                        other_segment_id,
+                        self.owner.get_volume_node(),
+                    )
+                )
+                if not applied_incrementally:
+                    visible_full = _baseline_dense(baseline)
+                    z0, z1, y0, y1, x0, x1 = [
+                        int(value) for value in operation_bounds
+                    ]
+                    visible_full[z0:z1, y0:y1, x0:x1] = visible_after
+                    self.owner.update_segment_binary_labelmap_from_array(
+                        visible_full,
+                        node,
+                        other_segment_id,
+                        self.owner.get_volume_node(),
+                    )
+                self._ensure_independent_segment_labelmap(node, other_segment_id)
+                try:
+                    self.owner.refresh_segmentation_display(
+                        node, other_segment_id
+                    )
+                except Exception:
+                    pass
+            if isinstance(baseline, ChunkedMaskBaseline):
+                baseline.set_region(operation_bounds, claimed, server_after)
+            else:
+                z0, z1, y0, y1, x0, x1 = [
+                    int(value) for value in operation_bounds
+                ]
+                baseline[z0:z1, y0:y1, x0:x1] = server_after
+            if np.any(local_changes):
+                self.dirty_segments.add(other_key)
+            self._remember_segment_revision(node, other_segment_id)
+
     def _apply_operations(self, operations):
         import slicer
 
@@ -9982,6 +10253,13 @@ class LiveCollaborationController:
                     self.owner.update_segment_binary_labelmap_from_array(
                         visible_full, node, segment_id, self.owner.get_volume_node()
                     )
+                claimed_voxels = np.logical_and(changed, values != 0)
+                self._apply_exclusive_voxel_claims(
+                    node,
+                    segment_id,
+                    operation_bounds,
+                    claimed_voxels,
+                )
                 self._ensure_independent_segment_labelmap(node, segment_id)
                 node.Modified()
                 try:

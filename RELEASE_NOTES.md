@@ -1,4 +1,54 @@
-# Live Segmentation 0.14.5
+# Live Segmentation 0.14.6
+
+Version 0.14.6 is a correctness and NAS hot-path release for shared biological
+segmentation projects.
+
+## Exclusive voxel ownership
+
+- While a room is active, Slicer's standard Segment Editor now uses **Overwrite
+  all segments**. The most recent stroke removes touched voxels from every other
+  label instead of creating double-labelled material.
+- Incoming edits apply the same rule according to the room's global operation
+  sequence. A synchronized losing label is cleared immediately; a genuinely
+  unsent local edit is preserved until it receives its own later sequence.
+- Label IDs, colors, and names remain independent while voxel ownership is
+  resolved. Rename and color operations are unaffected.
+
+## Faster mature NAS rooms
+
+- Idle clients poll a tiny `sequence-head.json` watermark instead of repeatedly
+  reading up to 256 KiB of embedded voxel-operation payloads.
+- A healthy writer no longer enumerates every immutable operation file before
+  every brush update. Full reconciliation remains the recovery path when the
+  compact caches disagree or an interrupted write is detected.
+- The receive fallback interval is 50 ms. The append-only operation files remain
+  the authoritative history and interrupted-cache recovery is still tested.
+
+## Clear label and storage controls
+
+- The label-lock dropdown now compares IDs and displayed names, so a Segment
+  Editor rename appears immediately without leaving or rejoining the room.
+- Complete `.mrb` project bundles are now explicit opt-in backups. Existing
+  installations migrate from the old five-minute default to off, 60 minutes,
+  and three retained bundles. Compact operation history continues automatically.
+- Room diagnostics report total room bytes, backup bytes, and actual live-state
+  bytes separately. Existing backups are never deleted during the upgrade.
+
+## Verification
+
+- 89 automated tests pass, including exclusive claim resolution, compact idle
+  polling, bounded writer history, stale-cache recovery, and label identity.
+- Slicer 5.12.3 integration verifies exclusive Segment Editor configuration,
+  lock-selector rename updates, live editing, chat, locks, and advanced room
+  features.
+
+This release keeps collaboration protocol 3 and remains compatible with rooms
+created by version 0.14.0 or newer. Both collaborators should install 0.14.6 so
+every computer applies the same exclusive-ownership rule.
+
+---
+
+# Previous release: Live Segmentation 0.14.5
 
 Version 0.14.5 is a responsiveness release for large biological image volumes,
 AI-assisted editing, and recovery after a temporarily blocked Slicer event loop.

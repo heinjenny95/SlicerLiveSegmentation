@@ -143,11 +143,19 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.open_segment_editor_button.enabled = active
         editor = self._standard_segment_editor_widget()
         if active:
-            self._enable_overlap_safe_segment_editing(editor)
+            self._enable_exclusive_segment_editing(editor)
         else:
             self._restore_segment_editor_overwrite_mode(editor)
 
-    def _enable_overlap_safe_segment_editing(self, editor):
+    def _enable_exclusive_segment_editing(self, editor):
+        """Make the most recent paint stroke own every voxel it touches.
+
+        A live room represents a material partition, not overlapping regions.
+        Keeping Slicer's ``OverwriteNone`` mode here allowed two ordinary
+        Segment Editor labels to claim the same voxel locally.  The transport
+        also resolves remote claims by the shared operation sequence, so the
+        local editor must use the same last-writer-wins rule.
+        """
         if editor is None:
             return
         try:
@@ -159,7 +167,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                     parameter_node.GetOverwriteMode()
                 )
             parameter_node.SetOverwriteMode(
-                slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+                slicer.vtkMRMLSegmentEditorNode.OverwriteAllSegments
             )
         except Exception:
             pass
@@ -432,7 +440,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         elif hasattr(editor, "setMasterVolumeNode"):
             editor.setMasterVolumeNode(volume_node)
         if self._live_session_active:
-            self._enable_overlap_safe_segment_editing(editor)
+            self._enable_exclusive_segment_editing(editor)
 
     def open_segment_editor(self):
         if self.live_collaboration is None or not self.live_collaboration.connected:
@@ -787,4 +795,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.14.5")
+        self.assertEqual(PLUGIN_VERSION, "0.14.6")

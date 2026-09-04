@@ -170,7 +170,7 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 85,
+            "automated_tests": 89,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
@@ -185,12 +185,14 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
                 "native-source-event-id-overlap-safe-labelmaps-consecutive-label-add-"
                 "participant-registry-throttled-recovery-scans-large-backup-safety-"
                 "recovery-journal-file-lock-resilience-event-driven-revision-probes-"
-                "revision-aware-settle-verification-journal-write-coalescing-bounded-catchup"
+                "revision-aware-settle-verification-journal-write-coalescing-bounded-catchup-"
+                "exclusive-voxel-ownership-lock-selector-rename-compact-sequence-watermark-"
+                "bounded-writer-history"
             ),
             "two_process_slicer_live_sync_test": (
                 "passed-two-slicer-256-cubed-bidirectional-rapid-three-component-"
-                "same-label-convergence-overlapping-cross-label-name-color-id-isolation-"
-                "bidirectional-presence"
+                "same-label-convergence-cross-label-name-color-id-isolation-"
+                "exclusive-overlap-convergence-bidirectional-presence"
             ),
             "docker_runtime_test": "pending-no-local-docker-installation",
         },

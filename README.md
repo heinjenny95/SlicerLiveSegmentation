@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.5.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.6.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.5`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.6`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -165,22 +165,17 @@ room setup now checks independent directories in parallel, and existing history
 loads in small progress-labelled batches so joining remains understandable and
 responsive on higher-latency NAS storage.
 
-Version 0.14.5 keeps the exact segment ID carried by Slicer's source-
-representation event and prevents shared internal binary-labelmap layers from
-making a sibling label look edited. Live-room Segment Editor sessions use
-overlap-safe editing, so two people may paint the same voxels into different
-labels without either label absorbing the other. A persistent participant index
-keeps collaborators visible despite stale SMB directory listings. Frequent
-polls use compact hot-state files while immutable directory scans are throttled
-to a recovery fallback. For source volumes occupying at least 256 MB in memory,
-complete automatic `.mrb` backups wait for 30 seconds without edits and are
-limited to one per hour; manual backups remain available at any time. Version
-0.14.5 additionally removes unchanged 10 Hz crash-journal writes, makes native
-segment events the normal edit path instead of scanning every label every 75 ms,
-and reads a settling label again only when its VTK revision changes plus one
-final correctness check. Catch-up after a blocked Slicer UI is applied in small
-eight-operation batches so inference, painting, and rendering can regain event-
-loop time between batches.
+Version 0.14.6 makes the room an exclusive material partition: the last globally
+ordered positive paint owns a voxel and clears its synchronized ownership from
+every other label. Slicer's standard Segment Editor uses the same overwrite rule
+while the room is active, so local and remote edits converge without double-
+labelled voxels. Renamed labels update the lock selector immediately. A new tiny
+sequence watermark lets idle clients detect changes without rereading embedded
+voxel payloads every 100 ms, and healthy writers no longer list the room's full
+operation history before every brush update. Complete `.mrb` project bundles are
+now explicit opt-in backups (default 60 minutes, three retained); compact live
+history remains continuous. Diagnostics report live-state and backup storage
+separately, making multi-hundred-megabyte source-volume bundles easy to identify.
 
 The safer global-label protocol is intentionally incompatible with earlier room
 formats. Every collaborator must install 0.14.0 or newer and create a new room; an older
@@ -193,8 +188,9 @@ presence records. It does not copy the source image into that directory.
 
 The client checks a signature derived from volume geometry and distributed
 content samples. A different source volume cannot join the same room.
-Independent voxel edits are combined. If two operations assign different values
-to the same voxel, the operation ordered later by the shared transport wins.
+Independent voxel edits are combined. If different labels claim the same voxel,
+the positive operation ordered later by the shared transport becomes its sole
+owner.
 
 ## Collaboration controls
 

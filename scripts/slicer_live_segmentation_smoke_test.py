@@ -354,10 +354,10 @@ def run_probe():
         if (
             editor_parameter_node is None
             or editor_parameter_node.GetOverwriteMode()
-            != slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+            != slicer.vtkMRMLSegmentEditorNode.OverwriteAllSegments
         ):
             raise RuntimeError(
-                "Live Segment Editor did not enable overlap-safe label editing"
+                "Live Segment Editor did not enable exclusive label editing"
             )
 
         operations = []
@@ -694,10 +694,11 @@ def run_probe():
                 "selected_label_during_event": mandibles_id,
                 "actual_changed_label": brain_id,
                 "names_and_colors_preserved": True,
-                "overwrite_mode": "OverwriteNone",
+                "overwrite_mode": "OverwriteAllSegments",
             }
 
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_CROSS_LABEL_PAIR", "0") == "1":
+            import LiveSegmentationLib.collaboration as collaboration_module
             from LiveSegmentationLib.collaboration import apply_mask_delta
 
             mandibles_id = "2.25.140200000000000000000000000000000000001"
@@ -752,7 +753,8 @@ def run_probe():
 
             target_id = mandibles_id if mode == "produce" else brain_id
             # Both users intentionally paint the same voxels into different
-            # labels. Overlap is valid and must remain present in both labels.
+            # labels. The later globally ordered operation must own them and
+            # remove them from the earlier label on both computers.
             target_bounds = [4, 6, 4, 6, 4, 6]
             editor.setCurrentSegmentID(target_id)
             if not widget.update_segment_binary_labelmap_crop(
@@ -771,6 +773,13 @@ def run_probe():
             while time.time() < deadline:
                 pump_events(0.10)
                 room_operations = controller.client.operations(controller.room_id, 0)
+                edited_target_ids = {
+                    str(item.get("segment_id") or "")
+                    for item in room_operations
+                    if str(item.get("segment_id") or "")
+                    in {mandibles_id, brain_id}
+                    and int(item.get("changed_voxels", 0) or 0) > 0
+                }
                 shared_masks = {
                     mandibles_id: np.zeros(image.shape, dtype=np.uint8),
                     brain_id: np.zeros(image.shape, dtype=np.uint8),
@@ -781,6 +790,16 @@ def run_probe():
                         shared_masks[item_id] = apply_mask_delta(
                             shared_masks[item_id], item
                         )
+                        changed, values = collaboration_module.decode_mask_delta(item)
+                        claimed = np.logical_and(changed, values != 0)
+                        z0, z1, y0, y1, x0, x1 = [
+                            int(value) for value in item["voxel_bbox"]
+                        ]
+                        for other_id, other_mask in shared_masks.items():
+                            if other_id == item_id:
+                                continue
+                            other_crop = other_mask[z0:z1, y0:y1, x0:x1]
+                            other_crop[claimed] = 0
                 shared_counts = {
                     item_id: int(mask.sum()) for item_id, mask in shared_masks.items()
                 }
@@ -795,14 +814,26 @@ def run_probe():
                     )
                     for item_id in (mandibles_id, brain_id)
                 }
-                if set(local_counts.values()) == {8} and set(shared_counts.values()) == {8}:
+                if (
+                    edited_target_ids == {mandibles_id, brain_id}
+                    and controller.last_sequence
+                    >= max(
+                        int(item["sequence"])
+                        for item in room_operations
+                        if str(item.get("segment_id") or "")
+                        in {mandibles_id, brain_id}
+                    )
+                    and local_counts == shared_counts
+                    and sorted(local_counts.values()) == [0, 8]
+                ):
                     break
-            if local_counts != {mandibles_id: 8, brain_id: 8} or shared_counts != {
-                mandibles_id: 8,
-                brain_id: 8,
-            }:
+            if (
+                edited_target_ids != {mandibles_id, brain_id}
+                or local_counts != shared_counts
+                or sorted(local_counts.values()) != [0, 8]
+            ):
                 raise RuntimeError(
-                    "Parallel labels crossed identities: "
+                    "Parallel labels did not converge to exclusive ownership: "
                     f"local={local_counts}, shared={shared_counts}"
                 )
             mandibles = segmentation.GetSegmentation().GetSegment(mandibles_id)
@@ -820,12 +851,25 @@ def run_probe():
                 "mandibles_color": list(mandibles.GetColor()),
                 "brain_color": list(brain.GetColor()),
                 "visible_collaborators": sorted(controller.presence_by_user),
+                "exclusive_voxel_owner": next(
+                    item_id for item_id, count in local_counts.items() if count == 8
+                ),
             }
 
         collaboration_extras = None
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_EXTRAS", "0") == "1":
             if str(controller._combo_current_data(controller.label_combo)) != segment_id:
                 raise RuntimeError("Explicit label-management selector was not populated")
+            selected_segment = segmentation.GetSegmentation().GetSegment(segment_id)
+            selected_segment.SetName("Smoke test renamed label")
+            controller._refresh_label_combo()
+            if (
+                str(controller._combo_current_data(controller.label_combo)) != segment_id
+                or str(controller.label_combo.currentText) != "Smoke test renamed label"
+            ):
+                raise RuntimeError(
+                    "Label-management selector did not follow a Segment Editor rename"
+                )
             if not controller.backup_enabled_checkbox.enabled:
                 raise RuntimeError("Backup settings are disabled while the shared room is active")
             controller.backup_enabled_checkbox.checked = True

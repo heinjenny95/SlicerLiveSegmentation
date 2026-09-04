@@ -45,6 +45,7 @@ from collaboration import (  # noqa: E402
     encode_mask_delta,
     encode_metadata_update,
     new_collaboration_segment_id,
+    resolve_exclusive_claim_region,
     update_recent_shared_folders,
     validate_remote_server_url,
     volume_signature,
@@ -697,6 +698,42 @@ def test_chunked_baseline_scales_with_touched_chunks_not_volume_size():
     assert not np.any(baseline.region(components[1]))
 
 
+def test_later_label_claim_clears_synchronized_overlap_but_keeps_unsent_work():
+    server_before = np.zeros((2, 3, 4), dtype=np.uint8)
+    server_before[0, 1, 1] = 1
+    server_before[0, 1, 2] = 1
+    current_visible = server_before.copy()
+    current_visible[1, 2, 3] = 1  # not in the shared sequence yet
+    claimed = np.zeros_like(server_before, dtype=bool)
+    claimed[0, 1, 1:3] = True
+
+    server_after, visible_after, local_changes = resolve_exclusive_claim_region(
+        server_before, current_visible, claimed
+    )
+
+    assert not np.any(server_after[claimed])
+    assert not np.any(visible_after[claimed])
+    assert visible_after[1, 2, 3] == 1
+    assert local_changes[1, 2, 3]
+
+
+def test_initial_replay_clears_even_unsequenced_visible_overlap():
+    server_before = np.ones((2, 2, 2), dtype=np.uint8)
+    current_visible = server_before.copy()
+    claimed = np.zeros_like(server_before, dtype=bool)
+    claimed[1, 1, 1] = True
+
+    _, visible_after, local_changes = resolve_exclusive_claim_region(
+        server_before,
+        current_visible,
+        claimed,
+        preserve_local_changes=False,
+    )
+
+    assert visible_after[1, 1, 1] == 0
+    assert not np.any(local_changes)
+
+
 def test_chunked_baseline_encodes_a_small_edit_in_huge_geometry():
     shape = (4096, 4096, 4096)
     bounds = [3000, 3004, 2000, 2004, 1000, 1004]
@@ -1065,7 +1102,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.5"
+    assert health.json()["version"] == "0.14.6"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -1077,7 +1114,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.5",
+            "server_version": "0.14.6",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -1087,7 +1124,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.5",
+                    "plugin_version": "0.14.6",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
@@ -1251,6 +1288,8 @@ def test_shared_folder_new_room_requires_collision_safe_clients(tmp_path):
     assert metadata["minimum_plugin_version"] == "0.14.0"
     assert "global-segment-identity-v1" in metadata["capabilities"]
     assert "explicit-segment-metadata-v1" in metadata["capabilities"]
+    assert "exclusive-voxel-ownership-v1" in metadata["capabilities"]
+    assert "compact-sequence-watermark-v1" in metadata["capabilities"]
 
 
 def test_shared_folder_concurrent_writers_receive_one_global_order(tmp_path):
@@ -1375,6 +1414,62 @@ def test_inline_operation_feed_avoids_live_operation_file_roundtrip(tmp_path, mo
     assert operations[0]["client_operation_id"] == "inline-operation-1"
 
 
+def test_idle_poll_reads_only_compact_sequence_watermark(tmp_path, monkeypatch):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("compact idle polling", "8" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed[0, 0, 0] = 1
+    client.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, changed, operation_id="watermark-op"),
+    )
+    assert client._sequence_head_path(client._room_path).is_file()
+
+    original_read = collaboration_module._read_json_file
+
+    def reject_large_idle_cache_read(path):
+        if Path(path).name == "sequence-state.json":
+            raise AssertionError("idle polling reread the operation payload cache")
+        return original_read(path)
+
+    monkeypatch.setattr(
+        collaboration_module, "_read_json_file", reject_large_idle_cache_read
+    )
+    client._last_operation_recovery_scan = time.monotonic()
+    assert client.operations(room["id"], 1) == []
+
+
+def test_healthy_room_push_does_not_relist_all_historical_operations(
+    tmp_path, monkeypatch
+):
+    client = SharedFolderRoomClient(tmp_path, "alice")
+    room = client.join("bounded writer hot path", "6" * 64)
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    first = empty.copy()
+    first[0, 0, 0] = 1
+    client.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, first, operation_id="bounded-write-1"),
+    )
+
+    original_glob = Path.glob
+
+    def reject_complete_history_listing(path, pattern):
+        if path.name == "operations" and pattern == "*.json":
+            raise AssertionError("healthy writer relisted the complete live history")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_complete_history_listing)
+    second = first.copy()
+    second[1, 1, 1] = 1
+    result = client.push_operation(
+        room["id"],
+        operation_payload("Organ", first, second, operation_id="bounded-write-2"),
+    )
+    assert result["sequence"] == 2
+
+
 def test_recent_chat_feed_avoids_relisting_the_network_directory(tmp_path, monkeypatch):
     client = SharedFolderRoomClient(tmp_path, "alice")
     room = client.join("indexed chat feed", "2" * 64)
@@ -1413,6 +1508,11 @@ def test_stale_operation_cache_recovery_scan_is_throttled(tmp_path):
     collaboration_module._write_json_atomic(
         alice._room_path / "sequence-state.json",
         {"latest_sequence": 0, "inline_operations": []},
+        durable=False,
+    )
+    collaboration_module._write_json_atomic(
+        alice._sequence_head_path(alice._room_path),
+        {"latest_sequence": 0},
         durable=False,
     )
 
