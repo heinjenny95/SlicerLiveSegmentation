@@ -101,11 +101,21 @@ PREFLIGHT_TIMEOUT_SECONDS = 20.0
 PRESENCE_DELAY_WARNING_SECONDS = 3.0
 PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
 INITIAL_SYNC_OPERATION_BATCH = 6
+LIVE_SYNC_OPERATION_BATCH = 8
 IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS = 1.0
 PRESENCE_DIRECTORY_SCAN_INTERVAL_SECONDS = 2.0
 LARGE_VOLUME_BYTES = 256 * 1024 * 1024
 LARGE_VOLUME_AUTO_BACKUP_INTERVAL_SECONDS = 60 * 60.0
 AUTO_BACKUP_IDLE_SECONDS = 30.0
+# Native segmentation notifications are the primary edit detector.  These
+# slower checks are safety nets for effects that omit a segment ID or finish a
+# labelmap write after their first VTK notification.  Keeping them sparse is
+# important: even a "cheap" labelmap inspection on Slicer's GUI thread can
+# contend with AI inference and rendering on microscopy-scale data.
+SEGMENT_EVENT_COALESCE_MILLISECONDS = 20
+SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
+AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
+JOURNAL_WRITE_RETRY_SECONDS = 5.0
 
 
 def new_collaboration_segment_id():
@@ -4128,6 +4138,7 @@ class LiveCollaborationController:
         self._pending_segmentation_preserve_added_ids = False
         self._segment_revisions = {}
         self._segment_verifications = {}
+        self._last_revision_probe = 0.0
         self._shared_folder_watcher = None
         self._applying_remote = False
         # Independent lanes keep slow project maintenance from blocking live
@@ -4217,6 +4228,8 @@ class LiveCollaborationController:
         self._operation_journal = None
         self._journal_context = None
         self._journal_recovery = []
+        self._journal_state_signature = None
+        self._journal_retry_at = 0.0
         self._comparison_node_id = None
         self.lan_server = None
         self._last_hybrid_fallback_count = 0
@@ -5006,7 +5019,11 @@ class LiveCollaborationController:
         enabled = self.recovery_enabled_checkbox.checked
         enabled = enabled() if callable(enabled) else enabled
         if not enabled:
-            self._operation_journal.clear()
+            signature = ("disabled",)
+            if self._journal_state_signature != signature:
+                self._operation_journal.clear()
+                self._journal_state_signature = signature
+                self._journal_retry_at = 0.0
             return
         pending = []
         seen = set()
@@ -5015,15 +5032,31 @@ class LiveCollaborationController:
             if operation_id and operation_id not in seen:
                 pending.append(dict(operation))
                 seen.add(operation_id)
+        # Do not overwrite recoverable operations before the user chooses
+        # Recover or Discard.  The former implementation rewrote the same local
+        # JSON file on every 100 ms transport poll, even when nothing changed.
+        # Besides needless I/O, that caused antivirus sharing violations and
+        # stole GUI time from inference-heavy modules.
+        if self._journal_recovery and not pending:
+            return
+        signature = ("enabled", tuple(sorted(seen)))
+        if self._journal_state_signature == signature:
+            return
+        now = time.monotonic()
+        if now < float(self._journal_retry_at or 0.0):
+            return
         journal_written = self._operation_journal.write(
             self._journal_context, pending
         )
         if not journal_written:
+            self._journal_retry_at = now + JOURNAL_WRITE_RETRY_SECONDS
             self.recovery_status_label.setText(
                 "Crash recovery is temporarily unavailable; live synchronization "
                 "continues normally."
             )
             return
+        self._journal_state_signature = signature
+        self._journal_retry_at = 0.0
         if pending:
             self.recovery_status_label.setText(
                 f"Crash journal contains {len(pending)} unacknowledged edit(s)."
@@ -5073,6 +5106,7 @@ class LiveCollaborationController:
             ("edit_roundtrip", "edit roundtrip"),
             ("edit-push", "publish"),
             ("edit-pull", "receive poll"),
+            ("local-diff", "local label scan"),
             ("apply", "apply/render"),
             ("chat-send", "chat send"),
         ):
@@ -6432,6 +6466,7 @@ class LiveCollaborationController:
             self.pending_segment_deletions.clear()
             self._segment_revisions.clear()
             self._segment_verifications.clear()
+            self._last_revision_probe = 0.0
             self.last_chat_sequence = 0
             self.pending_chat.clear()
             self.displayed_chat_sequences.clear()
@@ -6545,6 +6580,8 @@ class LiveCollaborationController:
             self._operation_journal = self._journal_for_context(
                 self._journal_context
             )
+            self._journal_state_signature = None
+            self._journal_retry_at = 0.0
             self._journal_recovery = self._operation_journal.read(
                 self._journal_context
             )
@@ -6685,6 +6722,7 @@ class LiveCollaborationController:
         self.pending_segment_deletions.clear()
         self._segment_revisions.clear()
         self._segment_verifications.clear()
+        self._last_revision_probe = 0.0
         self._known_segment_ids.clear()
         self.pending_chat.clear()
         self.displayed_chat_sequences.clear()
@@ -6728,6 +6766,8 @@ class LiveCollaborationController:
         self._journal_recovery = []
         self._journal_context = None
         self._operation_journal = None
+        self._journal_state_signature = None
+        self._journal_retry_at = 0.0
         self._remove_comparison_node()
         if self.lan_server is not None:
             self.lan_server.stop()
@@ -7109,12 +7149,36 @@ class LiveCollaborationController:
         existing["delay"] = min(float(existing.get("delay", 0.08)), 0.08)
 
     def _queue_due_segment_verifications(self, now):
-        """Queue sparse trailing comparisons until an interactive edit settles."""
+        """Queue trailing reads only when a label revision actually changed.
+
+        A final comparison at the deadline remains as a correctness guard for
+        effects that mutate a NumPy-backed scalar buffer without advancing its
+        VTK modification time.  This changes the normal settled-edit path from
+        several complete crop reads to one final verification.
+        """
+        node = self._segmentation_node()
         for key, state in list(self._segment_verifications.items()):
             if now < float(state.get("next", 0.0)):
                 continue
-            self.dirty_segments.add(key)
-            if now >= float(state.get("deadline", 0.0)):
+            deadline_reached = now >= float(state.get("deadline", 0.0))
+            if (
+                node is None
+                or str(node.GetID()) != str(key[0])
+                or node.GetSegmentation().GetSegment(str(key[1])) is None
+            ):
+                self._segment_verifications.pop(key, None)
+                continue
+            current_revision = self._segment_revision(node, key[1])
+            previous_revision = self._segment_revisions.get(key)
+            if (
+                deadline_reached
+                or current_revision is None
+                or previous_revision is None
+                or current_revision != previous_revision
+            ):
+                self.dirty_segments.add(key)
+                self._force_sync_refresh = True
+            if deadline_reached:
                 self._segment_verifications.pop(key, None)
                 continue
             delay = min(max(float(state.get("delay", 0.08)) * 2.0, 0.12), 0.60)
@@ -7237,7 +7301,7 @@ class LiveCollaborationController:
             import qt
 
             qt.QTimer.singleShot(
-                0,
+                SEGMENT_EVENT_COALESCE_MILLISECONDS,
                 lambda queued_generation=generation: self._flush_segmentation_events(
                     queued_generation
                 ),
@@ -7374,7 +7438,7 @@ class LiveCollaborationController:
             key = (node.GetID(), candidate)
             self.dirty_segments.add(key)
             self._schedule_segment_verification(key)
-        if ids_changed or metadata_changed_ids or event_segment_ids or unspecified_event:
+        if ids_changed or metadata_changed_ids:
             self._refresh_label_combo()
             self._update_lock_controls()
         self._force_sync_refresh = True
@@ -7571,6 +7635,7 @@ class LiveCollaborationController:
 
         if not self.initial_sync_complete:
             return
+        started = time.monotonic()
         existing_operation_ids = {
             str(operation.get("client_operation_id") or "")
             for operation in self.outgoing
@@ -7693,6 +7758,7 @@ class LiveCollaborationController:
                 self.session_metrics.operation_queued(operation_id)
                 self.session_metrics.increment("edits_queued")
         self._sync_operation_journal()
+        self.session_metrics.record("local-diff", time.monotonic() - started)
 
     def _active_presence(self):
         details = self._current_location()
@@ -7861,14 +7927,19 @@ class LiveCollaborationController:
                 f"{int(SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS)} seconds."
             )
             return
-        self._probe_segment_revisions()
+        if (
+            monotonic_now - self._last_revision_probe
+            >= SEGMENT_REVISION_PROBE_INTERVAL_SECONDS
+        ):
+            self._last_revision_probe = monotonic_now
+            self._probe_segment_revisions()
         now = time.time()
         self._queue_due_segment_verifications(monotonic_now)
 
         force_sync = bool(self._force_sync_refresh)
         force_realtime = bool(self._force_realtime_refresh)
 
-        if force_sync or now - self._last_sync_poll >= 0.10:
+        if self.dirty_segments or self.pending_segment_deletions:
             self._prepare_outgoing()
 
         push_idle = self._edit_push_worker is None or not self._edit_push_worker.is_alive()
@@ -7881,7 +7952,11 @@ class LiveCollaborationController:
             and not self.dirty_segments
             and (
                 self._snapshot_requested
-                or self.last_sequence - self._last_snapshot_sequence >= 100
+                or (
+                    self.last_sequence - self._last_snapshot_sequence >= 100
+                    and now - self._last_edit_activity_epoch
+                    >= AUTOMATIC_SNAPSHOT_IDLE_SECONDS
+                )
             )
         )
         if should_snapshot:
@@ -7909,7 +7984,9 @@ class LiveCollaborationController:
         if pull_idle and (force_sync or now - self._last_sync_poll >= 0.10):
             self._last_sync_poll = now
             operation_limit = (
-                INITIAL_SYNC_OPERATION_BATCH if not self.initial_sync_complete else 500
+                INITIAL_SYNC_OPERATION_BATCH
+                if not self.initial_sync_complete
+                else LIVE_SYNC_OPERATION_BATCH
             )
             self._edit_pull_worker = threading.Thread(
                 target=self._edit_pull_lane,

@@ -150,7 +150,7 @@
 
 ## Concurrent label identity and properties (0.14 protocol)
 
-1. Install version 0.14.4 on both computers and create a new room. Confirm an
+1. Install version 0.14.5 on both computers and create a new room. Confirm an
    older room or an older client is rejected with an explicit compatibility
    message instead of joining.
 2. Add one new label on each computer at nearly the same moment, using Slicer's

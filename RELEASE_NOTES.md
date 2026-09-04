@@ -1,4 +1,52 @@
-# Live Segmentation 0.14.4
+# Live Segmentation 0.14.5
+
+Version 0.14.5 is a responsiveness release for large biological image volumes,
+AI-assisted editing, and recovery after a temporarily blocked Slicer event loop.
+
+## Event-driven local synchronization
+
+- Native Slicer segment notifications remain the immediate edit trigger, but
+  rapid internal notifications are coalesced for 20 ms before inspecting the
+  room segmentation.
+- The full per-label revision safety scan no longer runs every 75 ms. It is now
+  a 750 ms compatibility fallback for tools that do not emit an identifiable
+  source-segment event.
+- The two-second trailing correctness window no longer rereads an unchanged
+  segment on every checkpoint. It reads again only after a VTK revision change
+  and performs one final comparison for NumPy-backed writers that do not advance
+  VTK modification time. Rapid disconnected components remain protected.
+- Pure paint notifications no longer rebuild label and lock controls; structural
+  changes and actual name/color changes still update them immediately.
+
+## Responsive catch-up and maintenance
+
+- After another module temporarily blocks Slicer's GUI thread, received edits
+  are applied in batches of at most eight. This prevents a backlog of up to 500
+  MRML/render updates from freezing the UI in one timer callback.
+- Automatic history compaction waits for five seconds without local edits;
+  explicitly requested snapshots still run immediately.
+- Local crash recovery writes only when the set of unacknowledged operations
+  changes. The prior 10 Hz rewrite loop is removed, retry attempts are paced,
+  and a recovered journal cannot be overwritten before Recover or Discard is
+  selected.
+- The live performance line now separates local label-scan time from publish,
+  receive, apply/render, and end-to-end latency.
+
+## Verification
+
+- 85 automated tests pass, including revision-aware trailing verification,
+  bounded catch-up batches, journal write coalescing, and preservation of
+  pending recovery data.
+- Slicer 5.12.3 integration testing covers the packaged module and large-volume
+  live edit path.
+
+This release keeps collaboration protocol 3 and remains compatible with rooms
+created by version 0.14.0 or newer. Every collaborator should nevertheless use
+0.14.5 so that each computer receives the responsiveness fixes.
+
+---
+
+# Previous release: Live Segmentation 0.14.4
 
 Version 0.14.4 is a Windows stability hotfix for the optional local crash-
 recovery journal.

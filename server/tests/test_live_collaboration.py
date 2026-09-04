@@ -124,7 +124,7 @@ def test_segmentation_observer_coalesces_work_into_next_qt_turn(monkeypatch):
     class FakeTimer:
         @staticmethod
         def singleShot(delay, callback):
-            assert delay == 0
+            assert delay == collaboration_module.SEGMENT_EVENT_COALESCE_MILLISECONDS
             queued_callbacks.append(callback)
 
     monkeypatch.setitem(sys.modules, "qt", types.SimpleNamespace(QTimer=FakeTimer))
@@ -255,6 +255,96 @@ def test_unspecified_segmentation_event_uses_changed_revision_not_selected_label
     assert (node.GetID(), "2.25.1") not in controller.dirty_segments
 
 
+def test_trailing_verification_reads_only_changed_or_final_segment_revision():
+    class FakeSegmentation:
+        def GetSegment(self, segment_id):
+            return object() if segment_id == "organ" else None
+
+    class FakeNode:
+        def GetID(self):
+            return "segmentation"
+
+        def GetSegmentation(self):
+            return FakeSegmentation()
+
+    node = FakeNode()
+    controller = LiveCollaborationController.__new__(LiveCollaborationController)
+    controller._segmentation_node = lambda: node
+    controller._segment_revisions = {("segmentation", "organ"): (10, 10)}
+    controller._segment_verifications = {
+        ("segmentation", "organ"): {
+            "next": 1.0,
+            "deadline": 10.0,
+            "delay": 0.08,
+        }
+    }
+    controller._segment_revision = lambda _node, _segment_id: (10, 10)
+    controller.dirty_segments = set()
+    controller._force_sync_refresh = False
+
+    controller._queue_due_segment_verifications(2.0)
+    assert controller.dirty_segments == set()
+    assert controller._force_sync_refresh is False
+
+    controller._segment_verifications[("segmentation", "organ")]["next"] = 2.0
+    controller._segment_revision = lambda _node, _segment_id: (11, 11)
+    controller._queue_due_segment_verifications(3.0)
+    assert controller.dirty_segments == {("segmentation", "organ")}
+    assert controller._force_sync_refresh is True
+
+    controller.dirty_segments.clear()
+    controller._force_sync_refresh = False
+    controller._segment_revisions[("segmentation", "organ")] = (11, 11)
+    controller._segment_verifications[("segmentation", "organ")]["next"] = 3.0
+    controller._queue_due_segment_verifications(11.0)
+    assert controller.dirty_segments == {("segmentation", "organ")}
+    assert ("segmentation", "organ") not in controller._segment_verifications
+
+
+def test_crash_journal_skips_unchanged_state_and_preserves_recovery():
+    class FakeCheckbox:
+        checked = True
+
+    class FakeLabel:
+        def setText(self, _text):
+            pass
+
+    class FakeJournal:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, context, pending):
+            self.writes.append((dict(context), list(pending)))
+            return True
+
+        def clear(self):
+            raise AssertionError("enabled journal must not be cleared")
+
+    controller = LiveCollaborationController.__new__(LiveCollaborationController)
+    controller.recovery_enabled_checkbox = FakeCheckbox()
+    controller.recovery_status_label = FakeLabel()
+    controller._operation_journal = FakeJournal()
+    controller._journal_context = {"room_name": "room-a"}
+    controller._journal_recovery = []
+    controller._journal_state_signature = None
+    controller._journal_retry_at = 0.0
+    controller.outgoing = [{"client_operation_id": "operation-1"}]
+    controller.awaiting_echo = []
+
+    controller._sync_operation_journal()
+    controller._sync_operation_journal()
+    assert len(controller._operation_journal.writes) == 1
+
+    controller.outgoing.append({"client_operation_id": "operation-2"})
+    controller._sync_operation_journal()
+    assert len(controller._operation_journal.writes) == 2
+
+    controller.outgoing.clear()
+    controller._journal_recovery = [{"client_operation_id": "recover-me"}]
+    controller._sync_operation_journal()
+    assert len(controller._operation_journal.writes) == 2
+
+
 def test_edit_pull_lane_limits_initial_sync_batch():
     class FakeClient:
         def __init__(self):
@@ -271,6 +361,11 @@ def test_edit_pull_lane_limits_initial_sync_batch():
 
     assert client.calls == [("room-id", 12, 6)]
     assert controller._worker_results.get_nowait()["operations"] == []
+
+
+def test_live_catch_up_batch_is_bounded_for_gui_responsiveness():
+    assert collaboration_module.INITIAL_SYNC_OPERATION_BATCH <= 8
+    assert collaboration_module.LIVE_SYNC_OPERATION_BATCH <= 8
 
 
 def test_shared_folder_watchdogs_allow_institutional_smb_latency():
@@ -970,7 +1065,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.4"
+    assert health.json()["version"] == "0.14.5"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -982,7 +1077,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.4",
+            "server_version": "0.14.5",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -992,7 +1087,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.4",
+                    "plugin_version": "0.14.5",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
