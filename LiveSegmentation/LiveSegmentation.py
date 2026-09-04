@@ -53,6 +53,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.live_collaboration = None
+        self._live_session_active = False
+        self._previous_segment_editor_overwrite_mode = None
 
     def setup(self):
         super().setup()
@@ -136,7 +138,43 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.segmentation_selector.enabled = enabled
 
     def set_live_session_active(self, active):
-        self.open_segment_editor_button.enabled = bool(active)
+        active = bool(active)
+        self._live_session_active = active
+        self.open_segment_editor_button.enabled = active
+        editor = self._standard_segment_editor_widget()
+        if active:
+            self._enable_overlap_safe_segment_editing(editor)
+        else:
+            self._restore_segment_editor_overwrite_mode(editor)
+
+    def _enable_overlap_safe_segment_editing(self, editor):
+        if editor is None:
+            return
+        try:
+            parameter_node = editor.mrmlSegmentEditorNode()
+            if parameter_node is None:
+                return
+            if self._previous_segment_editor_overwrite_mode is None:
+                self._previous_segment_editor_overwrite_mode = int(
+                    parameter_node.GetOverwriteMode()
+                )
+            parameter_node.SetOverwriteMode(
+                slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+            )
+        except Exception:
+            pass
+
+    def _restore_segment_editor_overwrite_mode(self, editor):
+        previous = self._previous_segment_editor_overwrite_mode
+        self._previous_segment_editor_overwrite_mode = None
+        if editor is None or previous is None:
+            return
+        try:
+            parameter_node = editor.mrmlSegmentEditorNode()
+            if parameter_node is not None:
+                parameter_node.SetOverwriteMode(int(previous))
+        except Exception:
+            pass
 
     def get_volume_node(self):
         return self.source_volume_selector.currentNode()
@@ -387,13 +425,14 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         except Exception:
             return None
 
-    @staticmethod
-    def _configure_standard_segment_editor(editor, segmentation_node, volume_node):
+    def _configure_standard_segment_editor(self, editor, segmentation_node, volume_node):
         editor.setSegmentationNode(segmentation_node)
         if hasattr(editor, "setSourceVolumeNode"):
             editor.setSourceVolumeNode(volume_node)
         elif hasattr(editor, "setMasterVolumeNode"):
             editor.setMasterVolumeNode(volume_node)
+        if self._live_session_active:
+            self._enable_overlap_safe_segment_editing(editor)
 
     def open_segment_editor(self):
         if self.live_collaboration is None or not self.live_collaboration.connected:
@@ -748,4 +787,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.14.2")
+        self.assertEqual(PLUGIN_VERSION, "0.14.3")

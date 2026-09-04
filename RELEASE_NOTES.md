@@ -1,4 +1,63 @@
-# Live Segmentation 0.14.2
+# Live Segmentation 0.14.3
+
+Version 0.14.3 fixes the remaining shared-labelmap identity failure, makes
+participant discovery resilient to stale SMB directory listings, and protects
+the computer hosting a shared folder from avoidable polling and backup load.
+
+## Exact, overlap-safe label identity
+
+- `SourceRepresentationModified` now consumes the exact segment ID supplied by
+  Slicer's native event instead of treating a shared representation MTime as an
+  edit to every segment in that layer.
+- Per-segment MTime fallback deliberately ignores shared binary-labelmap layers;
+  live labels are separated into independent layers outside the native callback
+  stack.
+- Segment Editor uses `OverwriteNone` only while a live room is active and
+  restores the user's previous mode on leave. Different labels may therefore
+  overlap without deleting, recoloring, or absorbing one another.
+- Names, colors, global IDs, voxel masks, selection, and ownership remain tied
+  to the same label during simultaneous edits.
+
+## Reliable presence with less host load
+
+- Shared rooms maintain a compact participant registry. Once a collaborator is
+  known, their deterministic heartbeat file is read directly even when an SMB
+  client temporarily returns a stale directory listing.
+- Immutable operation and chat directories are no longer enumerated on every
+  100/200 ms no-change poll. Compact hot-state files retain normal live latency;
+  a full scan runs at most once per second as a stale-cache recovery path.
+- Presence directory discovery is a two-second fallback while known participant
+  heartbeats continue at the normal live cadence.
+
+## Large-project backup safety
+
+- An automatic complete-project backup now waits for its configured interval
+  after joining and for 30 seconds without edits.
+- When the selected source volume occupies at least 256 MB in memory, complete
+  automatic `.mrb` backups are limited to one per hour. The UI reports that the
+  safety limit is active; **Back up now** remains available at any time.
+- This specifically prevents multi-hundred-megabyte project bundles from being
+  compressed and copied through the host computer every five minutes while a
+  live session is in progress.
+
+## Verification
+
+- 80 automated tests pass, including participant-registry discovery and
+  throttled stale-cache recovery for both operations and chat.
+- A real Slicer 5.12.3 native-event test kept an eight-voxel blue Brain edit
+  under Brain while red Mandibles was selected; names and colors stayed intact.
+- Two simultaneous Slicer 5.12.3 processes painted the same eight voxels into
+  red Mandibles and blue Brain. Both clients and the shared journal converged to
+  eight voxels in each independent label, and both clients saw the other user
+  online.
+
+This maintenance release keeps collaboration protocol 3 and remains compatible
+with rooms created by version 0.14.0 or newer. Because an already-corrupted room
+contains incorrect historical operations, start a new room for validation.
+
+---
+
+# Previous release: Live Segmentation 0.14.2
 
 Version 0.14.2 prevents edits from crossing label identities and makes joining
 shared-folder rooms faster, responsive, and explicit about initial loading.

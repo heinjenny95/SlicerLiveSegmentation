@@ -350,6 +350,15 @@ def run_probe():
         editor = widget._standard_segment_editor_widget()
         if editor is None or editor.segmentationNode() != segmentation:
             raise RuntimeError("Standard Segment Editor did not receive the room node")
+        editor_parameter_node = editor.mrmlSegmentEditorNode()
+        if (
+            editor_parameter_node is None
+            or editor_parameter_node.GetOverwriteMode()
+            != slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+        ):
+            raise RuntimeError(
+                "Live Segment Editor did not enable overlap-safe label editing"
+            )
 
         operations = []
         edit_latency_seconds = None
@@ -623,27 +632,21 @@ def run_probe():
             if not {mandibles_id, brain_id}.issubset(announced):
                 raise RuntimeError("Two consecutive labels were not both announced")
 
-            # Reproduce the dangerous ordering exactly: Brain changes, but the
-            # visible Segment Editor row already points at Mandibles when Slicer
-            # emits an ID-less SourceRepresentationModified notification.
+            # Reproduce the dangerous ordering exactly: Brain changes while the
+            # visible Segment Editor row already points at Mandibles. The event's
+            # explicit ID, never the selected row or a sibling layer MTime, must
+            # determine which label is published.
             editor.setCurrentSegmentID(mandibles_id)
             brain_bounds = [7, 9, 7, 9, 7, 9]
-            controller._applying_remote = True
-            try:
-                if not widget.update_segment_binary_labelmap_crop(
-                    np.zeros((2, 2, 2), dtype=np.uint8),
-                    np.ones((2, 2, 2), dtype=np.uint8),
-                    brain_bounds,
-                    segmentation,
-                    brain_id,
-                    volume,
-                ):
-                    raise RuntimeError("Could not create the Brain integrity probe")
-            finally:
-                controller._applying_remote = False
-            controller._on_segmentation_modified(
-                segmentation.GetSegmentation(), None, None
-            )
+            if not widget.update_segment_binary_labelmap_crop(
+                np.zeros((2, 2, 2), dtype=np.uint8),
+                np.ones((2, 2, 2), dtype=np.uint8),
+                brain_bounds,
+                segmentation,
+                brain_id,
+                volume,
+            ):
+                raise RuntimeError("Could not create the Brain integrity probe")
 
             deadline = time.time() + 8
             mandibles_voxels = brain_voxels = -1
@@ -669,13 +672,29 @@ def run_probe():
                     "Cross-label corruption detected: "
                     f"Mandibles={mandibles_voxels}, Brain={brain_voxels}"
                 )
+            mandibles_after = segmentation.GetSegmentation().GetSegment(mandibles_id)
+            brain_after = segmentation.GetSegmentation().GetSegment(brain_id)
+            if mandibles_after.GetName() != "Mandibles" or brain_after.GetName() != "Brain":
+                raise RuntimeError("Cross-label edit changed a label name")
+            if tuple(round(value, 3) for value in mandibles_after.GetColor()) != (
+                1.0,
+                0.0,
+                0.0,
+            ) or tuple(round(value, 3) for value in brain_after.GetColor()) != (
+                0.0,
+                0.0,
+                1.0,
+            ):
+                raise RuntimeError("Cross-label edit changed a label color")
             cross_label_integrity = {
                 "first_add_seconds": round(first_add_seconds, 4),
                 "second_add_seconds": round(second_add_seconds, 4),
                 "mandibles_voxels": mandibles_voxels,
                 "brain_voxels": brain_voxels,
-                "idless_event_selected_label": mandibles_id,
+                "selected_label_during_event": mandibles_id,
                 "actual_changed_label": brain_id,
+                "names_and_colors_preserved": True,
+                "overwrite_mode": "OverwriteNone",
             }
 
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_CROSS_LABEL_PAIR", "0") == "1":
@@ -709,6 +728,14 @@ def run_probe():
             ):
                 raise RuntimeError("Both cross-label test labels did not synchronize")
 
+            presence_deadline = time.time() + 8
+            while time.time() < presence_deadline and not controller.presence_by_user:
+                pump_events(0.10)
+            if not controller.presence_by_user:
+                raise RuntimeError(
+                    "Both Slicer clients joined, but collaborator presence stayed empty"
+                )
+
             marker_root = Path(shared_folder)
             marker_name = "".join(
                 character if character.isalnum() else "-" for character in room_name
@@ -724,11 +751,9 @@ def run_probe():
                 raise RuntimeError("Second Slicer did not reach the parallel-label barrier")
 
             target_id = mandibles_id if mode == "produce" else brain_id
-            target_bounds = (
-                [0, 2, 5, 7, 0, 2]
-                if mode == "produce"
-                else [8, 10, 0, 2, 8, 10]
-            )
+            # Both users intentionally paint the same voxels into different
+            # labels. Overlap is valid and must remain present in both labels.
+            target_bounds = [4, 6, 4, 6, 4, 6]
             editor.setCurrentSegmentID(target_id)
             if not widget.update_segment_binary_labelmap_crop(
                 np.zeros((2, 2, 2), dtype=np.uint8),
@@ -794,6 +819,7 @@ def run_probe():
                 "shared_counts": shared_counts,
                 "mandibles_color": list(mandibles.GetColor()),
                 "brain_color": list(brain.GetColor()),
+                "visible_collaborators": sorted(controller.presence_by_user),
             }
 
         collaboration_extras = None

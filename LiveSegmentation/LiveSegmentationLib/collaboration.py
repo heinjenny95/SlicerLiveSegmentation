@@ -101,6 +101,11 @@ PREFLIGHT_TIMEOUT_SECONDS = 20.0
 PRESENCE_DELAY_WARNING_SECONDS = 3.0
 PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
 INITIAL_SYNC_OPERATION_BATCH = 6
+IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS = 1.0
+PRESENCE_DIRECTORY_SCAN_INTERVAL_SECONDS = 2.0
+LARGE_VOLUME_BYTES = 256 * 1024 * 1024
+LARGE_VOLUME_AUTO_BACKUP_INTERVAL_SECONDS = 60 * 60.0
+AUTO_BACKUP_IDLE_SECONDS = 30.0
 
 
 def new_collaboration_segment_id():
@@ -1375,6 +1380,11 @@ class SharedFolderRoomClient:
         self._artifact_queue = queue.Queue()
         self._artifact_worker = None
         self._artifact_worker_lock = threading.Lock()
+        self._known_presence_users = {self.user_name}
+        self._presence_paths_cache = {}
+        self._last_presence_directory_scan = 0.0
+        self._last_operation_recovery_scan = 0.0
+        self._last_chat_recovery_scan = 0.0
 
     @staticmethod
     def _room_key(room_name):
@@ -1863,6 +1873,19 @@ class SharedFolderRoomClient:
         self._room_id = room_key
         self._room_path = room_path
         self._segment_owners_cache = {}
+        self._known_presence_users = {
+            value
+            for value in (
+                self.user_name,
+                str(metadata.get("created_by") or "").strip(),
+            )
+            if value
+        }
+        self._presence_paths_cache = {}
+        self._last_presence_directory_scan = 0.0
+        self._last_operation_recovery_scan = 0.0
+        self._last_chat_recovery_scan = 0.0
+        self._register_presence_user(room_path, self.user_name)
         self._append_audit(room_path, "room.join", {"created": created})
         return {
             "id": room_key,
@@ -2137,6 +2160,13 @@ class SharedFolderRoomClient:
             latest = 0
         immutable_entries = []
         if latest <= after_sequence:
+            monotonic_now = time.monotonic()
+            if (
+                monotonic_now - self._last_operation_recovery_scan
+                < IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS
+            ):
+                return []
+            self._last_operation_recovery_scan = monotonic_now
             try:
                 immutable_entries = [
                     (sequence, path)
@@ -2242,12 +2272,59 @@ class SharedFolderRoomClient:
             author = str(operation.get("author") or "")
             if segment_id and author:
                 self._segment_owners_cache.setdefault(segment_id, author)
+            if author:
+                self._known_presence_users.add(author)
         return operations
 
     def _presence_path(self, room_path):
-        readable = _safe_file_component(self.user_name, fallback="user", max_length=28)
-        digest = hashlib.sha256(self.user_name.encode("utf-8")).hexdigest()[:12]
+        return self._presence_path_for_user(room_path, self.user_name)
+
+    @staticmethod
+    def _presence_path_for_user(room_path, user_name):
+        user_name = str(user_name or "").strip()
+        readable = _safe_file_component(user_name, fallback="user", max_length=28)
+        digest = hashlib.sha256(user_name.encode("utf-8")).hexdigest()[:12]
         return room_path / "presence" / f"{readable}--{digest}.json"
+
+    def _register_presence_user(self, room_path, user_name):
+        """Keep a compact participant index so SMB directory caches cannot hide peers."""
+        user_name = str(user_name or "").strip()
+        if not user_name:
+            return
+        registry_path = room_path / "participants.json"
+        with self._named_lock(room_path, "participants", timeout_seconds=3.0):
+            registry = {}
+            if registry_path.is_file():
+                try:
+                    registry = _read_json_file(registry_path)
+                except LiveCollaborationError:
+                    registry = {}
+            users = {
+                str(item).strip()
+                for item in registry.get("users") or []
+                if str(item).strip()
+            }
+            users.add(user_name)
+            _write_json_atomic(
+                registry_path,
+                {"users": sorted(users, key=str.casefold), "updated_at": _utc_iso()},
+                durable=False,
+            )
+        self._known_presence_users.update(users)
+
+    def _read_presence_registry(self, room_path):
+        registry_path = room_path / "participants.json"
+        if not registry_path.is_file():
+            return
+        try:
+            registry = _read_json_file(registry_path)
+        except LiveCollaborationError:
+            return
+        self._known_presence_users.update(
+            str(item).strip()
+            for item in registry.get("users") or []
+            if str(item).strip()
+        )
 
     def _read_presence(self, room_path):
         now = time.time()
@@ -2257,12 +2334,31 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError(
                 f"Shared presence folder is unavailable: {presence_path}"
             )
-        try:
-            paths = list(presence_path.glob("*.json"))
-        except OSError as exc:
-            raise LiveCollaborationError(f"Could not list shared presence: {exc}") from exc
+        self._read_presence_registry(room_path)
+        paths_by_name = {
+            str(path): path
+            for path in self._presence_paths_cache.values()
+        }
+        for user_name in self._known_presence_users:
+            path = self._presence_path_for_user(room_path, user_name)
+            paths_by_name[str(path)] = path
+        monotonic_now = time.monotonic()
+        if (
+            monotonic_now - self._last_presence_directory_scan
+            >= PRESENCE_DIRECTORY_SCAN_INTERVAL_SECONDS
+        ):
+            self._last_presence_directory_scan = monotonic_now
+            try:
+                for path in presence_path.glob("*.json"):
+                    paths_by_name[str(path)] = path
+            except OSError as exc:
+                raise LiveCollaborationError(
+                    f"Could not list shared presence: {exc}"
+                ) from exc
         def read_user(path):
             try:
+                if not path.is_file():
+                    return None
                 data = _read_json_file(path)
                 if now - float(data.get("last_seen_epoch", 0.0)) <= self.presence_ttl_seconds:
                     data.pop("last_seen_epoch", None)
@@ -2271,7 +2367,18 @@ class SharedFolderRoomClient:
                 pass
             return None
 
-        users.extend(item for item in _parallel_map(read_user, paths) if item is not None)
+        users.extend(
+            item
+            for item in _parallel_map(read_user, paths_by_name.values())
+            if item is not None
+        )
+        for item in users:
+            user_name = str(item.get("user") or "").strip()
+            if user_name:
+                self._known_presence_users.add(user_name)
+                self._presence_paths_cache[user_name] = self._presence_path_for_user(
+                    room_path, user_name
+                )
         return sorted(users, key=lambda item: str(item.get("user", "")).casefold())
 
     def presence(self, room_id, details):
@@ -2432,6 +2539,13 @@ class SharedFolderRoomClient:
         )
         immutable_entries = []
         if latest <= after_sequence:
+            monotonic_now = time.monotonic()
+            if (
+                monotonic_now - self._last_chat_recovery_scan
+                < IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS
+            ):
+                return []
+            self._last_chat_recovery_scan = monotonic_now
             try:
                 immutable_entries = [
                     (sequence, path)
@@ -2484,7 +2598,13 @@ class SharedFolderRoomClient:
             message["sequence"] = sequence
             return message
 
-        return _parallel_map(read_message, selected)
+        messages = _parallel_map(read_message, selected)
+        self._known_presence_users.update(
+            str(item.get("author") or "").strip()
+            for item in messages
+            if str(item.get("author") or "").strip()
+        )
+        return messages
 
     @staticmethod
     def _segment_lock_path(room_path, segment_id):
@@ -3976,6 +4096,8 @@ class LiveCollaborationController:
         self.last_sequence = 0
         self.initial_sequence = 0
         self.initial_sync_complete = False
+        self._joined_at_epoch = 0.0
+        self._last_edit_activity_epoch = 0.0
         self.segmentation_node_id = None
         self.volume_shape = None
         self.source_volume_signature = None
@@ -5467,10 +5589,40 @@ class LiveCollaborationController:
         if not enabled:
             self.backup_status_label.setText("Automatic project backups are off.")
         else:
-            self.backup_status_label.setText(
-                f"A complete .mrb project is saved every {int(interval)} "
-                f"min; the newest {int(retention)} unpinned backups are kept."
+            effective_seconds, large_volume_safety = (
+                self._automatic_backup_interval_seconds(float(interval) * 60.0)
             )
+            if large_volume_safety:
+                self.backup_status_label.setText(
+                    "Large-dataset safety is active: complete .mrb backups are "
+                    f"limited to every {int(effective_seconds // 60)} min and only "
+                    f"start after {int(AUTO_BACKUP_IDLE_SECONDS)} s without edits. "
+                    "Manual Back up now remains available."
+                )
+            else:
+                self.backup_status_label.setText(
+                    f"A complete .mrb project is saved every {int(interval)} min "
+                    f"after {int(AUTO_BACKUP_IDLE_SECONDS)} s without edits; the "
+                    f"newest {int(retention)} unpinned backups are kept."
+                )
+
+    def _source_volume_memory_bytes(self):
+        try:
+            volume_node = self.owner.get_volume_node()
+            image = volume_node.GetImageData() if volume_node is not None else None
+            return int(image.GetActualMemorySize()) * 1024 if image is not None else 0
+        except Exception:
+            return 0
+
+    def _automatic_backup_interval_seconds(self, configured_seconds):
+        configured_seconds = max(60.0, float(configured_seconds))
+        large_volume = self._source_volume_memory_bytes() >= LARGE_VOLUME_BYTES
+        if (
+            large_volume
+            and configured_seconds < LARGE_VOLUME_AUTO_BACKUP_INTERVAL_SECONDS
+        ):
+            return LARGE_VOLUME_AUTO_BACKUP_INTERVAL_SECONDS, True
+        return configured_seconds, False
 
     def create_backup_now(self, checked=False):
         del checked
@@ -6335,6 +6487,8 @@ class LiveCollaborationController:
             self._last_lock_poll = 0.0
             self._last_health_check = 0.0
             self._last_backup_check = 0.0
+            self._joined_at_epoch = time.time()
+            self._last_edit_activity_epoch = self._joined_at_epoch
             self._force_sync_refresh = True
             self._force_realtime_refresh = True
             self._force_health_check = True
@@ -6507,6 +6661,8 @@ class LiveCollaborationController:
         self.last_sequence = 0
         self.initial_sequence = 0
         self.initial_sync_complete = False
+        self._joined_at_epoch = 0.0
+        self._last_edit_activity_epoch = 0.0
         self.baselines.clear()
         self.baseline_bounds.clear()
         self.dirty_segments.clear()
@@ -6720,8 +6876,15 @@ class LiveCollaborationController:
                     event_id, segment_callback
                 )
             )
-        def source_callback(caller, event, controller=self):
-            controller._on_segmentation_modified(caller, event, None)
+        @vtk.calldata_type(vtk.VTK_STRING)
+        def source_callback(caller, event, segment_id, controller=self):
+            # vtkSegmentation provides the exact segment ID as call data.  It
+            # is essential here: several segments may share one internal
+            # binary-labelmap layer and therefore the same VTK modification
+            # time, but only this segment was edited by Segment Editor.
+            controller._on_segmentation_modified(
+                caller, event, str(segment_id or "")
+            )
 
         self._observer_callbacks.append(source_callback)
         self._observer_tags.append(
@@ -6756,6 +6919,76 @@ class LiveCollaborationController:
             )
         except Exception:
             return None
+
+    @staticmethod
+    def _segment_representation_key(node, segment_id):
+        """Return the native identity of a segment's binary-labelmap layer."""
+        if node is None:
+            return None
+        try:
+            import vtkSegmentationCorePython as vtkSegmentationCore
+
+            segment = node.GetSegmentation().GetSegment(str(segment_id))
+            if segment is None:
+                return None
+            binary_name = (
+                vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+            )
+            image = segment.GetRepresentation(binary_name)
+            if image is None:
+                return None
+            try:
+                return str(image.GetAddressAsString(""))
+            except Exception:
+                return str(getattr(image, "__this__", "")) or None
+        except Exception:
+            return None
+
+    def _shared_representation_ids(self, node):
+        """Return IDs whose geometry revision belongs to a shared VTK layer."""
+        groups = {}
+        for segment_id in node.GetSegmentation().GetSegmentIDs():
+            segment_id = str(segment_id)
+            key = self._segment_representation_key(node, segment_id)
+            if key:
+                groups.setdefault(key, []).append(segment_id)
+        return {
+            segment_id
+            for members in groups.values()
+            if len(members) > 1
+            for segment_id in members
+        }
+
+    def _ensure_independent_segment_labelmap(self, node, segment_id):
+        """Move a live label to its own layer when Slicer currently shares it."""
+        if node is None:
+            return False
+        segment_id = str(segment_id or "")
+        if not segment_id:
+            return False
+        representation_key = self._segment_representation_key(node, segment_id)
+        if not representation_key:
+            return False
+        shared = any(
+            str(other_id) != segment_id
+            and self._segment_representation_key(node, other_id)
+            == representation_key
+            for other_id in node.GetSegmentation().GetSegmentIDs()
+        )
+        if not shared:
+            return False
+        previous_applying_remote = self._applying_remote
+        self._applying_remote = True
+        try:
+            separate = getattr(
+                node.GetSegmentation(), "SeparateSegmentLabelmap", None
+            )
+            if not callable(separate):
+                return False
+            result = separate(segment_id)
+            return result is not False
+        finally:
+            self._applying_remote = previous_applying_remote
 
     def _remember_segment_revision(self, node, segment_id):
         if node is None:
@@ -6894,6 +7127,7 @@ class LiveCollaborationController:
         node = self._segmentation_node()
         if node is None:
             return
+        shared_representation_ids = self._shared_representation_ids(node)
         for segment_id in node.GetSegmentation().GetSegmentIDs():
             segment_id = str(segment_id)
             key = (node.GetID(), segment_id)
@@ -6910,7 +7144,12 @@ class LiveCollaborationController:
                 self._force_sync_refresh = True
             revision = self._segment_revision(node, segment_id)
             previous = self._segment_revisions.get(key)
-            if revision is not None and previous is not None and revision != previous:
+            if (
+                segment_id not in shared_representation_ids
+                and revision is not None
+                and previous is not None
+                and revision != previous
+            ):
                 self.dirty_segments.add(key)
                 self._schedule_segment_verification(key)
                 self._force_sync_refresh = True
@@ -6974,6 +7213,7 @@ class LiveCollaborationController:
         del caller, event
         if self._applying_remote or not self.connected:
             return
+        self._last_edit_activity_epoch = time.time()
         segment_id = str(segment_id or "")
         if segment_id:
             self._pending_segmentation_event_ids.add(segment_id)
@@ -7088,17 +7328,35 @@ class LiveCollaborationController:
         event_segment_ids = {
             str(value) for value in (event_segment_ids or ()) if str(value or "")
         }
+        # Newly painted segments are commonly packed into an existing binary
+        # labelmap layer.  Separate only after Slicer's native callback has
+        # returned; doing it inside that stack can invalidate Segment Editor's
+        # model state.
+        separated_labelmap = False
+        for segment_id in sorted((event_segment_ids | added_ids) & current_ids):
+            separated_labelmap = (
+                self._ensure_independent_segment_labelmap(node, segment_id)
+                or separated_labelmap
+            )
+        if separated_labelmap:
+            # Separation replaces the shared representation objects for more
+            # than one sibling.  Record those administrative MTime changes so
+            # they can never masquerade as voxel edits on the next probe.
+            for current_segment_id in current_ids:
+                self._remember_segment_revision(node, current_segment_id)
         # Segment identity comes from the event payload or from that segment's
         # own representation revision. Never infer it from the currently
         # selected Segment Editor row: selection may change before a deferred
         # source-representation event is delivered.
         revision_changed_ids = set()
+        shared_representation_ids = self._shared_representation_ids(node)
         for current_segment_id in current_ids:
             key = (node.GetID(), current_segment_id)
             previous_revision = self._segment_revisions.get(key)
             current_revision = self._segment_revision(node, current_segment_id)
             if (
-                previous_revision is not None
+                current_segment_id not in shared_representation_ids
+                and previous_revision is not None
                 and current_revision is not None
                 and current_revision != previous_revision
             ):
@@ -7117,7 +7375,13 @@ class LiveCollaborationController:
         node = self._segmentation_node()
         if node is None:
             return
-        for segment_id in node.GetSegmentation().GetSegmentIDs():
+        segment_ids = [
+            str(segment_id)
+            for segment_id in node.GetSegmentation().GetSegmentIDs()
+        ]
+        for segment_id in segment_ids:
+            self._ensure_independent_segment_labelmap(node, segment_id)
+        for segment_id in segment_ids:
             self._remember_segment_metadata(node, segment_id)
             key = (node.GetID(), segment_id)
             crop, bounds = self._read_mask_crop(node, segment_id)
@@ -7743,6 +8007,11 @@ class LiveCollaborationController:
         health_check = self._force_health_check or now - self._last_health_check >= 5.0
         backup_enabled = self.backup_enabled_checkbox.checked
         backup_enabled = backup_enabled() if callable(backup_enabled) else backup_enabled
+        backup_value = self.backup_interval_spin.value
+        backup_value = backup_value() if callable(backup_value) else backup_value
+        backup_interval_seconds, _large_volume_safety = (
+            self._automatic_backup_interval_seconds(float(backup_value) * 60.0)
+        )
         backup_check = (
             bool(backup_enabled)
             and _uses_shared_folder(self.client)
@@ -7750,13 +8019,13 @@ class LiveCollaborationController:
             and not self.outgoing
             and not self.dirty_segments
             and now - self._last_backup_check >= 10.0
+            and now - self._joined_at_epoch >= backup_interval_seconds
+            and now - self._last_edit_activity_epoch >= AUTO_BACKUP_IDLE_SECONDS
         )
         actions = list(self.pending_actions)
         if maintenance_idle and (
             health_check or backup_check or self._force_advanced_refresh or actions
         ):
-            backup_value = self.backup_interval_spin.value
-            backup_value = backup_value() if callable(backup_value) else backup_value
             if health_check:
                 self._last_health_check = now
             if backup_check:
@@ -7774,7 +8043,7 @@ class LiveCollaborationController:
                     fetch_advanced,
                     health_check,
                     backup_check,
-                    max(60.0, float(backup_value) * 60.0),
+                    backup_interval_seconds,
                 ),
                 name="LiveSegmentation-maintenance",
                 daemon=True,
@@ -9461,6 +9730,8 @@ class LiveCollaborationController:
 
         apply_started = time.monotonic()
         applied_count = 0
+        if operations:
+            self._last_edit_activity_epoch = time.time()
         node = self._segmentation_node()
         if node is None:
             self._show_error("The shared segmentation node no longer exists")
@@ -9520,6 +9791,7 @@ class LiveCollaborationController:
                     continue
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
+                self._ensure_independent_segment_labelmap(node, segment_id)
                 if (
                     key in self.metadata_updates
                     and operation.get("author") != self.user_name
@@ -9625,6 +9897,7 @@ class LiveCollaborationController:
                     self.owner.update_segment_binary_labelmap_from_array(
                         visible_full, node, segment_id, self.owner.get_volume_node()
                     )
+                self._ensure_independent_segment_labelmap(node, segment_id)
                 node.Modified()
                 try:
                     self.owner.refresh_segmentation_display(node, segment_id)

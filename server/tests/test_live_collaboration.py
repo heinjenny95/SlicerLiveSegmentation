@@ -88,6 +88,35 @@ def test_collaborative_segment_ids_preserve_native_global_ids():
     )
 
 
+def test_large_volume_automatic_backups_are_safely_throttled():
+    class FakeImage:
+        def __init__(self, kibibytes):
+            self.kibibytes = kibibytes
+
+        def GetActualMemorySize(self):
+            return self.kibibytes
+
+    class FakeVolume:
+        def __init__(self, kibibytes):
+            self.image = FakeImage(kibibytes)
+
+        def GetImageData(self):
+            return self.image
+
+    class FakeOwner:
+        def __init__(self, kibibytes):
+            self.volume = FakeVolume(kibibytes)
+
+        def get_volume_node(self):
+            return self.volume
+
+    small = LiveCollaborationController(FakeOwner(64 * 1024))
+    assert small._automatic_backup_interval_seconds(300) == (300, False)
+    large = LiveCollaborationController(FakeOwner(512 * 1024))
+    assert large._automatic_backup_interval_seconds(300) == (3600, True)
+    assert large._automatic_backup_interval_seconds(7200) == (7200, False)
+
+
 def test_segmentation_observer_coalesces_work_into_next_qt_turn(monkeypatch):
     queued_callbacks = []
 
@@ -940,7 +969,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.2"
+    assert health.json()["version"] == "0.14.3"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -952,7 +981,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.2",
+            "server_version": "0.14.3",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -962,7 +991,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.2",
+                    "plugin_version": "0.14.3",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
@@ -1266,6 +1295,57 @@ def test_recent_chat_feed_avoids_relisting_the_network_directory(tmp_path, monke
     assert [item["text"] for item in client.chat_messages(room["id"], 0)] == ["hello"]
 
 
+def test_stale_operation_cache_recovery_scan_is_throttled(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("throttled operation recovery", "4" * 64)
+    bob.join("throttled operation recovery", "4" * 64)
+    assert alice.operations(room["id"], 0) == []
+
+    empty = np.zeros((2, 2, 2), dtype=np.uint8)
+    changed = empty.copy()
+    changed[0, 0, 0] = 1
+    bob.push_operation(
+        room["id"],
+        operation_payload("Organ", empty, changed, operation_id="recovery-op"),
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not list(
+        alice._room_path.joinpath("operations").glob("*.json")
+    ):
+        time.sleep(0.02)
+    collaboration_module._write_json_atomic(
+        alice._room_path / "sequence-state.json",
+        {"latest_sequence": 0, "inline_operations": []},
+        durable=False,
+    )
+
+    assert alice.operations(room["id"], 0) == []
+    alice._last_operation_recovery_scan = 0.0
+    assert [item["client_operation_id"] for item in alice.operations(room["id"], 0)] == [
+        "recovery-op"
+    ]
+
+
+def test_stale_chat_cache_recovery_scan_is_throttled(tmp_path):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("throttled chat recovery", "5" * 64)
+    bob.join("throttled chat recovery", "5" * 64)
+    assert alice.chat_messages(room["id"], 0) == []
+
+    bob.send_chat(room["id"], "hello", "recovery-chat")
+    collaboration_module._write_json_atomic(
+        alice._room_path / "chat-state.json",
+        {"latest_sequence": 0, "recent_messages": []},
+        durable=False,
+    )
+
+    assert alice.chat_messages(room["id"], 0) == []
+    alice._last_chat_recovery_scan = 0.0
+    assert [item["text"] for item in alice.chat_messages(room["id"], 0)] == ["hello"]
+
+
 def test_sequence_lock_retries_transient_windows_permission_error(tmp_path, monkeypatch):
     client = SharedFolderRoomClient(tmp_path, "alice")
     room = client.join("permission race room", "e" * 64)
@@ -1310,6 +1390,29 @@ def test_shared_folder_presence_expires_and_partial_files_are_ignored(tmp_path):
     time.sleep(0.5)
     users = alice.presence(room["id"], {})
     assert [item["user"] for item in users] == ["alice"]
+
+
+def test_presence_registry_finds_known_peer_without_directory_listing(
+    tmp_path, monkeypatch
+):
+    alice = SharedFolderRoomClient(tmp_path, "alice")
+    bob = SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("direct presence lookup", "6" * 64)
+    bob.join("direct presence lookup", "6" * 64)
+    bob.presence(room["id"], {"active_segment_name": "Brain"})
+    alice._presence_paths_cache.clear()
+    alice._last_presence_directory_scan = time.monotonic()
+
+    original_glob = Path.glob
+
+    def reject_presence_listing(path, pattern):
+        if path.name == "presence":
+            raise AssertionError("known presence peer required a directory listing")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_presence_listing)
+    users = alice.presence(room["id"], {"active_segment_name": "Mandibles"})
+    assert {item["user"] for item in users} == {"alice", "bob"}
 
 
 def test_presence_bypasses_slow_atomic_replace_on_network_share(tmp_path, monkeypatch):

@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.2.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.3.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.2`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.3`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -164,6 +164,17 @@ names and colors. Consecutive label creation stays non-blocking. Shared-folder
 room setup now checks independent directories in parallel, and existing history
 loads in small progress-labelled batches so joining remains understandable and
 responsive on higher-latency NAS storage.
+
+Version 0.14.3 uses the exact segment ID carried by Slicer's source-
+representation event and prevents shared internal binary-labelmap layers from
+making a sibling label look edited. Live-room Segment Editor sessions use
+overlap-safe editing, so two people may paint the same voxels into different
+labels without either label absorbing the other. A persistent participant index
+keeps collaborators visible despite stale SMB directory listings. Frequent
+polls use compact hot-state files while immutable directory scans are throttled
+to a recovery fallback. For source volumes occupying at least 256 MB in memory,
+complete automatic `.mrb` backups wait for 30 seconds without edits and are
+limited to one per hour; manual backups remain available at any time.
 
 The safer global-label protocol is intentionally incompatible with earlier room
 formats. Every collaborator must install 0.14.0 or newer and create a new room; an older
