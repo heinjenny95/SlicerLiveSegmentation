@@ -1,4 +1,44 @@
-# Live Segmentation 0.14.0
+# Live Segmentation 0.14.1
+
+Version 0.14.1 fixes a deterministic native Slicer crash caused by changing a
+segment's identifier from inside Slicer's own `SegmentAdded` notification.
+
+## Safe Segment Editor integration
+
+- Segment-added, removed, modified, and source-representation notifications are
+  coalesced and processed on the next Qt event-loop turn. Slicer's native
+  `qMRMLSegmentsModel` can finish handling each notification before the plugin
+  traverses or changes the segmentation.
+- Slicer-generated decimal `2.25` UUID OIDs and standard UUID strings are
+  recognized as globally unique and remain unchanged. Legacy scene-local IDs
+  such as `Segment_1` are still upgraded for safe collaboration, but only after
+  the originating VTK event has returned.
+- Pending callbacks carry an observation generation and are discarded after a
+  room is left or its replica changes, so stale work cannot touch a removed MRML
+  node.
+- The room replica is attached to Segment Editor before the module becomes
+  visible. The former forced `processEvents()` re-entrancy window is removed.
+  Leaving a room deactivates the current effect and detaches both the source
+  volume and segmentation before removing the replica.
+
+## Verification
+
+- 74 automated tests pass, including new global-ID recognition and deferred,
+  coalesced VTK-event regression tests.
+- A real Slicer 5.12.3 integration run created both a legacy `Segment_1` label
+  and a native `2.25` label while Segment Editor was active, then switched
+  between Live Segmentation and Segment Editor twelve times. The run completed
+  without an access violation, stale segment lookup, or changed native ID.
+- Chat, locks, own activity, metadata synchronization, shared-folder transport,
+  material templates, review controls, snapshots, conflict detection, and
+  diagnostics also passed in the same integration run.
+
+This maintenance release keeps collaboration protocol 3 and is compatible with
+rooms created by version 0.14.0.
+
+---
+
+# Previous release: Live Segmentation 0.14.0
 
 Version 0.14.0 fixes label identity and display-metadata corruption found during
 simultaneous two-computer editing, and makes the Direct LAN and Remote HTTPS

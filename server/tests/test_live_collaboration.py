@@ -4,6 +4,8 @@ import json
 import sys
 import threading
 import time
+import types
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from collaboration import (  # noqa: E402
     HybridRoomClient,
     LanRelayServer,
     LanRoomClient,
+    LiveCollaborationController,
     LiveCollaborationError,
     LiveRoomClient,
     SharedFolderRoomClient,
@@ -66,6 +69,92 @@ def operation_payload(segment_id, previous, current, replace=False, operation_id
         "color_hex": "#37E8B8",
         **encode_mask_delta(previous, current, replace=replace),
     }
+
+
+def test_collaborative_segment_ids_preserve_native_global_ids():
+    native_oid = f"2.25.{uuid.uuid4().int}"
+    native_uuid = str(uuid.uuid4())
+    assert LiveCollaborationController._segment_id_is_globally_unique(native_oid)
+    assert LiveCollaborationController._segment_id_is_globally_unique(native_uuid)
+    assert LiveCollaborationController._segment_id_is_globally_unique(
+        f"{{{native_uuid}}}"
+    )
+    assert LiveCollaborationController._segment_id_is_globally_unique(
+        "LiveSeg-existing"
+    )
+    assert not LiveCollaborationController._segment_id_is_globally_unique(
+        "Segment_1"
+    )
+
+
+def test_segmentation_observer_coalesces_work_into_next_qt_turn(monkeypatch):
+    queued_callbacks = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(delay, callback):
+            assert delay == 0
+            queued_callbacks.append(callback)
+
+    monkeypatch.setitem(sys.modules, "qt", types.SimpleNamespace(QTimer=FakeTimer))
+
+    class FakeSegmentation:
+        def RemoveObserver(self, _tag):
+            raise AssertionError("No observer tags were registered in this test")
+
+    class FakeNode:
+        def __init__(self):
+            self.segmentation = FakeSegmentation()
+
+        def GetID(self):
+            return "vtkMRMLSegmentationNode1"
+
+        def GetSegmentation(self):
+            return self.segmentation
+
+    node = FakeNode()
+    controller = LiveCollaborationController.__new__(LiveCollaborationController)
+    controller.connected = True
+    controller._applying_remote = False
+    controller._segmentation_event_generation = 4
+    controller._segmentation_event_flush_scheduled = False
+    controller._pending_segmentation_event_ids = set()
+    controller._pending_segmentation_event_unspecified = False
+    controller._pending_segmentation_preserve_added_ids = False
+    controller._preserve_added_segment_ids = False
+    controller._observed_node = node
+    controller._observed_segmentation = node.GetSegmentation()
+    controller._observer_tags = []
+    controller._observer_callbacks = []
+    controller._segment_revisions = {}
+    controller._segmentation_node = lambda: node
+    processed = []
+    controller._process_segmentation_events = (
+        lambda current_node, segment_ids, unspecified, preserve: processed.append(
+            (current_node, set(segment_ids), unspecified, preserve)
+        )
+    )
+
+    controller._on_segmentation_modified(segment_id="2.25.1")
+    controller._on_segmentation_modified(segment_id="2.25.2")
+    controller._on_segmentation_modified(segment_id=None)
+    assert processed == []
+    assert len(queued_callbacks) == 1
+
+    queued_callbacks.pop()()
+    assert processed == [(node, {"2.25.1", "2.25.2"}, True, False)]
+
+    controller._preserve_added_segment_ids = True
+    controller._on_segmentation_modified(segment_id="TemplateSegment")
+    controller._preserve_added_segment_ids = False
+    queued_callbacks.pop()()
+    assert processed[-1] == (node, {"TemplateSegment"}, False, True)
+
+    controller._on_segmentation_modified(segment_id="2.25.stale")
+    stale_callback = queued_callbacks.pop()
+    controller._unobserve_segmentation()
+    stale_callback()
+    assert len(processed) == 2
 
 
 def test_shared_folder_watchdogs_allow_institutional_smb_latency():
@@ -765,7 +854,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.0"
+    assert health.json()["version"] == "0.14.1"
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -777,7 +866,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.0",
+            "server_version": "0.14.1",
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -787,7 +876,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.0",
+                    "plugin_version": "0.14.1",
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }

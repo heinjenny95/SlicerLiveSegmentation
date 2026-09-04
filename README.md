@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.0.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.1.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.0`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.1`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -145,8 +145,17 @@ includes the current user's acknowledged changes. Direct LAN and Remote HTTPS
 address controls appear directly below the connection selector, with the LAN
 host creating its private local room store, URL, and session code automatically.
 
+Version 0.14.1 fixes a native Slicer crash that could occur when a collaborator
+created a label and opened Segment Editor. Segment notifications are now
+coalesced and processed on the next Qt event-loop turn, after Slicer's native
+segment model has finished updating. Slicer's globally unique `2.25…` segment
+IDs are preserved instead of being removed and reinserted, and opening or
+clearing Segment Editor no longer exposes a partially updated room replica.
+This maintenance release keeps collaboration protocol 3 and remains compatible
+with rooms created by version 0.14.0.
+
 The safer global-label protocol is intentionally incompatible with earlier room
-formats. Every collaborator must install 0.14.0 and create a new room; an older
+formats. Every collaborator must install 0.14.0 or newer and create a new room; an older
 room is rejected clearly instead of risking a wrong label assignment.
 
 Drive letters may differ between computers as long as both paths refer to the

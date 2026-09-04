@@ -740,6 +740,30 @@ def run_probe():
                     f"Local label kept a scene-local ID: {local_global_id}"
                 )
 
+            # Slicer 5.12 uses 2.25 UUID OIDs for labels created by Segment
+            # Editor.  They are already globally unique and must stay in place;
+            # removing/reinserting one from inside SegmentAdded used to leave
+            # qMRMLSegmentsModel holding a stale ID and crash vtkSegmentationCore.
+            native_label_id = f"2.25.{uuid.uuid4().int}"
+            native_label = slicer.vtkSegment()
+            native_label.SetName("Native global label")
+            native_label.SetColor(0.95, 0.82, 0.18)
+            segmentation.GetSegmentation().AddSegment(
+                native_label, native_label_id
+            )
+            pump_events(0.1)
+            if segmentation.GetSegmentation().GetSegment(native_label_id) is None:
+                raise RuntimeError("Slicer's native global segment ID was replaced")
+            for _ in range(12):
+                slicer.util.selectModule("LiveSegmentation")
+                pump_events(0.01)
+                widget.open_segment_editor()
+                pump_events(0.01)
+                if editor.segmentationNode() != segmentation:
+                    raise RuntimeError(
+                        "Repeated Segment Editor switch lost the room segmentation"
+                    )
+
             remote_label_id = new_collaboration_segment_id()
             remote_mask = np.zeros(image.shape, dtype=np.uint8)
             remote_mask[2, 2, 2] = 1

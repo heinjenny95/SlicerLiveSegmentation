@@ -213,12 +213,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
         editor = self._standard_segment_editor_widget()
         if editor is not None:
-            editor.setSegmentationNode(segmentation_node)
-            volume_node = self.get_volume_node()
-            if hasattr(editor, "setSourceVolumeNode"):
-                editor.setSourceVolumeNode(volume_node)
-            elif hasattr(editor, "setMasterVolumeNode"):
-                editor.setMasterVolumeNode(volume_node)
+            self._configure_standard_segment_editor(
+                editor, segmentation_node, self.get_volume_node()
+            )
         return segmentation_node
 
     def clear_live_segmentation(self, segmentation_node_id=None):
@@ -235,6 +232,14 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                         or editor_node.GetAttribute("LiveSegmentation.SharedReplica") == "1"
                     )
                 ):
+                    try:
+                        editor.setActiveEffect(None)
+                    except Exception:
+                        pass
+                    if hasattr(editor, "setSourceVolumeNode"):
+                        editor.setSourceVolumeNode(None)
+                    elif hasattr(editor, "setMasterVolumeNode"):
+                        editor.setMasterVolumeNode(None)
                     editor.setSegmentationNode(None)
             except Exception:
                 pass
@@ -382,6 +387,14 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         except Exception:
             return None
 
+    @staticmethod
+    def _configure_standard_segment_editor(editor, segmentation_node, volume_node):
+        editor.setSegmentationNode(segmentation_node)
+        if hasattr(editor, "setSourceVolumeNode"):
+            editor.setSourceVolumeNode(volume_node)
+        elif hasattr(editor, "setMasterVolumeNode"):
+            editor.setMasterVolumeNode(volume_node)
+
     def open_segment_editor(self):
         if self.live_collaboration is None or not self.live_collaboration.connected:
             slicer.util.errorDisplay("Join a live room before opening Segment Editor.")
@@ -397,17 +410,20 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             return
 
         slicer.util.setSliceViewerLayers(background=volume_node)
+        # Attach the authoritative room replica before the module becomes
+        # visible.  This prevents its qMRMLSegmentsModel from briefly binding to
+        # a stale node while queued segment notifications are still settling.
+        editor = self._standard_segment_editor_widget()
+        if editor is not None:
+            self._configure_standard_segment_editor(
+                editor, segmentation_node, volume_node
+            )
         slicer.util.selectModule("SegmentEditor")
-        slicer.app.processEvents()
         editor = self._standard_segment_editor_widget()
         if editor is None:
             slicer.util.errorDisplay("Slicer's Segment Editor is not available.")
             return
-        editor.setSegmentationNode(segmentation_node)
-        if hasattr(editor, "setSourceVolumeNode"):
-            editor.setSourceVolumeNode(volume_node)
-        elif hasattr(editor, "setMasterVolumeNode"):
-            editor.setMasterVolumeNode(volume_node)
+        self._configure_standard_segment_editor(editor, segmentation_node, volume_node)
 
     def get_selected_segmentation_node_and_segment_id(self):
         segmentation_node = self.get_segmentation_node()
@@ -732,4 +748,4 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.14.0")
+        self.assertEqual(PLUGIN_VERSION, "0.14.1")
