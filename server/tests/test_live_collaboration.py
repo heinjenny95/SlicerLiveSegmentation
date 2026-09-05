@@ -74,6 +74,29 @@ def operation_payload(segment_id, previous, current, replace=False, operation_id
     }
 
 
+def test_unavailable_undo_does_not_escape_gui_result_handler(monkeypatch):
+    messages = []
+    monkeypatch.setitem(sys.modules, "slicer", types.SimpleNamespace(
+        util=types.SimpleNamespace(showStatusMessage=lambda message, _duration: messages.append(message))
+    ))
+
+    def unavailable(_value, _sequence):
+        raise LiveCollaborationError("The deleted label did not exist before this edit")
+
+    controller = types.SimpleNamespace(
+        _queue_collaborative_undo=unavailable,
+        _append_activity=messages.append,
+        undo_shared_button=types.SimpleNamespace(enabled=False),
+        _force_sync_refresh=False,
+    )
+    LiveCollaborationController._handle_action_results(controller, [
+        {"action": "undo_operation", "request": {"sequence": 1}, "value": {}}
+    ])
+    assert controller.undo_shared_button.enabled
+    assert not controller._force_sync_refresh
+    assert len(messages) == 2 and "Could not undo" in messages[0]
+
+
 def test_collaborative_segment_ids_preserve_native_global_ids():
     native_oid = f"2.25.{uuid.uuid4().int}"
     native_uuid = str(uuid.uuid4())
@@ -1102,7 +1125,7 @@ def test_remote_server_preflight_is_non_mutating_and_finds_second_computer(clien
 def test_health_advertises_public_server_compatibility_and_security(client):
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "0.14.6"
+    assert health.json()["version"] == collaboration_module.PLUGIN_VERSION
     assert health.json()["protocol_version"] == 3
     assert health.json()["minimum_plugin_version"] == "0.14.0"
     assert health.json()["authentication"] == "open-testing"
@@ -1114,7 +1137,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
 
     def response(_method, _path, _payload):
         return {
-            "server_version": "0.14.6",
+            "server_version": collaboration_module.PLUGIN_VERSION,
             "protocol_version": 3,
             "minimum_plugin_version": "0.14.0",
             "server_time_epoch": time.time(),
@@ -1124,7 +1147,7 @@ def test_remote_https_client_turns_server_capabilities_into_ready_report(monkeyp
             "preflight_participants": [
                 {
                     "user": "bob",
-                    "plugin_version": "0.14.6",
+                    "plugin_version": collaboration_module.PLUGIN_VERSION,
                     "protocol_version": 3,
                     "volume_signature": "a" * 64,
                 }
@@ -2496,3 +2519,120 @@ def test_server_preserves_collaborative_undo_metadata(client, headers):
         headers=headers,
     ).json()
     assert operations[-1]["undo_of_sequence"] == created["sequence"]
+
+
+def test_baseline_worker_fork_survives_concurrent_gui_writes():
+    baseline = ChunkedMaskBaseline((128, 128, 128))
+    bounds = [1, 3, 1, 3, 1, 3]
+    ones = np.ones((2, 2, 2), dtype=np.uint8)
+    baseline.set_region(bounds, ones, ones)
+    private = baseline.fork()
+    baseline.set_region(bounds, ones, np.zeros_like(ones))
+    assert baseline.chunk_count == 0
+    assert np.all(private.region(bounds) == 1)
+    private.set_region(bounds, ones, np.zeros_like(ones))
+    assert baseline.chunk_count == 0
+
+
+def test_packed_remote_mask_reads_unaligned_tile_bit_offsets():
+    rng = np.random.default_rng(74)
+    before = rng.integers(0, 2, (67, 69, 71), dtype=np.uint8)
+    after = rng.integers(0, 2, before.shape, dtype=np.uint8)
+    operation = collaboration_module.encode_mask_delta(before, after)
+    operation["voxel_bbox"] = [10, 77, 20, 89, 30, 101]
+    packed = collaboration_module.PackedOperationMask(operation)
+    changed, values = packed.region([13, 76, 22, 88, 33, 101])
+    assert np.array_equal(values, after[3:66, 2:68, 3:71])
+    assert np.array_equal(changed, (before != after)[3:66, 2:68, 3:71])
+    changed, values = packed.region([76, 77, 88, 89, 100, 101])
+    assert values[0, 0, 0] == after[-1, -1, -1]
+    assert changed[0, 0, 0] == (before[-1, -1, -1] != after[-1, -1, -1])
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_bounded_background_encoding_preserves_distant_edits_and_deletions(replace):
+    shape = (259, 70, 271)
+    before = np.zeros(shape, dtype=np.uint8)
+    before[2:5, 3:6, 4:7] = 1
+    before[250:253, 60:63, 260:263] = 1
+    current = before.copy()
+    current[2:5, 3:6, 4:7] = 0
+    current[140:144, 20:24, 150:154] = 1
+    baseline = ChunkedMaskBaseline.from_crop(shape, before, [0, shape[0], 0, shape[1], 0, shape[2]])
+    operations = collaboration_module.encode_bounded_crop_edits(
+        baseline, current, [0, shape[0], 0, shape[1], 0, shape[2]], shape, replace=replace
+    )
+    actual = before.copy()
+    for operation in operations:
+        changed, _ = collaboration_module.decode_mask_delta(operation)
+        assert changed.size <= collaboration_module.OUTGOING_TILE_SIZE ** 3
+        actual = apply_mask_delta(actual, operation)
+    assert np.array_equal(actual, current)
+    assert np.array_equal(baseline.to_dense(), before)
+
+
+def test_background_encoding_does_not_resend_already_queued_strokes():
+    shape = (160, 8, 160)
+    empty = np.zeros(shape, dtype=np.uint8)
+    pending = empty.copy()
+    pending[1, 1, 1] = 1
+    current = pending.copy()
+    current[150, 2, 150] = 1
+    first = collaboration_module.encode_mask_delta(empty, pending)
+    operations = collaboration_module.encode_bounded_crop_edits(
+        ChunkedMaskBaseline(shape), current, [0, 160, 0, 8, 0, 160], shape, [first]
+    )
+    assert len(operations) == 1
+    changed, _ = collaboration_module.decode_mask_delta(operations[0])
+    assert np.count_nonzero(changed) == 1
+    assert np.array_equal(apply_mask_delta(pending, operations[0]), current)
+
+
+@pytest.mark.parametrize("empty_snapshot", [False, True])
+def test_incoming_snapshot_tiles_clear_old_distant_components(empty_snapshot):
+    shape = (193, 65, 131)
+    before = np.zeros(shape, dtype=np.uint8)
+    before[2, 2, 2] = 1
+    before[190, 63, 129] = 1
+    after = np.zeros(shape, dtype=np.uint8)
+    if not empty_snapshot:
+        after[70:140, 10:40, 50:100] = 1
+    baseline = ChunkedMaskBaseline.from_crop(shape, before, [0, 193, 0, 65, 0, 131])
+    operation = {"sequence": 10, **collaboration_module.encode_mask_delta(before, after, replace=True)}
+    actual = before.copy()
+    completions = 0
+    for piece in collaboration_module.iter_operation_tiles(operation, baseline):
+        changed, values = piece["_decoded"]
+        assert changed.size <= collaboration_module.INCOMING_TILE_SIZE ** 3
+        if piece.get("_completion_only"):
+            completions += 1
+            continue
+        z0, z1, y0, y1, x0, x1 = piece["voxel_bbox"]
+        actual[z0:z1, y0:y1, x0:x1][changed] = values[changed]
+    assert completions == 1
+    assert np.array_equal(actual, after)
+
+
+def test_async_journal_stall_does_not_block_submission_or_resurrect_cleared_edits(tmp_path):
+    journal = collaboration_module.PendingOperationJournal(tmp_path / "recovery.json")
+    writing = threading.Event()
+    release = threading.Event()
+    cleared = threading.Event()
+    original_write = journal.write
+
+    def blocked_write(context, operations):
+        if operations and operations[0]["client_operation_id"] == "first":
+            writing.set()
+            assert release.wait(2.0)
+        return original_write(context, operations)
+
+    journal.write = blocked_write
+    journal.submit({}, [{"client_operation_id": "first"}])
+    assert writing.wait(2.0)
+    started = time.perf_counter()
+    journal.submit({}, [{"client_operation_id": "second"}])
+    journal.submit({}, [], lambda success: cleared.set() if success else None)
+    assert time.perf_counter() - started < 0.1
+    release.set()
+    assert cleared.wait(2.0)
+    assert not journal.path.exists()

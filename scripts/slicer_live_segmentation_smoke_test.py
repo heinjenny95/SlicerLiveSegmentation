@@ -1374,7 +1374,7 @@ def run_probe():
             }
 
         deletion_sync = None
-        deleted_probe_ids = ("LocalDeletionProbe", "RemoteDeletionProbe")
+        deleted_probe_ids = ("LiveSeg-LocalDeletionProbe", "LiveSeg-RemoteDeletionProbe")
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_DELETION", "0") == "1":
             if not hasattr(controller.client, "_room_path"):
                 raise RuntimeError("Label deletion smoke test requires shared-folder mode")

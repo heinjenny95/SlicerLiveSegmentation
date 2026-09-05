@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -r server/requirements-dev.txt
-      - run: python -m ruff check server LiveSegmentation scripts/build_release.py scripts/slicer_live_segmentation_smoke_test.py
+      - run: python -m ruff check server LiveSegmentation scripts
       - run: python -m compileall -q server LiveSegmentation scripts
       - run: python -m pytest -q
 

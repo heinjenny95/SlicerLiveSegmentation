@@ -12,7 +12,8 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     (Join-Path $projectRoot 'scripts\build_release.py') `
     (Join-Path $projectRoot 'scripts\benchmark_shared_folder_latency.py') `
     (Join-Path $projectRoot 'scripts\slicer_live_segmentation_smoke_test.py') `
-    (Join-Path $projectRoot 'scripts\slicer_nninteractive_empty_segment_smoke_test.py')
+    (Join-Path $projectRoot 'scripts\slicer_nninteractive_empty_segment_smoke_test.py') `
+    (Join-Path $projectRoot 'scripts\slicer_responsiveness_smoke_test.py')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $venvPython -m pytest (Join-Path $projectRoot 'server')
 exit $LASTEXITCODE

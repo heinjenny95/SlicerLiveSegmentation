@@ -16,6 +16,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -30,6 +31,7 @@ import urllib.request
 import uuid
 import zipfile
 import zlib
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -120,6 +122,12 @@ SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
 AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
 JOURNAL_WRITE_RETRY_SECONDS = 5.0
 FULL_PROJECT_BACKUP_SETTINGS_VERSION = 2
+GUI_WORK_BUDGET_SECONDS = 0.008
+GUI_CONTINUATION_MILLISECONDS = 5
+INCOMING_TILE_SIZE = 64
+MAX_PENDING_REMOTE_OPERATIONS = 16
+MAX_INCOMING_PACKED_BYTES = 32 * 1024 * 1024
+OUTGOING_TILE_SIZE = 128
 
 
 def new_collaboration_segment_id():
@@ -604,16 +612,17 @@ def volume_signature(array, spacing=None, origin=None, ijk_to_ras=None, sample_c
 
 
 def _delta_bounds(changed):
-    coordinates = np.nonzero(changed)
-    if not coordinates[0].size:
+    # Coordinate lists allocate three int64 values for every foreground voxel.
+    # Axis projections need only O(z+y+x) temporary memory, even for dense ROIs.
+    z = np.flatnonzero(np.any(changed, axis=(1, 2)))
+    if not z.size:
         return None
+    y = np.flatnonzero(np.any(changed, axis=(0, 2)))
+    x = np.flatnonzero(np.any(changed, axis=(0, 1)))
     return [
-        int(coordinates[0].min()),
-        int(coordinates[0].max()) + 1,
-        int(coordinates[1].min()),
-        int(coordinates[1].max()) + 1,
-        int(coordinates[2].min()),
-        int(coordinates[2].max()) + 1,
+        int(z[0]), int(z[-1]) + 1,
+        int(y[0]), int(y[-1]) + 1,
+        int(x[0]), int(x[-1]) + 1,
     ]
 
 
@@ -647,6 +656,12 @@ class ChunkedMaskBaseline:
 
     def clear(self):
         self.chunks.clear()
+
+    def fork(self):
+        """Share immutable chunks with a worker; future writes copy one chunk."""
+        result = ChunkedMaskBaseline(self.shape, self.chunk_size)
+        result.chunks = dict(self.chunks)
+        return result
 
     def _chunk_shape(self, coordinate):
         starts = [int(value) * self.chunk_size for value in coordinate]
@@ -724,11 +739,14 @@ class ChunkedMaskBaseline:
                 if not np.any(local_values[local_changed]):
                     continue
                 chunk = np.zeros(self._chunk_shape(coordinate), dtype=np.uint8)
-                self.chunks[coordinate] = chunk
+            else:
+                chunk = chunk.copy()
             target = chunk[chunk_slices]
             target[local_changed] = local_values[local_changed]
             if not np.any(chunk):
                 self.chunks.pop(coordinate, None)
+            else:
+                self.chunks[coordinate] = chunk
 
     def replace_crop(self, crop=None, bounds=None):
         self.clear()
@@ -1072,6 +1090,57 @@ def encode_mask_crop_snapshot(current_crop, current_bounds, volume_shape):
     return encoded
 
 
+def encode_bounded_crop_edits(baseline, crop, crop_bounds, volume_shape, pending_operations=(), replace=False):
+    """Compare private NumPy state off-thread without allocating a dense union."""
+    working = baseline.fork() if isinstance(baseline, ChunkedMaskBaseline) else ChunkedMaskBaseline.from_crop(
+        volume_shape, baseline, [0, volume_shape[0], 0, volume_shape[1], 0, volume_shape[2]]
+    )
+    for operation in pending_operations:
+        if operation.get("operation_kind") == "snapshot":
+            working.clear()
+        changed, values = decode_mask_delta(operation)
+        working.set_region(operation["voxel_bbox"], changed, values)
+    coordinates = set()
+    for coordinate in working.chunks:
+        origin = tuple(value * working.chunk_size for value in coordinate)
+        coordinates.add(tuple(value // OUTGOING_TILE_SIZE for value in origin))
+    if crop is not None and crop_bounds is not None:
+        for z in range(crop_bounds[0] // OUTGOING_TILE_SIZE, (crop_bounds[1] - 1) // OUTGOING_TILE_SIZE + 1):
+            for y in range(crop_bounds[2] // OUTGOING_TILE_SIZE, (crop_bounds[3] - 1) // OUTGOING_TILE_SIZE + 1):
+                for x in range(crop_bounds[4] // OUTGOING_TILE_SIZE, (crop_bounds[5] - 1) // OUTGOING_TILE_SIZE + 1):
+                    coordinates.add((z, y, x))
+    result = []
+    if replace:
+        result.append(encode_mask_crop_snapshot(None, None, volume_shape))
+    for coordinate in sorted(coordinates):
+        bounds = []
+        for axis in range(3):
+            low = coordinate[axis] * OUTGOING_TILE_SIZE
+            bounds.extend([low, min(low + OUTGOING_TILE_SIZE, volume_shape[axis])])
+        shape = tuple(bounds[2 * axis + 1] - bounds[2 * axis] for axis in range(3))
+        current = np.zeros(shape, dtype=np.uint8)
+        if crop is not None and crop_bounds is not None:
+            overlap = []
+            for axis in range(3):
+                overlap.extend([max(bounds[2 * axis], crop_bounds[2 * axis]), min(bounds[2 * axis + 1], crop_bounds[2 * axis + 1])])
+            if all(overlap[2 * axis] < overlap[2 * axis + 1] for axis in range(3)):
+                src = tuple(slice(overlap[2 * axis] - crop_bounds[2 * axis], overlap[2 * axis + 1] - crop_bounds[2 * axis]) for axis in range(3))
+                dst = tuple(slice(overlap[2 * axis] - bounds[2 * axis], overlap[2 * axis + 1] - bounds[2 * axis]) for axis in range(3))
+                current[dst] = crop[src]
+        previous = np.zeros(shape, dtype=np.uint8) if replace else working.region(bounds)
+        encoded = encode_mask_delta(previous, current)
+        if encoded is None:
+            continue
+        encoded["voxel_bbox"] = [value + bounds[(index // 2) * 2] for index, value in enumerate(encoded["voxel_bbox"])]
+        encoded["volume_shape"] = list(volume_shape)
+        result.append(encoded)
+    # An empty snapshot followed by one patch can be represented by that one
+    # ordinary snapshot, preserving the efficient small-label path.
+    if replace and len(result) == 2:
+        result = [{**result[1], "operation_kind": "snapshot"}]
+    return result
+
+
 def decode_mask_delta(operation):
     """Return crop-local changed and value arrays for one encoded operation."""
     if operation.get("encoding") != LIVE_ENCODING:
@@ -1109,6 +1178,128 @@ def apply_mask_delta(mask, operation):
     crop = result[z0:z1, y0:y1, x0:x1]
     crop[changed] = values[changed]
     return result
+
+
+class PackedOperationMask:
+    """Keep legacy large operations bit-packed; expand only one display tile."""
+
+    def __init__(self, operation):
+        if operation.get("encoding") != LIVE_ENCODING:
+            raise ValueError("Unsupported live-operation encoding")
+        self.bounds = tuple(int(value) for value in operation["voxel_bbox"])
+        self.shape = tuple(self.bounds[2 * axis + 1] - self.bounds[2 * axis] for axis in range(3))
+        if any(size <= 0 for size in self.shape):
+            raise ValueError("Live-operation bounds are empty")
+        self.packed_bytes = (int(np.prod(self.shape, dtype=np.int64)) + 7) // 8
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(base64.b64decode(operation["payload"], validate=True), self.packed_bytes * 2 + 1)
+        if len(raw) != self.packed_bytes * 2 or not decoder.eof:
+            raise ValueError("Live-operation payload length does not match its bounds")
+        self.bytes = np.frombuffer(raw, dtype=np.uint8)
+
+    def region(self, bounds):
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
+        z0, z1 = z0 - self.bounds[0], z1 - self.bounds[0]
+        y0, y1 = y0 - self.bounds[2], y1 - self.bounds[2]
+        x0, x1 = x0 - self.bounds[4], x1 - self.bounds[4]
+        width = x1 - x0
+        starts = ((np.arange(z0, z1, dtype=np.int64)[:, None] * self.shape[1] + np.arange(y0, y1, dtype=np.int64)[None, :]) * self.shape[2] + x0)
+        indices = starts[:, :, None] // 8 + np.arange((width + 14) // 8)[None, None, :]
+        # A final row may have fewer than seven padding bits. The extra gather
+        # byte is irrelevant but must not index into the next bitset.
+        indices = np.minimum(indices, self.packed_bytes - 1)
+        bit_indices = starts[:, :, None] % 8 + np.arange(width)[None, None, :]
+        regions = []
+        for offset in (0, self.packed_bytes):
+            bits = np.unpackbits(self.bytes[indices + offset], bitorder="little", axis=-1)
+            regions.append(np.take_along_axis(bits, bit_indices, axis=-1))
+        return regions[0].astype(bool), regions[1]
+
+
+def iter_operation_tiles(operation, baseline=None, tile_size=INCOMING_TILE_SIZE):
+    """Yield bounded, decoded writes; commit the shared sequence only at the end.
+
+    A snapshot is replacement of the confirmed state. Include occupied old
+    chunks outside its new bounds so clearing a widely spread label never
+    requires constructing a source-volume-sized temporary array.
+    """
+    if operation.get("segment_deleted"):
+        yield operation
+        return
+    decoded = operation.get("_decoded")
+    packed = operation.get("_packed")
+    if packed is None:
+        changed, values = decoded if decoded is not None else decode_mask_delta(operation)
+    shape = tuple(int(value) for value in operation["volume_shape"])
+    bounds = [int(value) for value in operation["voxel_bbox"]]
+    z0, z1, y0, y1, x0, x1 = bounds
+    if any(bounds[2 * axis] < 0 or bounds[2 * axis + 1] > shape[axis] for axis in range(3)):
+        raise ValueError("Live-operation bounds exceed the source volume")
+    snapshot = operation.get("operation_kind") == "snapshot"
+    if isinstance(baseline, ChunkedMaskBaseline):
+        tile_size = baseline.chunk_size
+
+    def coordinates():
+        ranges = [(bounds[2 * axis] // tile_size, (bounds[2 * axis + 1] - 1) // tile_size) for axis in range(3)]
+        if snapshot and isinstance(baseline, ChunkedMaskBaseline):
+            for coordinate in list(baseline.chunks):
+                if not all(ranges[axis][0] <= coordinate[axis] <= ranges[axis][1] for axis in range(3)):
+                    yield coordinate
+        elif snapshot and baseline is not None:
+            # Compatibility for historical dense test baselines.
+            old_bounds = _delta_bounds(baseline)
+            if old_bounds is not None:
+                for z in range(old_bounds[0] // tile_size, (old_bounds[1] - 1) // tile_size + 1):
+                    for y in range(old_bounds[2] // tile_size, (old_bounds[3] - 1) // tile_size + 1):
+                        for x in range(old_bounds[4] // tile_size, (old_bounds[5] - 1) // tile_size + 1):
+                            coordinate = (z, y, x)
+                            if not all(ranges[axis][0] <= coordinate[axis] <= ranges[axis][1] for axis in range(3)):
+                                yield coordinate
+        for z in range(ranges[0][0], ranges[0][1] + 1):
+            for y in range(ranges[1][0], ranges[1][1] + 1):
+                for x in range(ranges[2][0], ranges[2][1] + 1):
+                    yield z, y, x
+
+    for coordinate in coordinates():
+        tile_bounds = []
+        for axis in range(3):
+            low = coordinate[axis] * tile_size
+            tile_bounds.extend([low, min(low + tile_size, shape[axis])])
+        overlap = [
+            max(tile_bounds[0], z0), min(tile_bounds[1], z1),
+            max(tile_bounds[2], y0), min(tile_bounds[3], y1),
+            max(tile_bounds[4], x0), min(tile_bounds[5], x1),
+        ]
+        if snapshot:
+            tile_shape = tuple(tile_bounds[2 * axis + 1] - tile_bounds[2 * axis] for axis in range(3))
+            tile_changed = np.ones(tile_shape, dtype=bool)
+            tile_values = np.zeros(tile_shape, dtype=np.uint8)
+            if all(overlap[2 * axis] < overlap[2 * axis + 1] for axis in range(3)):
+                src = tuple(slice(overlap[2 * axis] - bounds[2 * axis], overlap[2 * axis + 1] - bounds[2 * axis]) for axis in range(3))
+                dst = tuple(slice(overlap[2 * axis] - tile_bounds[2 * axis], overlap[2 * axis + 1] - tile_bounds[2 * axis]) for axis in range(3))
+                local_changed, local_values = packed.region(overlap) if packed is not None else (changed[src], values[src])
+                tile_values[dst] = np.where(local_changed, local_values, 0)
+        else:
+            tile_bounds = overlap
+            src = tuple(slice(overlap[2 * axis] - bounds[2 * axis], overlap[2 * axis + 1] - bounds[2 * axis]) for axis in range(3))
+            tile_changed, tile_values = packed.region(overlap) if packed is not None else (changed[src], values[src])
+        # Yield no-op tiles as well: advancing a huge sparse iterator must not
+        # scan all its empty space in a single GUI callback.
+        yield {
+            **operation,
+            "operation_kind": "patch",
+            "voxel_bbox": tile_bounds,
+            "_decoded": (tile_changed, tile_values),
+            "_partial_operation": True,
+            "_snapshot_tile": snapshot,
+        }
+    yield {
+        **operation,
+        "operation_kind": "patch",
+        "voxel_bbox": [0, 1, 0, 1, 0, 1],
+        "_decoded": (np.zeros((1, 1, 1), dtype=bool), np.zeros((1, 1, 1), dtype=np.uint8)),
+        "_completion_only": True,
+    }
 
 
 class LiveRoomClient:
@@ -4312,6 +4503,18 @@ class LiveCollaborationController:
         self._join_status_second = -1
         self._join_context = None
         self._worker_results = queue.Queue()
+        self._incoming_operations = deque()
+        self._incoming_iterator = None
+        self._incoming_piece = None
+        self._incoming_received_sequence = 0
+        self._incoming_continuation_scheduled = False
+        self._incoming_retry_at = 0.0
+        self._local_capture = None
+        self._local_encode_pending = False
+        self._local_encode_worker = None
+        self._local_continuation_scheduled = False
+        self._pending_remote_highlight = None
+        self._remote_highlight_scheduled = False
         self._last_presence_send = 0.0
         self._presence_worker_started_at = 0.0
         self._presence_stall_status_second = -1
@@ -5045,7 +5248,11 @@ class LiveCollaborationController:
             transport = "server"
         node = self._segmentation_node()
         node_name = node.GetName() if node is not None else "shared segmentation"
-        return f"● Live via {transport} in room “{self.room_name}” — editing “{node_name}”"
+        text = f"● Live via {transport} in room “{self.room_name}” — editing “{node_name}”"
+        pending = len(self._incoming_operations)
+        if pending:
+            text += f" — applying {pending} incoming change(s)…"
+        return text
 
     def _initial_sync_status_text(self):
         completed = min(int(self.last_sequence), int(self.initial_sequence))
@@ -5196,7 +5403,10 @@ class LiveCollaborationController:
         if not enabled:
             signature = ("disabled",)
             if self._journal_state_signature != signature:
-                self._operation_journal.clear()
+                if hasattr(self._operation_journal, "submit"):
+                    self._operation_journal.submit({}, [])
+                else:
+                    self._operation_journal.clear()
                 self._journal_state_signature = signature
                 self._journal_retry_at = 0.0
             return
@@ -5220,9 +5430,17 @@ class LiveCollaborationController:
         now = time.monotonic()
         if now < float(self._journal_retry_at or 0.0):
             return
-        journal_written = self._operation_journal.write(
-            self._journal_context, pending
-        )
+        submit = getattr(self._operation_journal, "submit", None)
+        if callable(submit):
+            results, session_token = self._worker_results, self._session_token
+            submit(self._journal_context, pending, lambda success: results.put({
+                "lane": "local-journal", "session_token": session_token,
+                "signature": signature, "success": success, "pending_count": len(pending),
+            }))
+            self._journal_state_signature = signature
+            self.recovery_status_label.setText(f"Writing crash journal for {len(pending)} pending edit(s)…")
+            return
+        journal_written = self._operation_journal.write(self._journal_context, pending)
         if not journal_written:
             self._journal_retry_at = now + JOURNAL_WRITE_RETRY_SECONDS
             self.recovery_status_label.setText(
@@ -5282,7 +5500,8 @@ class LiveCollaborationController:
             ("edit-push", "publish"),
             ("edit-pull", "receive poll"),
             ("local-diff", "local label scan"),
-            ("apply", "apply/render"),
+            ("local-encode", "background encode"),
+            ("gui-incoming", "incoming UI work"),
             ("chat-send", "chat send"),
         ):
             if key in stages:
@@ -6853,7 +7072,7 @@ class LiveCollaborationController:
         segmentation_node_id = self.segmentation_node_id
         if notify_remote:
             if self._operation_journal is not None:
-                self._operation_journal.clear()
+                self._operation_journal.submit({}, [])
         else:
             self._sync_operation_journal()
         self._joining = False
@@ -6891,6 +7110,18 @@ class LiveCollaborationController:
         self._joined_at_epoch = 0.0
         self._last_edit_activity_epoch = 0.0
         self.baselines.clear()
+        self._incoming_operations.clear()
+        self._incoming_iterator = None
+        self._incoming_piece = None
+        self._incoming_received_sequence = 0
+        self._incoming_continuation_scheduled = False
+        self._incoming_retry_at = 0.0
+        self._local_capture = None
+        self._local_encode_pending = False
+        self._local_encode_worker = None
+        self._local_continuation_scheduled = False
+        self._pending_remote_highlight = None
+        self._remote_highlight_scheduled = False
         self.baseline_bounds.clear()
         self.dirty_segments.clear()
         self.force_snapshots.clear()
@@ -7639,6 +7870,11 @@ class LiveCollaborationController:
         for segment_id in segment_ids:
             self._remember_segment_metadata(node, segment_id)
             key = (node.GetID(), segment_id)
+            if not seed and key in self.baselines:
+                # Ordered replay already constructed the confirmed state. A
+                # second whole-label read at join completion only stalls input.
+                self._remember_segment_revision(node, segment_id)
+                continue
             crop, bounds = self._read_mask_crop(node, segment_id)
             if seed:
                 self.baselines[key] = ChunkedMaskBaseline(self.volume_shape)
@@ -7857,14 +8093,61 @@ class LiveCollaborationController:
             self.metadata_updates.discard(key)
             self._segment_revisions.pop(key, None)
             self._segment_verifications.pop(key, None)
-        for key in list(self.dirty_segments):
+        capture_key = self._local_capture[0] if self._local_capture is not None else None
+        keys = list(self.dirty_segments)
+        if capture_key in keys:
+            keys.remove(capture_key)
+            keys.insert(0, capture_key)
+        for key in keys:
+            if self._local_encode_pending:
+                break
             node = slicer.mrmlScene.GetNodeByID(key[0])
             if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
                 self.dirty_segments.discard(key)
                 self.metadata_updates.discard(key)
+                self._local_capture = None
                 continue
             previous = self.baselines.get(key)
-            current_crop, current_bounds = self._read_mask_crop(node, key[1])
+            revision = self._segment_revision(node, key[1])
+            if (key in self.metadata_updates and key not in self.force_snapshots
+                    and self._local_capture is None and revision is not None
+                    and revision == self._segment_revisions.get(key)
+                    and self._current_role() != "viewer" and not self._locked_by_other(key[1])):
+                segment = node.GetSegmentation().GetSegment(key[1])
+                self.outgoing.append({
+                    "client_operation_id": str(uuid.uuid4()), "segment_id": key[1],
+                    "segment_name": segment.GetName() or key[1],
+                    "color_hex": self._segment_color_hex(segment),
+                    "base_sequence": int(self.last_sequence), "metadata_update": True,
+                    **encode_metadata_update(self.volume_shape),
+                })
+                self.outgoing_keys.add(key)
+                self.metadata_updates.discard(key)
+                self.dirty_segments.discard(key)
+                continue
+            capture = getattr(self.owner, "capture_segment_mask_steps", None)
+            if callable(capture):
+                if self._local_capture is None or self._local_capture[0] != key:
+                    self._local_capture = (key, capture(node, key[1], self.owner.get_volume_node()))
+                deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
+                completed = False
+                try:
+                    while time.perf_counter() < deadline:
+                        next(self._local_capture[1])
+                except StopIteration as stopped:
+                    current_crop, current_bounds = stopped.value
+                    completed = True
+                    self._local_capture = None
+                except RuntimeError as exc:
+                    self._local_capture = None
+                    if str(exc) != "Live label changed during mask capture":
+                        self._show_error(str(exc))
+                    break
+                if not completed:
+                    self._schedule_local_continuation()
+                    break
+            else:
+                current_crop, current_bounds = self._read_mask_crop(node, key[1])
             self._remember_segment_revision(node, key[1])
             if self._current_role() == "viewer":
                 if self._crop_differs_from_baseline(
@@ -7892,49 +8175,34 @@ class LiveCollaborationController:
                 continue
             if previous is None:
                 previous = ChunkedMaskBaseline(self.volume_shape)
-            # A new room/label is announced as a snapshot, but that snapshot is
-            # encoded from the segment's effective crop (one voxel when empty),
-            # never from the complete microscopy volume.
-            if key in self.force_snapshots:
-                encoded = encode_mask_crop_snapshot(
-                    current_crop, current_bounds, self.volume_shape
-                )
-            else:
-                pending_operations = [
-                    operation
-                    for operation in [*self.awaiting_echo, *self.outgoing]
-                    if str(operation.get("segment_id") or "") == key[1]
-                ]
-                encoded = encode_mask_crop_delta_after_operations(
-                    previous,
-                    current_crop,
-                    current_bounds,
-                    self.baseline_bounds.get(key),
-                    self.volume_shape,
-                    pending_operations,
-                )
-            if encoded is None and key in self.metadata_updates:
-                encoded = encode_metadata_update(self.volume_shape)
-            if encoded is None:
-                self.dirty_segments.discard(key)
-                self.force_snapshots.discard(key)
-                continue
             segment = node.GetSegmentation().GetSegment(key[1])
-            operation = {
-                "client_operation_id": str(uuid.uuid4()),
+            metadata = {
                 "segment_id": key[1],
                 "segment_name": segment.GetName() or key[1],
                 "color_hex": self._segment_color_hex(segment),
                 "base_sequence": int(self.last_sequence),
-                **encoded,
             }
             if key in self.metadata_updates:
-                operation["metadata_update"] = True
-            self.outgoing.append(operation)
-            self.outgoing_keys.add(key)
+                metadata["metadata_update"] = True
+            pending_operations = [
+                dict(operation) for operation in [*self.awaiting_echo, *self.outgoing]
+                if str(operation.get("segment_id") or "") == key[1]
+            ]
+            private_baseline = previous.fork() if isinstance(previous, ChunkedMaskBaseline) else previous.copy()
+            force_snapshot = key in self.force_snapshots
             self.dirty_segments.discard(key)
             self.force_snapshots.discard(key)
             self.metadata_updates.discard(key)
+            self._local_encode_pending = True
+            self._local_encode_worker = threading.Thread(
+                target=self._encode_local_lane,
+                args=(self._session_token, self._worker_results, key, private_baseline,
+                      current_crop, current_bounds, tuple(self.volume_shape),
+                      pending_operations, force_snapshot, metadata),
+                name="LiveSegmentation-local-encode", daemon=True,
+            )
+            self._local_encode_worker.start()
+            break
         for operation in self.outgoing:
             operation_id = str(operation.get("client_operation_id") or "")
             if operation_id and operation_id not in existing_operation_ids:
@@ -7942,6 +8210,38 @@ class LiveCollaborationController:
                 self.session_metrics.increment("edits_queued")
         self._sync_operation_journal()
         self.session_metrics.record("local-diff", time.monotonic() - started)
+
+    def _schedule_local_continuation(self):
+        if self._local_continuation_scheduled:
+            return
+        import qt
+
+        self._local_continuation_scheduled = True
+        session_token = self._session_token
+
+        def continue_local():
+            if session_token != self._session_token:
+                return
+            self._local_continuation_scheduled = False
+            if self.connected and self.dirty_segments:
+                self._prepare_outgoing()
+
+        qt.QTimer.singleShot(GUI_CONTINUATION_MILLISECONDS, continue_local)
+
+    @staticmethod
+    def _encode_local_lane(session_token, results, key, baseline, crop, bounds, shape, pending, replace, metadata):
+        started = time.perf_counter()
+        try:
+            encoded_operations = encode_bounded_crop_edits(baseline, crop, bounds, shape, pending, replace)
+            if not encoded_operations and metadata.get("metadata_update"):
+                encoded_operations = [encode_metadata_update(shape)]
+            operations = [{**metadata, "client_operation_id": str(uuid.uuid4()), **encoded} for encoded in encoded_operations]
+            results.put({"lane": "local-encode", "session_token": session_token, "key": key,
+                         "encoded_operations": operations, "duration": time.perf_counter() - started})
+        except Exception as exc:
+            results.put({"lane": "local-encode", "session_token": session_token, "key": key,
+                         "error": str(exc), "replace": replace, "metadata": metadata,
+                         "duration": time.perf_counter() - started})
 
     def _active_presence(self):
         details = self._current_location()
@@ -7965,7 +8265,7 @@ class LiveCollaborationController:
             pass
         return details
 
-    def _snapshot_operations(self):
+    def _snapshot_operations(self, defer_encode=False):
         node = self._segmentation_node()
         if node is None:
             return []
@@ -7975,10 +8275,21 @@ class LiveCollaborationController:
             key = (node.GetID(), segment_id)
             mask = self.baselines.get(key)
             if mask is None:
+                if defer_encode:
+                    continue
                 crop, bounds = self._read_mask_crop(node, segment_id)
                 mask = ChunkedMaskBaseline.from_crop(
                     self.volume_shape, crop, bounds
                 )
+            if defer_encode and isinstance(mask, ChunkedMaskBaseline):
+                result.append({
+                    "segment_id": segment_id,
+                    "segment_name": segment.GetName() or segment_id,
+                    "color_hex": self._segment_color_hex(segment),
+                    "metadata_update": True,
+                    "_snapshot_baseline": mask.fork(),
+                })
+                continue
             if isinstance(mask, ChunkedMaskBaseline):
                 encoded_operations = encode_chunked_mask_snapshot(mask)
             else:
@@ -8005,6 +8316,7 @@ class LiveCollaborationController:
 
     def on_timer(self):
         self._drain_worker_results()
+        self._drain_incoming_operations()
         monotonic_now = time.monotonic()
         if self._preflight_running:
             elapsed = monotonic_now - self._preflight_started_at
@@ -8132,7 +8444,11 @@ class LiveCollaborationController:
             push_idle
             and self.initial_sync_complete
             and not self.outgoing
+            and not self.awaiting_echo
             and not self.dirty_segments
+            and not self._local_encode_pending
+            and self._local_capture is None
+            and not self._incoming_operations
             and (
                 self._snapshot_requested
                 or (
@@ -8143,7 +8459,7 @@ class LiveCollaborationController:
             )
         )
         if should_snapshot:
-            snapshot_operations = self._snapshot_operations()
+            snapshot_operations = self._snapshot_operations(defer_encode=True)
             snapshot_label = self._snapshot_label
             self._snapshot_requested = False
             self._snapshot_label = ""
@@ -8164,7 +8480,8 @@ class LiveCollaborationController:
             self._edit_push_worker.start()
 
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
-        if pull_idle and (
+        incoming_bytes = sum(item["_packed"].bytes.nbytes for item in self._incoming_operations if "_packed" in item)
+        if pull_idle and len(self._incoming_operations) < MAX_PENDING_REMOTE_OPERATIONS and incoming_bytes < MAX_INCOMING_PACKED_BYTES and (
             force_sync or now - self._last_sync_poll >= LIVE_EDIT_POLL_INTERVAL_SECONDS
         ):
             self._last_sync_poll = now
@@ -8179,7 +8496,7 @@ class LiveCollaborationController:
                     self._session_token,
                     self.client,
                     self.room_id,
-                    int(self.last_sequence),
+                    max(int(self.last_sequence), self._incoming_received_sequence),
                     operation_limit,
                 ),
                 name="LiveSegmentation-edit-pull",
@@ -8371,8 +8688,18 @@ class LiveCollaborationController:
                 command_errors.extend(group_result["errors"])
             snapshot = None
             if snapshot_operations:
+                encoded_snapshots = []
+                for item in snapshot_operations:
+                    if "_snapshot_baseline" not in item:
+                        encoded_snapshots.append(item)
+                        continue
+                    metadata = {key: value for key, value in item.items() if not key.startswith("_")}
+                    encoded_snapshots.extend(
+                        {**metadata, **encoded}
+                        for encoded in encode_chunked_mask_snapshot(item["_snapshot_baseline"])
+                    )
                 snapshot = client.publish_room_snapshot(
-                    room_id, snapshot_operations, compact=True, label=snapshot_label
+                    room_id, encoded_snapshots, compact=True, label=snapshot_label
                 )
             self._worker_results.put(
                 {
@@ -8401,13 +8728,27 @@ class LiveCollaborationController:
     ):
         started = time.monotonic()
         try:
+            operations = client.operations(
+                room_id, after_sequence, limit=int(operation_limit)
+            )
+            prepared = []
+            prepared_bytes = 0
+            for operation in operations:
+                item = dict(operation)
+                if not item.get("segment_deleted"):
+                    bounds = item["voxel_bbox"]
+                    predicted_bytes = (int(np.prod([bounds[index + 1] - bounds[index] for index in (0, 2, 4)], dtype=np.int64)) + 7) // 8 * 2
+                    if prepared and prepared_bytes + predicted_bytes > MAX_INCOMING_PACKED_BYTES:
+                        break
+                    item["_packed"] = PackedOperationMask(item)
+                    item["_has_claims"] = bool(np.any(item["_packed"].bytes))
+                    prepared_bytes += item["_packed"].bytes.nbytes
+                prepared.append(item)
             self._worker_results.put(
                 {
                     "lane": "edit-pull",
                     "session_token": session_token,
-                    "operations": client.operations(
-                        room_id, after_sequence, limit=int(operation_limit)
-                    ),
+                    "operations": prepared,
                     "duration": time.monotonic() - started,
                 }
             )
@@ -8963,7 +9304,8 @@ class LiveCollaborationController:
             )
 
     def _drain_worker_results(self):
-        while True:
+        deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
+        while time.perf_counter() < deadline:
             try:
                 result = self._worker_results.get_nowait()
             except queue.Empty:
@@ -9022,6 +9364,41 @@ class LiveCollaborationController:
                 self._presence_worker_started_at = 0.0
                 self._presence_stall_status_second = -1
             self.session_metrics.record(lane, float(result.get("duration", 0.0)))
+            if lane == "local-journal":
+                if result.get("signature") != self._journal_state_signature:
+                    continue
+                if result.get("success"):
+                    self._journal_retry_at = 0.0
+                    count = int(result.get("pending_count", 0))
+                    self.recovery_status_label.setText(
+                        f"Crash journal contains {count} unacknowledged edit(s)." if count else "No recoverable edits for the active room"
+                    )
+                else:
+                    self._journal_state_signature = None
+                    self._journal_retry_at = time.monotonic() + JOURNAL_WRITE_RETRY_SECONDS
+                    self.recovery_status_label.setText("Crash recovery is temporarily unavailable; live synchronization continues normally.")
+                continue
+            if lane == "local-encode":
+                self._local_encode_pending = False
+                key = tuple(result["key"])
+                node = self._segmentation_node()
+                if node is None or node.GetSegmentation().GetSegment(key[1]) is None:
+                    continue
+                if "error" in result:
+                    self.dirty_segments.add(key)
+                    if result.get("replace"):
+                        self.force_snapshots.add(key)
+                    if (result.get("metadata") or {}).get("metadata_update"):
+                        self.metadata_updates.add(key)
+                    self._show_error(f"Could not prepare local edit: {result['error']}")
+                    continue
+                for operation in result.get("encoded_operations") or []:
+                    self.outgoing.append(operation)
+                    self.outgoing_keys.add(key)
+                    self.session_metrics.operation_queued(operation["client_operation_id"])
+                    self.session_metrics.increment("edits_queued")
+                self._sync_operation_journal()
+                continue
             if isinstance(self.client, HybridRoomClient):
                 fallback_count = int(self.client.fallback_count)
                 if fallback_count > self._last_hybrid_fallback_count:
@@ -9186,11 +9563,11 @@ class LiveCollaborationController:
                     item for item in self.pending_actions if item["id"] not in completed_action_ids
                 ]
             operations = result.get("operations") or []
-            if operations:
-                self._append_history_operations(operations)
-            self._apply_operations(operations)
-            if operations:
-                self._refresh_label_combo()
+            for operation in operations:
+                sequence = int(operation.get("sequence", 0))
+                if sequence > max(self.last_sequence, self._incoming_received_sequence):
+                    self._incoming_operations.append(operation)
+                    self._incoming_received_sequence = sequence
             if result.get("users") is not None:
                 self._update_presence(result["users"])
             if result.get("messages") is not None:
@@ -9216,8 +9593,11 @@ class LiveCollaborationController:
                     int(item.get("overlap_voxels", 0))
                     for item in result["conflicts_detected"]
                 )
-                slicer.util.warningDisplay(
+                self._append_activity(
                     f"Concurrent edits overlapped in {overlap} voxels. Review the conflict panel."
+                )
+                slicer.util.showStatusMessage(
+                    f"Concurrent edits overlapped in {overlap} voxels; see conflict panel", 5000
                 )
                 self._force_advanced_refresh = True
                 self.session_metrics.increment(
@@ -9268,6 +9648,99 @@ class LiveCollaborationController:
             if self.connected:
                 self._last_transport_result_at = time.monotonic()
                 self._transport_stall_status_second = -1
+
+    def _iter_incoming_operation(self, operation, node, baseline):
+        locally_deleted = self._segment_has_pending_deletion(node, operation["segment_id"])
+        if not operation.get("segment_deleted") and not locally_deleted:
+            self._ensure_segment(node, operation)
+            self._ensure_independent_segment_labelmap(node, operation["segment_id"])
+            prepare = getattr(self.owner, "prepare_segment_labelmap_extent", None)
+            if callable(prepare) and operation.get("_has_claims", True):
+                for _ in prepare(node, operation["segment_id"], self.owner.get_volume_node(), operation["voxel_bbox"]):
+                    yield {"_capacity_step": True}
+        yield from iter_operation_tiles(operation, baseline)
+
+    def _segment_has_pending_deletion(self, node, segment_id):
+        if segment_id in self.pending_segment_deletions:
+            return True
+        if any(item.get("segment_deleted") and item.get("segment_id") == segment_id
+               for item in [*self.outgoing, *self.awaiting_echo]):
+            return True
+        if (self.initial_sync_complete and segment_id in self._known_segment_ids
+                and node.GetSegmentation().GetSegment(segment_id) is None):
+            # The native removal notification may still await its coalesced
+            # callback when an older creation echo arrives from the network.
+            self.pending_segment_deletions[segment_id] = dict(
+                self._segment_metadata.get(segment_id) or {"segment_id": segment_id}
+            )
+            return True
+        return False
+
+    def _drain_incoming_operations(self):
+        """Apply a short slice of ordered voxel work, then return to Qt input."""
+        if not self.connected or time.monotonic() < self._incoming_retry_at:
+            return
+        deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
+        started = time.perf_counter()
+        try:
+            while self._incoming_operations and time.perf_counter() < deadline:
+                operation = self._incoming_operations[0]
+                if self._incoming_iterator is None:
+                    node = self._segmentation_node()
+                    if node is None:
+                        return
+                    operation["_metadata_before"] = self._current_segment_metadata(node, operation["segment_id"])
+                    baseline = self.baselines.get((node.GetID(), operation["segment_id"]))
+                    self._incoming_iterator = self._iter_incoming_operation(operation, node, baseline)
+                if self._incoming_piece is None:
+                    self._applying_remote = True
+                    try:
+                        self._incoming_piece = next(self._incoming_iterator, None)
+                    finally:
+                        self._applying_remote = False
+                if self._incoming_piece is None:
+                    clean_operation = {key: value for key, value in operation.items() if not key.startswith("_")}
+                    self._append_history_operations([clean_operation])
+                    self._incoming_operations.popleft()
+                    self._incoming_iterator = None
+                    self._refresh_label_combo()
+                    continue
+                piece = self._incoming_piece
+                no_op = piece.get("_capacity_step") or (piece.get("_partial_operation") and not np.any(piece["_decoded"][0]))
+                if not no_op and self._apply_operations([piece]) is False:
+                    self._incoming_retry_at = time.monotonic() + 1.0
+                    return
+                self._incoming_piece = None
+            if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
+                self.initial_sync_complete = True
+                self._initialize_baselines_and_seed(seed=False)
+            if self._incoming_operations and not self._incoming_continuation_scheduled:
+                import qt
+
+                self._incoming_continuation_scheduled = True
+                session_token = self._session_token
+
+                def continue_incoming():
+                    if session_token != self._session_token:
+                        return
+                    self._incoming_continuation_scheduled = False
+                    self._drain_incoming_operations()
+
+                qt.QTimer.singleShot(GUI_CONTINUATION_MILLISECONDS, continue_incoming)
+        except Exception as exc:
+            if str(exc) == "Live label changed during extent preparation":
+                # A local edit won the race with a staged image allocation.
+                # Restart preparation using its new state; nothing was applied.
+                self._incoming_iterator = None
+                self._incoming_piece = None
+                self._incoming_retry_at = time.monotonic() + 0.05
+                return
+            self._incoming_iterator = None
+            self._incoming_piece = None
+            self._incoming_retry_at = time.monotonic() + 1.0
+            self._show_error(f"Could not prepare incoming edit: {exc}")
+        finally:
+            self.session_metrics.record("gui-incoming", time.perf_counter() - started)
 
     def _queue_snapshot_operations(self, operations):
         for operation in operations or []:
@@ -9538,8 +10011,17 @@ class LiveCollaborationController:
                 self._show_revision_comparison(value or [], request.get("sequence", 0))
                 self.compare_revision_button.enabled = True
             elif action == "undo_operation":
-                self._queue_collaborative_undo(value, request.get("sequence", 0))
-                self.undo_shared_button.enabled = True
+                try:
+                    self._queue_collaborative_undo(value, request.get("sequence", 0))
+                except LiveCollaborationError as exc:
+                    # An unavailable inverse is not a transport failure and
+                    # must not escape the Qt timer or leave Undo disabled.
+                    message = f"Could not undo this edit: {exc}"
+                    self._append_activity(message)
+                    slicer.util.showStatusMessage(message, 6000)
+                    continue
+                finally:
+                    self.undo_shared_button.enabled = True
                 self._force_sync_refresh = True
                 slicer.util.showStatusMessage(
                     f"Collaborative undo queued for sequence {request.get('sequence')}",
@@ -10091,7 +10573,7 @@ class LiveCollaborationController:
         node = self._segmentation_node()
         if node is None:
             self._show_error("The shared segmentation node no longer exists")
-            return
+            return False
         for operation in operations:
             sequence = int(operation["sequence"])
             if sequence <= self.last_sequence:
@@ -10099,7 +10581,11 @@ class LiveCollaborationController:
             try:
                 segment_id = operation["segment_id"]
                 key = (node.GetID(), segment_id)
-                metadata_before = self._current_segment_metadata(node, segment_id)
+                metadata_before = (
+                    operation.get("_metadata_before")
+                    if operation.get("_completion_only")
+                    else self._current_segment_metadata(node, segment_id)
+                )
                 if operation.get("segment_deleted"):
                     self._segment_metadata[segment_id] = {
                         "segment_id": segment_id,
@@ -10145,6 +10631,22 @@ class LiveCollaborationController:
                     self.last_sequence = sequence
                     applied_count += 1
                     continue
+                if self._segment_has_pending_deletion(node, segment_id):
+                    # Confirm the shared order while the newer local tombstone
+                    # waits to be sent. Never recreate a deleted local label
+                    # merely because its older creation/paint echo arrived late.
+                    baseline = self.baselines.setdefault(key, ChunkedMaskBaseline(self.volume_shape))
+                    if operation.get("operation_kind") == "snapshot":
+                        baseline.clear()
+                    decoded = operation.get("_decoded")
+                    changed, values = decoded if decoded is not None else decode_mask_delta(operation)
+                    baseline.set_region(operation["voxel_bbox"], changed, values)
+                    if not operation.get("_partial_operation"):
+                        if operation.get("author") == self.user_name:
+                            self._acknowledge_local_operation(operation)
+                        self.last_sequence = sequence
+                        applied_count += 1
+                    continue
                 self._applying_remote = True
                 self._ensure_segment(node, operation)
                 self._ensure_independent_segment_labelmap(node, segment_id)
@@ -10172,11 +10674,13 @@ class LiveCollaborationController:
                     int(value) for value in operation["voxel_bbox"]
                 ]
                 oz0, oz1, oy0, oy1, ox0, ox1 = operation_bounds
-                changed, values = decode_mask_delta(operation)
+                decoded = operation.get("_decoded")
+                changed, values = decoded if decoded is not None else decode_mask_delta(operation)
                 baseline = self.baselines.get(key)
                 if baseline is None:
                     baseline = ChunkedMaskBaseline(self.volume_shape)
-                    self.baselines[key] = baseline
+                else:
+                    baseline = baseline.fork() if isinstance(baseline, ChunkedMaskBaseline) else baseline.copy()
 
                 # Ordinary edits only touch the operation crop. Checkpoints may
                 # clear old content, so their affected region also covers the
@@ -10260,8 +10764,8 @@ class LiveCollaborationController:
                     operation_bounds,
                     claimed_voxels,
                 )
+                self.baselines[key] = baseline
                 self._ensure_independent_segment_labelmap(node, segment_id)
-                node.Modified()
                 try:
                     self.owner.refresh_segmentation_display(node, segment_id)
                 except Exception:
@@ -10290,6 +10794,15 @@ class LiveCollaborationController:
                 self._known_segment_ids.add(segment_id)
                 self._remember_segment_revision(node, segment_id)
                 self._set_segment_collaboration_tags(segment_id)
+                if operation.get("_partial_operation"):
+                    # The sequence and acknowledgement belong to the original
+                    # operation, not its rendering tiles. Qt may process local
+                    # input between pieces without skipping or reordering edits.
+                    if operation.get("author") != self.user_name and self.initial_sync_complete:
+                        highlight = np.logical_and(changed, values != 0) if operation.get("_snapshot_tile") else changed
+                        if np.any(highlight):
+                            self._queue_remote_highlight(highlight, operation_bounds, operation.get("author"))
+                    continue
                 actor = (
                     "You"
                     if operation.get("author") == self.user_name
@@ -10336,7 +10849,12 @@ class LiveCollaborationController:
                         and not np.any(values)
                     ):
                         highlight_changed = None
-                    if highlight_changed is not None and np.any(highlight_changed):
+                    if (
+                        not operation.get("_completion_only")
+                        and highlight_changed is not None
+                        and highlight_changed.size <= INCOMING_TILE_SIZE ** 3
+                        and np.any(highlight_changed)
+                    ):
                         try:
                             import qt
 
@@ -10367,12 +10885,37 @@ class LiveCollaborationController:
                 applied_count += 1
             except Exception as exc:
                 self._show_error(f"Could not apply live edit {sequence}: {exc}")
-                return
+                return False
             finally:
                 self._applying_remote = False
         if applied_count:
             self.session_metrics.record("apply", time.monotonic() - apply_started)
             self.session_metrics.increment("operations_applied", applied_count)
+        return True
+
+    def _queue_remote_highlight(self, changed, bounds, author):
+        """Display at most one small recent edit overlay per 250 ms."""
+        self._pending_remote_highlight = (np.asarray(changed, dtype=np.uint8).copy(), list(bounds), str(author or "Collaborator"))
+        if self._remote_highlight_scheduled:
+            return
+        import qt
+
+        self._remote_highlight_scheduled = True
+        session_token = self._session_token
+
+        def show_latest():
+            if session_token != self._session_token:
+                return
+            self._remote_highlight_scheduled = False
+            latest = self._pending_remote_highlight
+            self._pending_remote_highlight = None
+            if self.connected and latest is not None:
+                try:
+                    self.owner.show_remote_change_highlight_crop(*latest)
+                except Exception:
+                    logging.debug("Could not show the optional remote edit highlight", exc_info=True)
+
+        qt.QTimer.singleShot(250, show_latest)
 
     def _update_presence(self, users):
         now = time.monotonic()

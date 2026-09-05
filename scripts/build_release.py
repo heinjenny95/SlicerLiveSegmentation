@@ -75,7 +75,7 @@ def is_allowed(path: Path) -> bool:
     if any(part in FORBIDDEN_PARTS for part in relative.parts):
         return False
     lower_name = path.name.lower()
-    if lower_name == ".env" or lower_name.endswith((".seg.nrrd", ".nii.gz")):
+    if lower_name == ".env" or lower_name.endswith((".seg.nrrd", ".nii.gz", ".result.json", ".log")):
         return False
     return path.suffix.lower() not in FORBIDDEN_SUFFIXES
 
@@ -170,7 +170,7 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 89,
+            "automated_tests": 98,
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"
@@ -187,7 +187,9 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
                 "recovery-journal-file-lock-resilience-event-driven-revision-probes-"
                 "revision-aware-settle-verification-journal-write-coalescing-bounded-catchup-"
                 "exclusive-voxel-ownership-lock-selector-rename-compact-sequence-watermark-"
-                "bounded-writer-history"
+                "bounded-writer-history-cooperative-64-cubed-remote-apply-"
+                "background-packed-decode-bounded-local-encode-async-journal-"
+                "384-cubed-qt-heartbeat-stalled-storage-immediate-delete-echo"
             ),
             "two_process_slicer_live_sync_test": (
                 "passed-two-slicer-256-cubed-bidirectional-rapid-three-component-"

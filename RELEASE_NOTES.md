@@ -1,4 +1,54 @@
-# Live Segmentation 0.14.6
+# Live Segmentation 0.14.7
+
+This release separates transport latency from Slicer's interactive work and
+reduces full-labelmap processing during simultaneous editing.
+
+## Cooperative incoming edits
+
+- Decompression runs on the receive worker. Packed masks remain compact until
+  a small region is needed; queued operations have count and byte backpressure.
+- Incoming masks, including large snapshots, are applied in at most 64-cubed
+  pieces with an 8 ms soft Qt work budget and short continuations. An operation
+  is acknowledged only after all its pieces finish, in the original room order.
+- Source-aligned, isolated labelmaps receive direct bounded array writes. Extent
+  growth is prepared in small slabs and discarded if a newer local edit arrives.
+- Only the changed label's derived representations are invalidated. Remote
+  highlights are coalesced, and hidden labels remain hidden.
+
+## Background outgoing work
+
+- Local mask capture yields between small slabs and checks that the captured
+  revision is stable. Voxel comparisons and compression then run on a private
+  background snapshot, using copy-on-write baseline chunks and 128-cubed tiles.
+- Renames and colors do not capture unchanged voxel masks. Room checkpoint
+  compression and the coalesced local recovery journal also run off the GUI.
+- A delayed creation echo cannot resurrect a label just deleted locally.
+- An unavailable undo inverse is reported without escaping the GUI callback or
+  leaving the Undo button disabled.
+
+## Verification and limits
+
+- 98 automated tests pass, including bounded encoding, tiled snapshot clearing,
+  bit-packed tile decoding, copy-on-write isolation, and a stalled journal.
+- Real Slicer 5.12.3 tests cover two-client exclusive ownership, label identity,
+  deletion, rejoin, chat, locks, and a new 384-cubed responsiveness probe.
+- In the local rendered probe, 24 remote strokes completed in 0.609 s, a dense
+  884,736-voxel remote mask in 0.219 s, and a local edit into a large layer in
+  0.312 s. The maximum measured Qt heartbeat gap was 47 ms. A simulated 2 s
+  storage stall produced a maximum 16 ms GUI gap. These are single-machine
+  synthetic measurements, not NAS or two-computer latency guarantees.
+- The work budget is cooperative, not a hard real-time deadline. Native Slicer
+  rendering, full project saving, non-linear geometry resampling, insufficient
+  RAM, and local AI initialization can still block or slow the local application.
+  See [performance validation](docs/PERFORMANCE.md) for the test scope.
+
+Protocol 3 and the room format are unchanged. Install 0.14.7 on every participant
+to obtain the responsiveness improvements on each receiving computer. Existing
+rooms and history are preserved; nnInteractive remains a separate plugin.
+
+---
+
+# Previous release: Live Segmentation 0.14.6
 
 Version 0.14.6 is a correctness and NAS hot-path release for shared biological
 segmentation projects.

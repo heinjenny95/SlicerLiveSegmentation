@@ -617,16 +617,15 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         )
         label_value = int(segment.GetLabelValue())
         crop = np.asarray(internal == label_value, dtype=np.uint8)
-        nonzero = np.nonzero(crop)
-        if not nonzero[0].size:
+        occupied_z = np.flatnonzero(np.any(crop, axis=(1, 2)))
+        if not occupied_z.size:
             return (None, None)
+        occupied_y = np.flatnonzero(np.any(crop, axis=(0, 2)))
+        occupied_x = np.flatnonzero(np.any(crop, axis=(0, 1)))
         local_bounds = [
-            int(nonzero[0].min()),
-            int(nonzero[0].max()) + 1,
-            int(nonzero[1].min()),
-            int(nonzero[1].max()) + 1,
-            int(nonzero[2].min()),
-            int(nonzero[2].max()) + 1,
+            int(occupied_z[0]), int(occupied_z[-1]) + 1,
+            int(occupied_y[0]), int(occupied_y[-1]) + 1,
+            int(occupied_x[0]), int(occupied_x[-1]) + 1,
         ]
         z0, z1, y0, y1, x0, x1 = local_bounds
         crop = np.ascontiguousarray(crop[z0:z1, y0:y1, x0:x1])
@@ -639,6 +638,62 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             extent[0] + x1,
         ]
         return crop, bounds
+
+    @classmethod
+    def capture_segment_mask_steps(cls, segmentation_node, segment_id, reference_volume_node):
+        """Copy a stable mask for background diffing, yielding between slabs."""
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            raise RuntimeError("Live label changed during mask capture")
+        binary_name = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        image = segment.GetRepresentation(binary_name)
+        if image is None or image.GetPointData().GetScalars() is None:
+            return None, None
+        matrix = cls._reference_ijk_to_segmentation_ras_matrix(reference_volume_node, segmentation_node)
+        image_matrix = vtk.vtkMatrix4x4()
+        image.GetImageToWorldMatrix(image_matrix)
+        if matrix is None or not cls._matrices_match(image_matrix, matrix):
+            result = cls.segment_mask_crop_in_reference_geometry(segmentation_node, segment_id, reference_volume_node)
+            if result is None:
+                # Preserve Slicer's general resampling compatibility. This is
+                # the uncommon transformed-geometry fallback, not the bounded
+                # path used by standard Segment Editor and source-aligned ROIs.
+                shape = tuple(reversed(reference_volume_node.GetImageData().GetDimensions()))
+                mask = cls.segment_mask_in_reference_geometry(segmentation_node, segment_id, reference_volume_node, shape)
+                return mask, [0, shape[0], 0, shape[1], 0, shape[2]]
+            return result
+        revision = (image.GetMTime(), image.GetPointData().GetScalars().GetMTime())
+        label_value = int(segment.GetLabelValue())
+        extent = [int(value) for value in image.GetExtent()]
+        internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
+        copy = np.empty(internal.shape, dtype=np.uint8)
+        depth = max(1, (1024 * 1024) // max(1, internal.shape[1] * internal.shape[2] * internal.itemsize))
+        bounds = None
+        for start in range(0, internal.shape[0], depth):
+            end = min(start + depth, internal.shape[0])
+            slab = copy[start:end]
+            np.equal(internal[start:end], label_value, out=slab)
+            z = np.flatnonzero(np.any(slab, axis=(1, 2)))
+            if z.size:
+                y = np.flatnonzero(np.any(slab, axis=(0, 2)))
+                x = np.flatnonzero(np.any(slab, axis=(0, 1)))
+                found = [start + int(z[0]), start + int(z[-1]) + 1, int(y[0]), int(y[-1]) + 1, int(x[0]), int(x[-1]) + 1]
+                if bounds is None:
+                    bounds = found
+                else:
+                    for axis in range(3):
+                        bounds[2 * axis] = min(bounds[2 * axis], found[2 * axis])
+                        bounds[2 * axis + 1] = max(bounds[2 * axis + 1], found[2 * axis + 1])
+            yield None
+        current = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if current is None or current.GetRepresentation(binary_name) != image or int(current.GetLabelValue()) != label_value or (
+            image.GetMTime(), image.GetPointData().GetScalars().GetMTime()
+        ) != revision:
+            raise RuntimeError("Live label changed during mask capture")
+        if bounds is None:
+            return None, None
+        z0, z1, y0, y1, x0, x1 = bounds
+        return copy[z0:z1, y0:y1, x0:x1], [extent[4] + z0, extent[4] + z1, extent[2] + y0, extent[2] + y1, extent[0] + x0, extent[0] + x1]
 
     @classmethod
     def segment_mask_region_in_reference_geometry(
@@ -728,6 +783,79 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         return image
 
     @classmethod
+    def prepare_segment_labelmap_extent(
+        cls, segmentation_node, segment_id, reference_volume_node, voxel_bbox
+    ):
+        """Grow an isolated layer with bounded copies before applying tiles.
+
+        Everything runs on the GUI thread, one yielded slice at a time. A local
+        stroke during preparation invalidates the staged copy; it is retried
+        against the new image, never committed over the user's newer data.
+        """
+        from vtk.util import numpy_support
+
+        segmentation = segmentation_node.GetSegmentation()
+        segment = segmentation.GetSegment(segment_id)
+        binary_name = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        matrix = cls._reference_ijk_to_segmentation_ras_matrix(reference_volume_node, segmentation_node)
+        if segment is None or matrix is None:
+            return
+        old_image = segment.GetRepresentation(binary_name)
+        old_extent = None
+        old_array = None
+        old_revision = None
+        old_label_value = int(segment.GetLabelValue())
+        if old_image is not None and old_image.GetPointData().GetScalars() is not None:
+            old_matrix = vtk.vtkMatrix4x4()
+            old_image.GetImageToWorldMatrix(old_matrix)
+            if not cls._matrices_match(old_matrix, matrix):
+                return
+            old_extent = [int(value) for value in old_image.GetExtent()]
+            old_array = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
+            old_revision = (old_image.GetMTime(), old_image.GetPointData().GetScalars().GetMTime())
+        z0, z1, y0, y1, x0, x1 = [int(value) for value in voxel_bbox]
+        if old_extent is not None:
+            ox0, ox1, oy0, oy1, oz0, oz1 = old_extent
+            if ox0 <= x0 < x1 <= ox1 + 1 and oy0 <= y0 < y1 <= oy1 + 1 and oz0 <= z0 < z1 <= oz1 + 1:
+                return
+            z0, z1 = min(z0, oz0), max(z1, oz1 + 1)
+            y0, y1 = min(y0, oy0), max(y1, oy1 + 1)
+            x0, x1 = min(x0, ox0), max(x1, ox1 + 1)
+        dims = tuple(reversed(reference_volume_node.GetImageData().GetDimensions()))
+        bounds = [z0, z1, y0, y1, x0, x1]
+        for axis in range(3):
+            bounds[2 * axis] = max(0, (bounds[2 * axis] // 64) * 64)
+            bounds[2 * axis + 1] = min(dims[axis], ((bounds[2 * axis + 1] + 63) // 64) * 64)
+        z0, z1, y0, y1, x0, x1 = bounds
+        target = np.empty((z1 - z0, y1 - y0, x1 - x0), dtype=old_array.dtype if old_array is not None else np.uint8)
+        slab_depth = max(1, (1024 * 1024) // max(1, target.shape[1] * target.shape[2] * target.itemsize))
+        for start in range(0, target.shape[0], slab_depth):
+            end = min(start + slab_depth, target.shape[0])
+            slab = target[start:end]
+            slab.fill(0)
+            if old_array is not None:
+                low, high = max(z0 + start, oz0), min(z0 + end, oz1 + 1)
+                if low < high:
+                    target[low - z0:high - z0, oy0 - y0:oy1 + 1 - y0, ox0 - x0:ox1 + 1 - x0] = old_array[low - oz0:high - oz0]
+            yield None
+        current_segment = segmentation.GetSegment(segment_id)
+        if current_segment is None or current_segment.GetRepresentation(binary_name) != old_image:
+            raise RuntimeError("Live label changed during extent preparation")
+        if int(current_segment.GetLabelValue()) != old_label_value or (
+            old_revision is not None
+            and (old_image.GetMTime(), old_image.GetPointData().GetScalars().GetMTime()) != old_revision
+        ):
+            raise RuntimeError("Live label changed during extent preparation")
+        image = vtkSegmentationCore.vtkOrientedImageData()
+        image.SetExtent(x0, x1 - 1, y0, y1 - 1, z0, z1 - 1)
+        # numpy_to_vtk retains the NumPy owner for this zero-copy scalar buffer.
+        image.GetPointData().SetScalars(numpy_support.numpy_to_vtk(target.reshape(-1), deep=False))
+        image.SetGeometryFromImageToWorldMatrix(matrix)
+        segment.RemoveAllRepresentations(binary_name)
+        segment.AddRepresentation(binary_name, image)
+        segment.Modified()
+
+    @classmethod
     def update_segment_binary_labelmap_crop(
         cls,
         current_crop,
@@ -752,6 +880,40 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         binary_name = (
             vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
         )
+        image = segment.GetRepresentation(binary_name)
+        reference_matrix = cls._reference_ijk_to_segmentation_ras_matrix(
+            reference_volume_node, segmentation_node
+        )
+        if image is not None and image.GetPointData().GetScalars() is not None and reference_matrix is not None:
+            image_matrix = vtk.vtkMatrix4x4()
+            image.GetImageToWorldMatrix(image_matrix)
+            z0, z1, y0, y1, x0, x1 = [int(value) for value in voxel_bbox]
+            ix0, ix1, iy0, iy1, iz0, iz1 = [int(value) for value in image.GetExtent()]
+            contained = (
+                ix0 <= x0 < x1 <= ix1 + 1
+                and iy0 <= y0 < y1 <= iy1 + 1
+                and iz0 <= z0 < z1 <= iz1 + 1
+            )
+            # Only isolated layers can be edited directly: a packed sibling
+            # may use a different label value in the same VTK scalar array.
+            isolated = not any(
+                str(other_id) != str(segment_id)
+                and segmentation.GetSegment(other_id).GetRepresentation(binary_name) == image
+                for other_id in segmentation.GetSegmentIDs()
+            )
+            if contained and isolated and cls._matrices_match(image_matrix, reference_matrix):
+                internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
+                    segmentation_node, segment_id
+                )
+                region = internal[z0 - iz0:z1 - iz0, y0 - iy0:y1 - iy0, x0 - ix0:x1 - ix0]
+                region[changed] = np.where(target[changed] != 0, int(segment.GetLabelValue()), 0)
+                image.GetPointData().GetScalars().Modified()
+                # This layer is isolated. Invalidate only its derived meshes;
+                # image.Modified() invalidates every label's representation
+                # through vtkSegmentation's global source-image observer.
+                segment.RemoveAllRepresentations(binary_name)
+                segment.Modified()
+                return True
         if segment.GetRepresentation(binary_name) is None:
             segmentation.CreateRepresentation(binary_name)
         logic = slicer.modules.segmentations.logic()
@@ -785,11 +947,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         if display_node is None:
             segmentation_node.CreateDefaultDisplayNodes()
             display_node = segmentation_node.GetDisplayNode()
-        if display_node is not None:
-            display_node.SetVisibility(True)
-            display_node.SetSegmentVisibility(segment_id, True)
-            display_node.Modified()
-        segmentation_node.Modified()
+        # Native labelmap/segment notifications already invalidate the affected
+        # view. Re-emitting broad Modified events causes redundant redraws and
+        # must not turn a user's hidden label visible on every remote edit.
 
 
 class LiveSegmentationTest(ScriptedLoadableModuleTest):

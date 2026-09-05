@@ -161,6 +161,25 @@ leave a new replica at sequence zero.
 
 ## Persistence
 
+### Cooperative GUI boundary (0.14.7)
+
+The transport workers return compact, decompressed bit-packed masks. A bounded
+queue limits queued operations and expanded packed bytes. The GUI expands only
+64-cubed regions and applies them in room order with an 8 ms soft work budget;
+5 ms continuations allow input and rendering between batches. Snapshot clearing
+uses occupied baseline chunks, including old regions outside the new snapshot.
+The original operation is acknowledged and added to history only after all its
+regions finish. Capacity growth is staged incrementally with revision checks.
+
+Outgoing mask capture is cooperative and revision-checked. Private arrays and
+copy-on-write baseline forks are compared/compressed on a worker into bounded
+128-cubed operations. Metadata-only edits bypass voxel capture. The local
+recovery journal has an independent coalescing writer; a blocked file write never
+holds its submission lock. No MRML objects are accessed by these encode workers.
+See [performance validation and limits](PERFORMANCE.md).
+
+### Durable room data
+
 The shared-folder layout contains `room.json`, active operation and archived
 history records, snapshot manifests, permanent spatial chat, conflict, role,
 review, access-request, template, audit and lock records, versioned `.mrb`

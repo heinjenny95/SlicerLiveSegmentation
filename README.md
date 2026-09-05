@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.6.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.14.7.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.6`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.14.7`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -176,6 +176,12 @@ operation history before every brush update. Complete `.mrb` project bundles are
 now explicit opt-in backups (default 60 minutes, three retained); compact live
 history remains continuous. Diagnostics report live-state and backup storage
 separately, making multi-hundred-megabyte source-volume bundles easy to identify.
+
+Version 0.14.7 processes incoming masks cooperatively in small regions and moves
+local comparisons, compression, and journal writes to background workers.
+Source-aligned labelmaps avoid full-extent brush merges. See the reproducible
+[responsiveness measurements and limits](docs/PERFORMANCE.md); these are not a
+guarantee for arbitrary hardware or network conditions.
 
 The safer global-label protocol is intentionally incompatible with earlier room
 formats. Every collaborator must install 0.14.0 or newer and create a new room; an older

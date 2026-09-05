@@ -103,6 +103,41 @@ class PendingOperationJournal:
         self.path = Path(path)
         self.last_error = ""
         self._write_lock = threading.RLock()
+        self._pending_lock = threading.Lock()
+        self._pending_job = None
+        self._writer_thread = None
+
+    def submit(self, context, operations, callback=None):
+        """Serialize/coalesce journal writes without waiting on local file locks."""
+        job = (dict(context or {}), [dict(item) for item in operations or ()], callback)
+        with self._pending_lock:
+            self._pending_job = job
+            if self._writer_thread is not None:
+                return
+            self._writer_thread = threading.Thread(
+                target=self._drain_pending, name="LiveSegmentation-recovery", daemon=True
+            )
+            self._writer_thread.start()
+
+    def _drain_pending(self):
+        while True:
+            with self._pending_lock:
+                job = self._pending_job
+                self._pending_job = None
+                if job is None:
+                    self._writer_thread = None
+                    return
+            context, operations, callback = job
+            try:
+                success = self.write(context, operations)
+            except Exception as exc:
+                self.last_error = str(exc)
+                success = False
+            if callback is not None:
+                try:
+                    callback(success)
+                except Exception:
+                    pass
 
     def write(self, context, operations):
         """Persist pending edits without ever interrupting live synchronization.
