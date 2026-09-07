@@ -6695,11 +6695,17 @@ class LiveCollaborationController:
             self.transport_combo.setCurrentIndex(3)
             password = self.ssh_password_edit.text
             password = str(password() if callable(password) else password)
-            return _ssh_transport_module().SshRoomClient(
+            import slicer
+
+            python_executable = Path(slicer.app.applicationDirPath()) / ("python-real.exe" if os.name == "nt" else "python-real")
+            client = _ssh_transport_module().SshProcessRoomClient(
                 location, user_name, self._text(self.ssh_user_edit),
                 password, known_hosts=self._ssh_known_hosts_path(),
                 remote_python=self._text(self.ssh_python_edit),
-            ), _ssh_transport_module().parse_ssh_folder(location).location
+                python_executable=python_executable,
+            )
+            client.stage_callback = lambda stage: logging.info("Live Segmentation SSH setup: %s", stage)
+            return client, _ssh_transport_module().parse_ssh_folder(location).location
         if transport_mode == "shared-folder":
             location = self._text(self.shared_folder_edit)
             return SharedFolderRoomClient(location, user_name), location
@@ -8522,6 +8528,9 @@ class LiveCollaborationController:
             self.preflight_button.setText(
                 f"Checking… {int(max(0.0, elapsed))} s"
             )
+            ssh_stage = getattr(self._connecting_client, "connection_stage", None)
+            if ssh_stage:
+                self.status_label.setText(f"● {ssh_stage}… {int(max(0.0, elapsed))} s")
             if elapsed >= preflight_timeout:
                 self._leave_client_in_background(self._connecting_client, None)
                 self._connecting_client = None
@@ -8541,7 +8550,8 @@ class LiveCollaborationController:
                                     "connection",
                                     "fail",
                                     "Connection timeout",
-                                    f"The destination did not answer within {int(preflight_timeout)} seconds.",
+                                    f"SSH setup stalled during: {ssh_stage}. The local worker was stopped. This does not prove the server is offline."
+                                    if ssh_stage else f"The destination did not answer within {int(preflight_timeout)} seconds.",
                                     "Check the address or folder, firewall, VPN/network route, and credentials.",
                                 )
                             ],
@@ -8560,15 +8570,20 @@ class LiveCollaborationController:
             elapsed_second = max(0, int(elapsed))
             if elapsed_second != self._join_status_second:
                 self._join_status_second = elapsed_second
+                ssh_stage = getattr(self._connecting_client, "connection_stage", None)
                 self.status_label.setText(
-                    "● Connecting in background… "
+                    f"● {ssh_stage or 'Connecting in background'}… "
                     f"{elapsed_second} / {int(join_timeout)} s"
                 )
             if (
                 self._join_started_at
                 and elapsed >= join_timeout
             ):
+                ssh_stage = getattr(self._connecting_client, "connection_stage", None)
                 self._cancel_join(
+                    f"SSH setup stalled during: {ssh_stage}. The local worker was stopped. "
+                    "This does not prove the server is offline. Join again after checking the reported step."
+                    if ssh_stage else
                     "The collaboration location did not respond within "
                     f"{int(join_timeout)} seconds. "
                     "The connection attempt was cancelled locally and will not be "

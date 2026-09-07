@@ -171,8 +171,8 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "validation": {
             "ruff": "passed",
             "python_compileall": "passed",
-            "automated_tests": 119,
-            "ssh_transport": "passed-encrypted-loopback-two-clients-host-key-rejection-auth-failure-parallel-rpc-slicer-rejoin; real-deployment-login-pending",
+            "automated_tests": 124,
+            "ssh_transport": "passed-isolated-local-worker-stalled-import-cancellation-password-first-stage-diagnostics-encrypted-two-clients-slicer-safe-start-rejoin; real-deployment-login-pending",
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
                 "passed-realtime-lanes-optimistic-chat-explicit-label-selection-editable-"

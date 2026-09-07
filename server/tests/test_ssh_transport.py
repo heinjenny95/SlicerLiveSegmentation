@@ -22,6 +22,7 @@ from features import build_invitation, parse_invitation  # noqa: E402
 from ssh_transport import (  # noqa: E402
     REMOTE_BOOTSTRAP,
     SshHostKeyRequired,
+    SshProcessRoomClient,
     SshRoomClient,
     key_fingerprint,
     looks_like_ssh_folder,
@@ -144,11 +145,12 @@ class LocalSSHServer:
         finally:
             transport.close()
 
-    def client(self, user, known_hosts, password="test-password"):
+    def client(self, user, known_hosts, password="test-password", isolated=False):
         folder = self.folder.as_posix()
         if os.name == "nt":
             folder = folder[2:]  # same-drive rooted path for the loopback helper
-        return SshRoomClient(f"ssh://127.0.0.1:{self.port}{folder}", user, "test-user", password, known_hosts=known_hosts, timeout_seconds=4)
+        client_type = SshProcessRoomClient if isolated else SshRoomClient
+        return client_type(f"ssh://127.0.0.1:{self.port}{folder}", user, "test-user", password, known_hosts=known_hosts, timeout_seconds=4)
 
     def pin(self, path):
         trust_host_key(path, {"host": f"[127.0.0.1]:{self.port}", "type": self.key.get_name(), "key": self.key.get_base64(), "fingerprint": key_fingerprint(self.key)})
@@ -229,11 +231,14 @@ def test_missing_remote_folder_is_not_created(ssh_server, tmp_path):
         client.close()
 
 
-def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server, tmp_path):
+@pytest.mark.parametrize("isolated", [False, True])
+def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server, tmp_path, isolated):
     known_hosts = tmp_path / "known_hosts"
     ssh_server.pin(known_hosts)
-    alice = ssh_server.client("alice", known_hosts)
-    bob = ssh_server.client("bob", known_hosts)
+    alice = ssh_server.client("alice", known_hosts, isolated=isolated)
+    bob = ssh_server.client("bob", known_hosts, isolated=isolated)
+    stages = []
+    alice.stage_callback = stages.append
     try:
         room = alice.join("encrypted-room", "a" * 64)
         assert bob.join("encrypted-room", "a" * 64)["id"] == room["id"]
@@ -252,6 +257,10 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
         assert bob.room_history(room["id"])
         assert alice.password == bob.password == ""
         assert alice.preflight("encrypted-room", "a" * 64)["transport"] == "ssh-folder"
+        assert "Loading local SSH libraries" in stages
+        assert "Starting Python on the SSH server" in stages
+        if isolated:
+            assert all("test-password" not in arg for arg in alice._process.args)
         with pytest.raises(LiveCollaborationError, match="Unsupported"):
             alice._rpc("__getattribute__", "password")
     finally:
@@ -259,10 +268,11 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
         bob.close()
 
 
-def test_slow_ssh_request_does_not_serialize_other_lanes(tmp_path):
+@pytest.mark.parametrize("isolated", [False, True])
+def test_slow_ssh_request_does_not_serialize_other_lanes(tmp_path, isolated):
     server = LocalSSHServer(tmp_path, delay_health=True)
     server.pin(tmp_path / "known_hosts")
-    client = server.client("alice", tmp_path / "known_hosts")
+    client = server.client("alice", tmp_path / "known_hosts", isolated=isolated)
     try:
         room = client.join("parallel-room", "b" * 64)
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -281,3 +291,57 @@ def test_slow_ssh_request_does_not_serialize_other_lanes(tmp_path):
     finally:
         client.close()
         server.close()
+
+
+def test_isolated_host_verification_works_without_importing_crypto(ssh_server, tmp_path, monkeypatch):
+    client = ssh_server.client("alice", tmp_path / "known_hosts", isolated=True)
+    try:
+        with pytest.raises(LiveCollaborationError) as found:
+            client.join("unknown-room", "a" * 64)
+        details = found.value.host_key
+        assert details["fingerprint"] == key_fingerprint(ssh_server.key)
+        assert ssh_server.authenticated == 0
+        with monkeypatch.context() as scoped:
+            scoped.setitem(sys.modules, "paramiko", None)
+            trust_host_key(tmp_path / "known_hosts", details)
+        assert (tmp_path / "known_hosts").read_text().startswith(details["host"])
+    finally:
+        client.close()
+
+
+def test_stalled_local_import_can_be_killed_without_waiting_for_python(tmp_path, monkeypatch):
+    import ssh_transport
+
+    real_popen = subprocess.Popen
+
+    def stalled_child(args, **kwargs):
+        # Reproduce a worker stuck before SSH startup, without touching a server.
+        if "--local-worker" in args:
+            return real_popen([sys.executable, "-u", "-c", "import time; time.sleep(60)"], **kwargs)
+        return real_popen(args, **kwargs)
+
+    monkeypatch.setattr(ssh_transport.subprocess, "Popen", stalled_child)
+    client = SshProcessRoomClient("linux-host/folder", "alice", "test-user", "test-password", startup_timeout=0.25)
+    started = time.monotonic()
+    try:
+        with pytest.raises(LiveCollaborationError, match="Starting isolated local SSH worker"):
+            client.join("stalled", "a" * 64)
+        assert time.monotonic() - started < 3
+        assert client.password == ""
+        client._process.wait(timeout=3)
+        assert client._process.poll() is not None
+    finally:
+        client.close()
+
+
+def test_explicit_password_does_not_contact_an_ssh_agent(ssh_server, tmp_path, monkeypatch):
+    def forbidden_agent():
+        raise AssertionError("Password authentication must not contact an agent")
+
+    monkeypatch.setattr(paramiko.client, "Agent", forbidden_agent)
+    ssh_server.pin(tmp_path / "known_hosts")
+    client = ssh_server.client("alice", tmp_path / "known_hosts")
+    try:
+        assert client.join("password-room", "a" * 64)["id"]
+    finally:
+        client.close()

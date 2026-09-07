@@ -1,4 +1,34 @@
-# Live Segmentation 0.15.0
+# Live Segmentation 0.15.1
+
+This fixes a local SSH-library import stall observed inside a running Slicer.
+The previous generic 45-second message incorrectly suggested an unresponsive
+collaboration location even though no server login had been attempted.
+
+- SSH/crypto imports and sessions now run in a dedicated local Python process.
+  Cancelling or timing out terminates that worker and any Python launcher child,
+  without terminating Slicer. No password is written to disk, arguments or the
+  environment; only anonymous process pipes carry the session setup.
+- Progress identifies local library loading, verified-host loading, server login,
+  remote Python startup and remote folder preparation. Timeout messages identify
+  the stage and no longer assume that the server is offline.
+- An explicitly entered password bypasses SSH agent/default-key discovery.
+  Host-key verification remains mandatory; saving a verified public key no longer
+  imports cryptography into Slicer either.
+- 124 automated tests cover both direct and process-isolated transports, including
+  an artificial stalled startup, host-key errors and concurrent chat/health RPCs.
+- The real Slicer Safe Start test passed incoming paint, outgoing erase, chat and
+  exact seven-voxel rejoin without importing Paramiko into Slicer. A synthetic
+  loopback paint arrived in 0.078 s; this is not a deployed-server latency promise.
+
+Install 0.15.1 and restart Slicer through the Live Segmentation shortcut after
+saving your work. An already stuck import in an old Slicer process cannot be
+repaired by merely copying the new files. Real-server login and account-specific
+folder rights still require an authenticated user test. Protocol and room data
+are unchanged; nnInteractive remains separate.
+
+---
+
+# Previous release: Live Segmentation 0.15.0
 
 ## Linux folders through encrypted SSH
 

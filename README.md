@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.15.0.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.15.1.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.15.0`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.15.1`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -369,7 +369,7 @@ two-minute preflight beacon. See `docs/TWO_COMPUTER_PREFLIGHT.md`.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 119 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, SSH, crash-recovery, QA,
+- 124 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, SSH, crash-recovery, QA,
   chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.

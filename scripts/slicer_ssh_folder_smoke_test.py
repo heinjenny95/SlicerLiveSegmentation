@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -27,7 +28,7 @@ def wait_until(predicate, timeout=25):
 
 def probe():
     from LiveSegmentationLib.collaboration import encode_mask_crop_snapshot
-    from LiveSegmentationLib.ssh_transport import SshRoomClient
+    from LiveSegmentationLib.ssh_transport import SshProcessRoomClient
 
     root = Path(__file__).resolve().parents[1]
     folder = Path(tempfile.mkdtemp(prefix="live-slicer-ssh-"))
@@ -64,10 +65,11 @@ def probe():
         join_return = time.monotonic() - start
         assert join_return < 0.25
         wait_until(lambda: controller.connected and controller.initial_sync_complete)
+        assert "paramiko" not in sys.modules, "SSH libraries leaked into the Slicer process"
         assert not controller._text(controller.ssh_password_edit)
         assert "encrypted SSH" in controller._live_status_text()
         assert controller.backup_group.isHidden()
-        peer = SshRoomClient(connection["location"], "ssh-bob", connection["username"], connection["password"], known_hosts=connection["known_hosts"])
+        peer = SshProcessRoomClient(connection["location"], "ssh-bob", connection["username"], connection["password"], known_hosts=connection["known_hosts"], python_executable=controller.client.python_executable)
         room = peer.join("encrypted-slicer-room", controller.source_volume_signature)
         operation = {"client_operation_id": "ssh-smoke-paint", "segment_id": "LiveSeg-Mandibles", "segment_name": "Mandibles", "color_hex": "#FF0000", "base_sequence": 0, **encode_mask_crop_snapshot(np.ones((2, 2, 2), dtype=np.uint8), [4, 6, 5, 7, 6, 8], [64, 64, 64])}
         start = time.monotonic()

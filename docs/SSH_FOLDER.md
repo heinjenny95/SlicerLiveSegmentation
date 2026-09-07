@@ -34,6 +34,18 @@ Do not solve permission errors by making sensitive data world-writable.
 
 ## Storage and lifecycle
 
+Since 0.15.1, SSH and cryptography run inside a dedicated local Python process,
+not inside Slicer's Python interpreter. The worker uses Slicer's existing Python
+runtime, a local module working directory, no user-site packages and no inherited
+PYTHONPATH. Credentials pass through an anonymous pipe, never process arguments,
+environment variables or a temporary file. Cancelling a connection terminates
+only that worker (including Python launcher children on Windows).
+
+Connection progress identifies library loading, server login, remote Python
+startup and folder preparation. A timeout reports the last setup step; it does
+not automatically diagnose the server as offline. An entered password bypasses
+agent/key discovery; leave it empty to use a supported SSH agent/default key.
+
 Room data lives at `<selected folder>/LiveSegmentation/rooms/...`, using the
 same ordered operations, stable label identities, locks and history as shared
 folder mode. A small Python helper runs in memory for each SSH connection and
