@@ -6,6 +6,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/collaboration.py
   LiveSegmentationLib/features.py
   LiveSegmentationLib/version.py
+  LiveSegmentationLib/ssh_transport.py
 )
 
 set(MODULE_PYTHON_RESOURCES

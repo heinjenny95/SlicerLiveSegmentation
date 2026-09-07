@@ -17,7 +17,7 @@ that module.
 
 ## Windows installation
 
-1. Extract `SlicerLiveSegmentation-module-0.14.7.zip` completely.
+1. Extract `SlicerLiveSegmentation-module-0.15.0.zip` completely.
 2. Double-click `Install-LiveSegmentation.cmd` in the extracted folder.
 3. Close all running Slicer windows.
 4. Open the new desktop shortcut **Live Segmentation**.
@@ -29,7 +29,7 @@ when an existing Slicer profile cannot reach its main window; it does not delete
 or overwrite the normal profile.
 
 The installer copies only this module to
-`Documents\SlicerExtensions\LiveSegmentation-0.14.7`. Other Slicer extensions and
+`Documents\SlicerExtensions\LiveSegmentation-0.15.0`. Other Slicer extensions and
 their settings remain unchanged.
 
 Alternatively, add the extracted `LiveSegmentation` directory under
@@ -330,6 +330,23 @@ labels when scientifically appropriate, monitor Slicer process memory, and first
 test the intended volume, label count, undo settings, and network share on a
 representative workstation.
 
+## Linux server folders over SSH
+
+Choose **Linux server folder (SSH)** and enter `linux-host/dev/shm/team`
+or `ssh://linux-host/absolute/folder`, your own SSH login and password, and the
+same room name on both computers. Recognized Linux host paths pasted into the
+shared-folder or server address field automatically select SSH mode. Install
+the optional local SSH dependency with **Install SSH support** if prompted.
+
+The host needs SSH shell access, Python 3.10+ with NumPy, and an existing folder
+that both accounts can read and write. No SMB mount, HTTP daemon, administrative
+installation, or additional listening port is needed. Passwords are never saved;
+first-use server fingerprints must be verified. `/dev/shm` is temporary storage,
+not a durable backup location. Full Slicer project backups are not uploaded by
+this transport: use Slicer's **Save** to persistent storage.
+
+See [Linux SSH folder setup](docs/SSH_FOLDER.md) for details and limitations.
+
 ## Remote internet collaboration
 
 The connection selector offers **Remote HTTPS server**. This transport uses the
@@ -352,7 +369,7 @@ two-minute preflight beacon. See `docs/TWO_COMPUTER_PREFLIGHT.md`.
 ## Verification
 
 - Ruff and Python compilation pass.
-- 66 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, crash-recovery, QA,
+- 119 automated transport, API, preflight, HTTPS-policy, direct-LAN/fallback, SSH, crash-recovery, QA,
   chat-anchor, chunked snapshot/compaction, history,
   conflict, role, review, lock, template, invitation, diagnostics, backup,
   authentication, and delta tests pass.

@@ -41,7 +41,7 @@ class LiveSegmentation(ScriptedLoadableModule):
         self.parent.contributors = ["Live Segmentation contributors"]
         self.parent.helpText = (
             "Synchronize a standard 3D Slicer Segmentation node through a shared "
-            "network folder, trusted direct LAN relay, or remote HTTPS server. Segmentation tools "
+            "network folder, Linux SSH folder, trusted direct LAN relay, or remote HTTPS server. Segmentation tools "
             "remain separate and can edit the selected node through Slicer's MRML scene."
         )
         self.parent.acknowledgementText = (

@@ -4377,6 +4377,14 @@ def _uses_shared_folder(client):
     )
 
 
+def _ssh_transport_module():
+    try:
+        from . import ssh_transport
+    except ImportError:
+        import ssh_transport
+    return ssh_transport
+
+
 def benchmark_room_transport(client, room_id, after_sequence=0, samples=5):
     """Measure non-destructive health and live-feed reads for the active room."""
     samples = max(2, min(int(samples), 20))
@@ -4586,6 +4594,10 @@ class LiveCollaborationController:
         self._comparison_node_id = None
         self.lan_server = None
         self._last_hybrid_fallback_count = 0
+        self._connecting_client = None
+        self._ssh_trust_dialog = None
+        self._ssh_install_process = None
+        self._cleaned_up = False
 
     def setup(self):
         import ctk
@@ -4627,6 +4639,7 @@ class LiveCollaborationController:
         self.transport_combo.addItem("Shared/network folder")
         self.transport_combo.addItem("Direct LAN + shared-folder fallback")
         self.transport_combo.addItem("Remote HTTPS server")
+        self.transport_combo.addItem("Linux server folder (SSH)")
         self.transport_combo.setCurrentIndex(2 if default_transport == "server" else 0)
         identity_layout.addRow("Name", self.user_edit)
         identity_layout.addRow("Room", self.room_edit)
@@ -5205,6 +5218,40 @@ class LiveCollaborationController:
         layout.insertWidget(2, self.server_settings)
         layout.insertWidget(2, self.lan_settings)
 
+        self.ssh_settings = ctk.ctkCollapsibleButton()
+        self.ssh_settings.text = "Linux server login (SSH)"
+        self.ssh_settings.collapsed = False
+        ssh_form = qt.QFormLayout(self.ssh_settings)
+        self.ssh_user_edit = qt.QLineEdit(str(settings.value(self.SETTINGS_PREFIX + "sshUser", getpass.getuser())))
+        self.ssh_password_edit = qt.QLineEdit()
+        self.ssh_password_edit.echoMode = qt.QLineEdit.Password
+        self.ssh_password_edit.setPlaceholderText("Session only; leave empty for SSH key/agent")
+        self.ssh_python_edit = qt.QLineEdit("python3")
+        self.ssh_python_edit.setToolTip("Remote Python 3.10+ executable with NumPy; an absolute path to an existing environment is supported.")
+        self.ssh_info_label = qt.QLabel(
+            "Enter host/absolute/folder above. The plugin runs a temporary helper over encrypted SSH; "
+            "no Windows share or extra listening port is needed. The remote folder must already exist "
+            "and be writable. Full MRB backups are not available in this mode; use Slicer Save to persistent storage."
+        )
+        self.ssh_info_label.setWordWrap(True)
+        self.ssh_storage_warning = qt.QLabel()
+        self.ssh_storage_warning.setWordWrap(True)
+        self.ssh_storage_warning.setStyleSheet("color: #b26a00; font-weight: bold;")
+        self.ssh_install_button = qt.QPushButton("Install SSH support")
+        self.ssh_install_button.clicked.connect(self.install_ssh_support)
+        self.ssh_install_status = qt.QLabel()
+        self.ssh_install_status.setWordWrap(True)
+        ssh_form.addRow("SSH login", self.ssh_user_edit)
+        ssh_form.addRow("Password", self.ssh_password_edit)
+        ssh_form.addRow("Remote Python", self.ssh_python_edit)
+        ssh_form.addRow(self.ssh_info_label)
+        ssh_form.addRow(self.ssh_storage_warning)
+        ssh_form.addRow(self.ssh_install_button)
+        ssh_form.addRow(self.ssh_install_status)
+        layout.insertWidget(2, self.ssh_settings)
+        self.shared_folder_edit.editTextChanged.connect(self._detect_ssh_folder)
+        self.server_edit.editingFinished.connect(self._detect_ssh_server_address)
+
         self.transport_combo.currentIndexChanged.connect(self._update_transport_fields)
         self._update_transport_fields()
 
@@ -5229,12 +5276,14 @@ class LiveCollaborationController:
     def _transport_mode(self):
         index = self.transport_combo.currentIndex
         index = index() if callable(index) else index
-        return {0: "shared-folder", 1: "direct-lan", 2: "server"}.get(
+        return {0: "shared-folder", 1: "direct-lan", 2: "server", 3: "ssh-folder"}.get(
             int(index), "shared-folder"
         )
 
     def _live_status_text(self):
-        if isinstance(self.client, HybridRoomClient):
+        if getattr(self.client, "transport_kind", None) == "ssh-folder":
+            transport = "encrypted SSH"
+        elif isinstance(self.client, HybridRoomClient):
             transport = (
                 "direct LAN / shared-folder fallback"
                 if self.client.fallback_client is not None
@@ -5265,10 +5314,10 @@ class LiveCollaborationController:
     def _update_transport_fields(self, index=None):
         del index
         mode = self._transport_mode()
-        shared = mode in {"shared-folder", "direct-lan"}
+        shared = mode in {"shared-folder", "direct-lan", "ssh-folder"}
         direct = mode == "direct-lan"
         self.shared_folder_label.setText(
-            "Fallback folder (optional)" if direct else "Shared folder"
+            "Linux server folder" if mode == "ssh-folder" else "Fallback folder (optional)" if direct else "Shared folder"
         )
         self.shared_folder_label.setVisible(shared)
         self.shared_folder_widget.setVisible(shared)
@@ -5278,9 +5327,106 @@ class LiveCollaborationController:
             self.server_settings.collapsed = False
         if direct:
             self.lan_settings.collapsed = False
-        self.backup_group.setVisible(shared)
+        self.ssh_settings.setVisible(mode == "ssh-folder")
+        self.shared_folder_button.setVisible(mode != "ssh-folder")
+        self.shared_folder_edit.lineEdit().setPlaceholderText(
+            "e.g. linux-host/dev/shm/team" if mode == "ssh-folder" else r"e.g. P:\LiveSegmentation or \\server\share"
+        )
+        self.backup_group.setVisible(shared and mode != "ssh-folder")
         if hasattr(self, "backup_enabled_checkbox"):
             self._on_backup_settings_changed()
+
+    def _detect_ssh_folder(self, value):
+        ssh = _ssh_transport_module()
+
+        if self._transport_mode() == "shared-folder" and ssh.looks_like_ssh_folder(value):
+            self.transport_combo.setCurrentIndex(3)
+        volatile = False
+        if self._transport_mode() == "ssh-folder":
+            try:
+                volatile = ssh.parse_ssh_folder(value).volatile
+            except ValueError:
+                pass
+        self.ssh_storage_warning.setText(
+            "Temporary RAM folder: /dev/shm is normally cleared on server restart. Save your results to persistent storage."
+            if volatile else ""
+        )
+
+    def _detect_ssh_server_address(self):
+        value = self._text(self.server_edit)
+        if self._transport_mode() == "server" and _ssh_transport_module().looks_like_ssh_folder(value):
+            self.transport_combo.setCurrentIndex(3)
+            self.shared_folder_edit.setEditText(value)
+
+    def _ssh_known_hosts_path(self):
+        return Path.home() / ".ssh" / "live_segmentation_known_hosts"
+
+    def install_ssh_support(self, checked=False):
+        del checked
+        import importlib.util
+
+        import qt
+        import slicer
+
+        if self._ssh_install_process is not None:
+            return
+        if importlib.util.find_spec("paramiko") is not None:
+            self.ssh_install_status.setText("SSH support is installed. You can join now.")
+            return
+        executable = Path(slicer.app.applicationDirPath()) / ("PythonSlicer.exe" if os.name == "nt" else "PythonSlicer")
+        if not executable.is_file():
+            self.ssh_install_status.setText("PythonSlicer was not found. Install paramiko in Slicer's Python environment.")
+            return
+        process = qt.QProcess()
+        self._ssh_install_process = process
+        self.ssh_install_button.enabled = False
+        self.ssh_install_status.setText("Installing optional SSH support locally in the background…")
+        process.readyReadStandardOutput.connect(lambda: process.readAllStandardOutput())
+        process.readyReadStandardError.connect(lambda: process.readAllStandardError())
+
+        def finished(code, _status):
+            if self._ssh_install_process is not process:
+                return
+            self._ssh_install_process = None
+            importlib.invalidate_caches()
+            if not self._cleaned_up:
+                self.ssh_install_button.enabled = True
+                self.ssh_install_status.setText("SSH support installed. You can join now." if code == 0 else "SSH installation failed. Check internet access and the Python environment.")
+            process.deleteLater()
+
+        process.finished.connect(finished)
+        process.errorOccurred.connect(lambda error: finished(-1, None) if error == qt.QProcess.FailedToStart else None)
+        process.start(str(executable), ["-m", "pip", "install", "paramiko>=3.4,<5"])
+
+    def _ask_ssh_host_trust(self, details):
+        import qt
+        import slicer
+        trust_host_key = _ssh_transport_module().trust_host_key
+
+        dialog = qt.QMessageBox(slicer.util.mainWindow())
+        self._ssh_trust_dialog = dialog
+        dialog.setWindowTitle("Verify SSH server identity")
+        dialog.setIcon(qt.QMessageBox.Warning)
+        dialog.setText("First connection to " + details["host"])
+        dialog.setInformativeText(
+            "Server fingerprint:\n" + details["fingerprint"] + "\n\nCompare this fingerprint with your server administrator. "
+            "Trust it only if it matches. A changed known key is always rejected."
+        )
+        trust_button = dialog.addButton("Trust this verified server", qt.QMessageBox.AcceptRole)
+        dialog.addButton(qt.QMessageBox.Cancel)
+
+        def answered(_result):
+            self._ssh_trust_dialog = None
+            if not self._cleaned_up and dialog.clickedButton() == trust_button:
+                try:
+                    trust_host_key(self._ssh_known_hosts_path(), details)
+                    self.status_label.setText("SSH identity saved. Click Join live room again to sign in.")
+                except Exception as exc:
+                    self._show_error(str(exc), popup=True)
+            dialog.deleteLater()
+
+        dialog.finished.connect(answered)
+        dialog.open()
 
     def toggle_lan_host(self, checked=False):
         del checked
@@ -6451,7 +6597,9 @@ class LiveCollaborationController:
 
         try:
             transport = self._transport_mode()
-            if transport == "shared-folder":
+            if transport == "ssh-folder":
+                location = _ssh_transport_module().parse_ssh_folder(self._text(self.shared_folder_edit)).location
+            elif transport == "shared-folder":
                 location = self._text(self.shared_folder_edit)
             elif transport == "direct-lan":
                 location = self._text(self.lan_url_edit)
@@ -6509,7 +6657,10 @@ class LiveCollaborationController:
         try:
             invitation = parse_invitation(Path(str(path)).read_text(encoding="utf-8"))
             self.room_edit.setText(invitation["room_name"])
-            if invitation["transport"] == "shared-folder":
+            if invitation["transport"] == "ssh-folder":
+                self.transport_combo.setCurrentIndex(3)
+                self.shared_folder_edit.setEditText(invitation["location"])
+            elif invitation["transport"] == "shared-folder":
                 self.transport_combo.setCurrentIndex(0)
                 self.shared_folder_edit.setEditText(invitation["location"])
             elif invitation["transport"] == "direct-lan":
@@ -6536,6 +6687,19 @@ class LiveCollaborationController:
 
     def _build_connection_client(self, user_name, transport_mode):
         """Build the selected transport without joining or touching room state."""
+        if transport_mode == "server" and _ssh_transport_module().looks_like_ssh_folder(self._text(self.server_edit)):
+            self._detect_ssh_server_address()
+            transport_mode = self._transport_mode()
+        location = self._text(self.shared_folder_edit)
+        if transport_mode == "ssh-folder" or (transport_mode == "shared-folder" and _ssh_transport_module().looks_like_ssh_folder(location)):
+            self.transport_combo.setCurrentIndex(3)
+            password = self.ssh_password_edit.text
+            password = str(password() if callable(password) else password)
+            return _ssh_transport_module().SshRoomClient(
+                location, user_name, self._text(self.ssh_user_edit),
+                password, known_hosts=self._ssh_known_hosts_path(),
+                remote_python=self._text(self.ssh_python_edit),
+            ), _ssh_transport_module().parse_ssh_folder(location).location
         if transport_mode == "shared-folder":
             location = self._text(self.shared_folder_edit)
             return SharedFolderRoomClient(location, user_name), location
@@ -6598,9 +6762,14 @@ class LiveCollaborationController:
                     "lane": "preflight",
                     "session_token": session_token,
                     "error": str(exc),
+                    "ssh_host_key": getattr(exc, "host_key", None),
                     "duration": time.monotonic() - started,
                 }
             )
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
     def run_connection_preflight(self, checked=False):
         del checked
@@ -6617,6 +6786,7 @@ class LiveCollaborationController:
             client, _location = self._build_connection_client(
                 user_name, self._transport_mode()
             )
+            self._connecting_client = client
             self._preflight_running = True
             self._preflight_started_at = time.monotonic()
             self._set_connection_inputs_enabled(False)
@@ -6696,18 +6866,27 @@ class LiveCollaborationController:
         self.lan_host_checkbox.enabled = enabled
         self.lan_port_spin.enabled = enabled
         self.lan_host_button.enabled = enabled
+        self.ssh_user_edit.enabled = enabled
+        self.ssh_password_edit.enabled = enabled
+        self.ssh_python_edit.enabled = enabled
+        self.ssh_install_button.enabled = enabled and self._ssh_install_process is None
         self.preflight_button.enabled = enabled and not self._preflight_running
 
     @staticmethod
     def _leave_client_in_background(client, room_id):
-        if client is None or not room_id:
+        if client is None:
             return
 
         def leave_client():
             try:
-                client.leave(room_id)
+                if room_id:
+                    client.leave(room_id)
             except Exception:
                 pass
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
         threading.Thread(
             target=leave_client,
@@ -6719,6 +6898,8 @@ class LiveCollaborationController:
         if not self._joining:
             return
         self._session_token += 1
+        self._leave_client_in_background(self._connecting_client, None)
+        self._connecting_client = None
         self._joining = False
         self._join_started_at = 0.0
         self._join_status_second = -1
@@ -6760,6 +6941,7 @@ class LiveCollaborationController:
                     "session_token": session_token,
                     "client": client,
                     "error": str(exc),
+                    "ssh_host_key": getattr(exc, "host_key", None),
                     "duration": time.monotonic() - started,
                 }
             )
@@ -6790,6 +6972,8 @@ class LiveCollaborationController:
             client, connection_location = self._build_connection_client(
                 user_name, transport_mode
             )
+            self._connecting_client = client
+            transport_mode = self._transport_mode()
             self._join_context = {
                 "user_name": user_name,
                 "room_name": room_name,
@@ -6845,6 +7029,11 @@ class LiveCollaborationController:
             self._join_worker = None
             self._join_context = None
             self.client = client
+            self._connecting_client = None
+            if getattr(client, "transport_kind", None) == "ssh-folder":
+                self.ssh_password_edit.clear()
+                self._remember_recent_shared_folder(client.location)
+                qt.QSettings().setValue(self.SETTINGS_PREFIX + "sshUser", client.username)
             self.room_id = room["id"]
             self.room_name = str(room["name"])
             self.user_name = context["user_name"]
@@ -7068,6 +7257,9 @@ class LiveCollaborationController:
 
     def leave(self, notify_remote=True):
         client = self.client
+        connecting_client = self._connecting_client
+        self._connecting_client = None
+        self._leave_client_in_background(connecting_client, None)
         room_id = self.room_id
         segmentation_node_id = self.segmentation_node_id
         if notify_remote:
@@ -7097,6 +7289,8 @@ class LiveCollaborationController:
             # minutes.  Local teardown must always finish immediately; the
             # courtesy presence/audit cleanup is best-effort on a daemon lane.
             self._leave_client_in_background(client, room_id)
+        elif getattr(client, "transport_kind", None) == "ssh-folder":
+            self._leave_client_in_background(client, None)
         self.client = None
         self.room_id = None
         self.room_name = None
@@ -7276,6 +7470,10 @@ class LiveCollaborationController:
         self.users_label.setText("Nobody else is connected")
 
     def cleanup(self):
+        self._cleaned_up = True
+        self.ssh_password_edit.clear()
+        if self._ssh_trust_dialog is not None:
+            self._ssh_trust_dialog.reject()
         # Preserve unacknowledged edits if Slicer exits or the module is
         # destroyed unexpectedly. An explicit Leave remains the clean discard.
         self.leave(notify_remote=False)
@@ -8319,11 +8517,14 @@ class LiveCollaborationController:
         self._drain_incoming_operations()
         monotonic_now = time.monotonic()
         if self._preflight_running:
+            preflight_timeout = 45.0 if self._transport_mode() == "ssh-folder" else PREFLIGHT_TIMEOUT_SECONDS
             elapsed = monotonic_now - self._preflight_started_at
             self.preflight_button.setText(
                 f"Checking… {int(max(0.0, elapsed))} s"
             )
-            if elapsed >= PREFLIGHT_TIMEOUT_SECONDS:
+            if elapsed >= preflight_timeout:
+                self._leave_client_in_background(self._connecting_client, None)
+                self._connecting_client = None
                 self._session_token += 1
                 self._preflight_running = False
                 self._preflight_worker = None
@@ -8340,7 +8541,7 @@ class LiveCollaborationController:
                                     "connection",
                                     "fail",
                                     "Connection timeout",
-                                    f"The destination did not answer within {int(PREFLIGHT_TIMEOUT_SECONDS)} seconds.",
+                                    f"The destination did not answer within {int(preflight_timeout)} seconds.",
                                     "Check the address or folder, firewall, VPN/network route, and credentials.",
                                 )
                             ],
@@ -8350,6 +8551,7 @@ class LiveCollaborationController:
                 self.timer.stop()
             return
         if self._joining:
+            join_timeout = 45.0 if self._transport_mode() == "ssh-folder" else SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
             elapsed = (
                 monotonic_now - self._join_started_at
                 if self._join_started_at
@@ -8360,15 +8562,15 @@ class LiveCollaborationController:
                 self._join_status_second = elapsed_second
                 self.status_label.setText(
                     "● Connecting in background… "
-                    f"{elapsed_second} / {int(SHARED_FOLDER_JOIN_TIMEOUT_SECONDS)} s"
+                    f"{elapsed_second} / {int(join_timeout)} s"
                 )
             if (
                 self._join_started_at
-                and elapsed >= SHARED_FOLDER_JOIN_TIMEOUT_SECONDS
+                and elapsed >= join_timeout
             ):
                 self._cancel_join(
                     "The collaboration location did not respond within "
-                    f"{int(SHARED_FOLDER_JOIN_TIMEOUT_SECONDS)} seconds. "
+                    f"{int(join_timeout)} seconds. "
                     "The connection attempt was cancelled locally and will not be "
                     "retried automatically."
                 )
@@ -9321,7 +9523,11 @@ class LiveCollaborationController:
                     )
                     continue
                 if "error" in result:
-                    self._cancel_join(result["error"])
+                    if result.get("ssh_host_key"):
+                        self._cancel_join()
+                        self._ask_ssh_host_trust(result["ssh_host_key"])
+                    else:
+                        self._cancel_join(result["error"])
                 else:
                     self._finish_join(result["client"], result["room"])
                 continue
@@ -9329,6 +9535,7 @@ class LiveCollaborationController:
                 if result.get("session_token") != self._session_token:
                     continue
                 self._preflight_running = False
+                self._connecting_client = None
                 self._preflight_worker = None
                 self._preflight_started_at = 0.0
                 self._set_connection_inputs_enabled(
@@ -9354,6 +9561,8 @@ class LiveCollaborationController:
                 else:
                     report = dict(result.get("report") or {})
                 self._show_preflight_report(report)
+                if result.get("ssh_host_key"):
+                    self._ask_ssh_host_trust(result["ssh_host_key"])
                 if not self.connected and not self._joining:
                     self.timer.stop()
                 continue

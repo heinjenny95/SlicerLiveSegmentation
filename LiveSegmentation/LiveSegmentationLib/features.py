@@ -466,8 +466,16 @@ def build_invitation(
     Server API keys are never included. Direct-LAN invitations intentionally
     carry their temporary session code and must therefore be shared privately.
     """
-    if transport not in {"shared-folder", "server", "direct-lan"}:
+    if transport not in {"shared-folder", "server", "direct-lan", "ssh-folder"}:
         raise ValueError("Unsupported invitation transport")
+    if transport == "ssh-folder":
+        try:
+            from .ssh_transport import parse_ssh_folder
+        except ImportError:
+            from ssh_transport import parse_ssh_folder
+        location = parse_ssh_folder(location).location
+        access_code = None
+        fallback_shared_folder = None
     result = {
         "format": INVITATION_FORMAT_V2 if transport == "direct-lan" else INVITATION_FORMAT,
         "transport": transport,

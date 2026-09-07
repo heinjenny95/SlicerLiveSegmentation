@@ -1,4 +1,44 @@
-# Live Segmentation 0.14.7
+# Live Segmentation 0.15.0
+
+## Linux folders through encrypted SSH
+
+- New **Linux server folder (SSH)** mode accepts `host/absolute/folder`,
+  `host:/absolute/folder` and `ssh://host/folder`. Recognized Linux paths pasted
+  into the existing address fields automatically select this mode.
+- Each participant uses their own SSH login. Passwords remain in memory only;
+  first-use host fingerprints require verification and changed keys are refused.
+- A Python helper runs through the existing SSH connection with concurrent
+  requests. No SMB mount, remote package installation, HTTP service or extra
+  listening port is required. The server needs Python 3.10+, NumPy, SSH shell
+  access and an existing folder writable by both accounts.
+- Setup, dependency installation and transport waits run off the Slicer GUI.
+  Leave and cancellation close the connection; startup remains clean and offline.
+- Optional Paramiko installation is available from the module. Path history and
+  invitations support SSH without storing credentials.
+- A visible warning identifies `/dev/shm` as temporary RAM storage. Full `.mrb`
+  backup upload is not available in SSH mode; save projects to persistent storage
+  using Slicer's Save. Existing shared-folder backup behavior is unchanged.
+
+## Verification and boundaries
+
+- 119 automated tests, Ruff and compilation pass. New encrypted integration tests
+  cover two-client edits, chat, presence, history, host-key rejection, failed
+  authentication, missing folders, concurrent RPCs and clean close.
+- In a synthetic Slicer 5.12.3 SSH loopback test, remote paint arrived in 0.140 s;
+  Join returned immediately and Leave returned in 0.015 s. Erasure and exact
+  7-voxel restoration after rejoin passed. These are local measurements, not
+  two-computer or deployed-server guarantees.
+- Actual deployment login and account-specific folder permissions require a
+  user-authenticated connection. No deployment password is bundled or recorded.
+- Interactive MFA, jump-host configuration and MobaXterm session import are not
+  implemented. See [SSH setup](docs/SSH_FOLDER.md).
+
+Protocol 3 and room format are unchanged. All participants need 0.15.0 for the
+new SSH mode. nnInteractive remains separate and untouched.
+
+---
+
+# Previous release: Live Segmentation 0.14.7
 
 This release separates transport latency from Slicer's interactive work and
 reduces full-labelmap processing during simultaneous editing.
