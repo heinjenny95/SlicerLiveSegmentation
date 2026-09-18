@@ -10,6 +10,26 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- A room snapshot could erase a collaborator's latest edits for every
+  participant, including the author (L-02). The snapshot was built from the
+  publisher's last known sequence but appended, with replace semantics, after
+  everything that had arrived in the meantime, and compaction then archived
+  those operations. The publisher now passes the sequence the snapshot was
+  built from; the shared folder checks it under the sequence lock and skips
+  the snapshot when the room has moved on (the HTTPS server has no atomic
+  check yet, so the client checks immediately before publishing). A skipped
+  automatic snapshot is simply retried later, a requested one is rebuilt.
+- A participant that was behind the compaction point never learned that a
+  label had been deleted and kept a ghost label (L-02). Compaction now repeats
+  such deletions at the start of the snapshot; they are not shown as new
+  activity.
+- A reader that briefly could not see the next operation (SMB directory-cache
+  lag) resumed at any later operation of kind `snapshot`, which includes an
+  ordinary replace of one label, and skipped other labels' operations for good
+  (L-02). It now resumes only at the first operation of a room snapshot.
+- Every idle participant published its own full snapshot shortly after
+  another one had done so, because only one's own snapshots were counted
+  (L-02). Snapshots received from the room now count as well.
 - Shared/Network Folder: the sequence lock could be held by two computers at
   once (L-01), which produced two operations with the same sequence number,
   silently dropped one of them for readers, and made the room refuse every new
