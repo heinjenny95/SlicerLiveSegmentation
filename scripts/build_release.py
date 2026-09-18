@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import zipfile
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ ROOT_FILES = (
     ".dockerignore",
     ".editorconfig",
     ".gitignore",
+    "CHANGELOG.md",
     "CMakeLists.txt",
     "CITATION.cff",
     "CONTRIBUTING.md",
@@ -69,6 +71,43 @@ MODULE_FILES = (
 
 def version() -> str:
     return (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+
+VERSION_CARRIERS = (
+    ("LiveSegmentation/LiveSegmentationLib/version.py", r'^PLUGIN_VERSION = "([^"]+)"'),
+    ("server/app/main.py", r'^SERVER_VERSION = "([^"]+)"'),
+    ("CITATION.cff", r'^version: "?([^"\s]+)"?'),
+    ("CMakeLists.txt", r'set\(EXTENSION_VERSION "([^"]+)"\)'),
+)
+
+
+def check_version_consistency() -> None:
+    """Refuse to build a release whose version carriers disagree."""
+    expected = version()
+    mismatches = []
+    for relative, pattern in VERSION_CARRIERS:
+        match = re.search(
+            pattern, (PROJECT_ROOT / relative).read_text(encoding="utf-8"), re.MULTILINE
+        )
+        found = match.group(1) if match else None
+        if found != expected:
+            mismatches.append(f"{relative}: {found!r}")
+    # On a tag build the tag itself is a version carrier.
+    if os.getenv("GITHUB_REF_TYPE") == "tag":
+        tag = os.getenv("GITHUB_REF_NAME", "")
+        if tag != f"v{expected}":
+            mismatches.append(f"git tag: {tag!r}")
+    if mismatches:
+        raise RuntimeError(
+            f"VERSION says {expected!r} but these carriers disagree: " + ", ".join(mismatches)
+        )
+
+
+def count_test_functions() -> int:
+    return sum(
+        len(re.findall(r"^def test_", path.read_text(encoding="utf-8"), re.MULTILINE))
+        for path in sorted((PROJECT_ROOT / "server" / "tests").glob("test_*.py"))
+    )
 
 
 def is_allowed(path: Path) -> bool:
@@ -131,6 +170,7 @@ def verify_archive(path: Path) -> None:
 
 
 def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
+    check_version_consistency()
     release_version = version()
     output_dir.mkdir(parents=True, exist_ok=True)
     root_name = f"SlicerLiveSegmentation-{release_version}"
@@ -168,10 +208,17 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
         "repository_url": "https://github.com/heinjenny95/SlicerLiveSegmentation",
         "artifacts": artifacts,
-        "validation": {
-            "ruff": "passed",
-            "python_compileall": "passed",
-            "automated_tests": 124,
+        "measured_by_this_script": {
+            "archives_verified": True,
+            "version_carriers_consistent": True,
+            "test_functions_in_source": count_test_functions(),
+        },
+        "maintainer_asserted_validation": {
+            "note": (
+                "Statements written by the maintainer for this release. They are "
+                "not run or verified by build_release.py; the CI run of the release "
+                "commit is the evidence for ruff, compileall and pytest."
+            ),
             "ssh_transport": "passed-isolated-local-worker-stalled-import-cancellation-password-first-stage-diagnostics-encrypted-two-clients-slicer-safe-start-rejoin; real-deployment-login-pending",
             "live_server_health": "passed",
             "slicer_5_12_3_smoke_test": (
@@ -199,8 +246,6 @@ def build_release(output_dir: Path, generated_at: str | None = None) -> dict:
                 "exclusive-overlap-convergence-bidirectional-presence"
             ),
             "docker_runtime_test": "pending-no-local-docker-installation",
-        },
-        "security": {
             "contains_patient_data": False,
             "contains_local_database": False,
             "contains_api_keys": False,
