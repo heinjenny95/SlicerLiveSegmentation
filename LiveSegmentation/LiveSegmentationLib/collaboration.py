@@ -1587,6 +1587,59 @@ class LiveRoomClient:
         return None
 
 
+class _HeldSharedLock:
+    """A shared-folder lock this client currently holds.
+
+    A lock older than ``stale_lock_seconds`` counts as abandoned. Publishing a
+    snapshot on a slow NAS can take longer than that, so the holder refreshes
+    the lock while it works, and it can verify that it still owns the lock
+    immediately before it writes something that depends on it.
+    """
+
+    def __init__(self, client, lock_path, token, owner_record):
+        self._client = client
+        self._lock_path = lock_path
+        self._token = token
+        self._owner_record = dict(owner_record)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start_heartbeat(self, interval_seconds):
+        def beat():
+            while not self._stop.wait(interval_seconds):
+                if self._client._lock_owner_token(self._lock_path) != self._token:
+                    # Never touch a lock that is not (or momentarily not) ours.
+                    continue
+                try:
+                    # Replacing owner.json also updates the directory timestamp,
+                    # which is what clients before this change look at.
+                    _write_json_atomic(
+                        self._lock_path / "owner.json",
+                        {**self._owner_record, "heartbeat_at": _utc_iso()},
+                        durable=False,
+                    )
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(
+            target=beat, name="LiveSegmentation-lock-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def stop_heartbeat(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def verify(self):
+        """Raise if another client has taken this lock over in the meantime."""
+        if self._client._lock_owner_token(self._lock_path) != self._token:
+            raise LiveCollaborationError(
+                "The shared-folder lock was taken over by another computer before "
+                "this change could be written. Nothing was written; try again."
+            )
+
+
 class SharedFolderRoomClient:
     """Ordered live-room transport backed only by a shared filesystem folder."""
 
@@ -1728,6 +1781,80 @@ class SharedFolderRoomClient:
         except (LiveCollaborationError, TypeError, ValueError):
             return 0, []
 
+    def _shared_folder_clock_offset(self, room_path):
+        """Return (file-server clock - local clock) in seconds, cached briefly.
+
+        Lock files carry timestamps from the file server. Comparing them with
+        the local clock made a PC whose clock ran a minute ahead of the NAS see
+        every foreign lock as stale and break it while it was still held.
+        """
+        cached = getattr(self, "_clock_offset_cache", None)
+        now = time.monotonic()
+        if cached is not None and cached[0] == str(room_path) and now - cached[1] < 30.0:
+            return cached[2]
+        probe_path = room_path / f".clock-probe-{uuid.uuid4().hex}"
+        offset = 0.0
+        try:
+            probe_path.write_bytes(b"")
+            offset = probe_path.stat().st_mtime - time.time()
+        except OSError:
+            offset = cached[2] if cached is not None and cached[0] == str(room_path) else 0.0
+        finally:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._clock_offset_cache = (str(room_path), now, offset)
+        return offset
+
+    def _lock_age_seconds(self, room_path, lock_path):
+        """Age of a lock directory by the file server's own clock, or None."""
+        try:
+            newest = lock_path.stat().st_mtime
+        except OSError:
+            return None
+        try:
+            newest = max(newest, (lock_path / "owner.json").stat().st_mtime)
+        except OSError:
+            pass
+        return time.time() + self._shared_folder_clock_offset(room_path) - newest
+
+    @staticmethod
+    def _lock_owner_token(lock_path):
+        try:
+            return str(_read_json_file(lock_path / "owner.json").get("token") or "") or None
+        except (OSError, LiveCollaborationError):
+            return None
+
+    def _break_stale_lock(self, room_path, lock_path, lock_name):
+        """Remove an abandoned lock without ever removing a live one.
+
+        Two waiting clients can judge the same lock stale. The first one breaks
+        it and acquires a fresh lock; the second one would then rename that
+        fresh lock away and both would be inside the critical section. The
+        lock is therefore inspected again after the rename and put back when
+        it is not the abandoned lock that was observed.
+        """
+        observed_token = self._lock_owner_token(lock_path)
+        stale_path = room_path / f"{lock_name}.lock.stale-{uuid.uuid4().hex}"
+        try:
+            os.replace(lock_path, stale_path)
+        except OSError:
+            return
+        moved_token = self._lock_owner_token(stale_path)
+        moved_age = self._lock_age_seconds(room_path, stale_path)
+        if moved_token != observed_token or (
+            moved_age is not None and moved_age <= self.stale_lock_seconds
+        ):
+            try:
+                os.replace(stale_path, lock_path)
+                return
+            except OSError:
+                # The name is taken again. The displaced holder notices through
+                # verify() before it writes; nothing more can be done here.
+                pass
+        shutil.rmtree(stale_path, ignore_errors=True)
+
     @contextmanager
     def _named_lock(self, room_path, lock_name, timeout_seconds=None):
         lock_name = _safe_file_component(lock_name, fallback="room-lock", max_length=40)
@@ -1740,19 +1867,9 @@ class SharedFolderRoomClient:
             try:
                 lock_path.mkdir()
             except FileExistsError:
-                try:
-                    age = time.time() - lock_path.stat().st_mtime
-                except OSError:
-                    age = 0.0
-                if age > self.stale_lock_seconds:
-                    stale_path = room_path / f"{lock_name}.lock.stale-{uuid.uuid4().hex}"
-                    try:
-                        os.replace(lock_path, stale_path)
-                        owner_path = stale_path / "owner.json"
-                        owner_path.unlink(missing_ok=True)
-                        stale_path.rmdir()
-                    except OSError:
-                        pass
+                age = self._lock_age_seconds(room_path, lock_path)
+                if age is not None and age > self.stale_lock_seconds:
+                    self._break_stale_lock(room_path, lock_path, lock_name)
                     continue
                 if time.monotonic() >= deadline:
                     raise LiveCollaborationError(
@@ -1775,31 +1892,22 @@ class SharedFolderRoomClient:
                     f"Could not lock the shared folder {room_path}: {exc}"
                 ) from exc
 
+            owner_record = {"token": token, "user": self.user_name, "created_at": _utc_iso()}
             try:
-                _write_json_atomic(
-                    lock_path / "owner.json",
-                    {"token": token, "user": self.user_name, "created_at": _utc_iso()},
-                    durable=False,
-                )
+                _write_json_atomic(lock_path / "owner.json", owner_record, durable=False)
                 break
             except Exception:
-                try:
-                    lock_path.joinpath("owner.json").unlink(missing_ok=True)
-                    lock_path.rmdir()
-                except OSError:
-                    pass
+                shutil.rmtree(lock_path, ignore_errors=True)
                 raise
+
+        held = _HeldSharedLock(self, lock_path, token, owner_record)
+        held.start_heartbeat(max(0.05, self.stale_lock_seconds / 4.0))
         try:
-            yield
+            yield held
         finally:
-            try:
-                owner_path = lock_path / "owner.json"
-                owner = _read_json_file(owner_path) if owner_path.is_file() else {}
-                if owner.get("token") == token:
-                    owner_path.unlink(missing_ok=True)
-                    lock_path.rmdir()
-            except (OSError, LiveCollaborationError):
-                pass
+            held.stop_heartbeat()
+            if self._lock_owner_token(lock_path) == token:
+                shutil.rmtree(lock_path, ignore_errors=True)
 
     def _sequence_lock(self, room_path):
         return self._named_lock(room_path, "sequence")
@@ -2240,7 +2348,7 @@ class SharedFolderRoomClient:
         operations_path = room_path / "operations"
         operation_index_path = room_path / "operation-index" / f"{operation_hash}.json"
         state_path = room_path / "sequence-state.json"
-        with self._sequence_lock(room_path):
+        with self._sequence_lock(room_path) as sequence_lock:
             state = {}
             if state_path.is_file():
                 try:
@@ -2385,6 +2493,7 @@ class SharedFolderRoomClient:
             # Publish the immutable operation before the replaceable polling
             # cache.  A peer can therefore discover it even while its SMB
             # client still shows an older sequence-state.json generation.
+            sequence_lock.verify()
             _write_json_atomic(destination, stored, durable=False)
             _write_shared_hot_cache(
                 state_path,
@@ -3457,7 +3566,7 @@ class SharedFolderRoomClient:
             return None
         group_id = str(uuid.uuid4())
         created = []
-        with self._sequence_lock(room_path):
+        with self._sequence_lock(room_path) as sequence_lock:
             original_creators = self._segment_creators(room_path)
             for segment_id, owner in original_creators.items():
                 lock_path = self._segment_lock_path(room_path, segment_id)
@@ -3510,6 +3619,7 @@ class SharedFolderRoomClient:
                     / "operations"
                     / f"{sequence:020d}--{operation_hash}.json"
                 )
+                sequence_lock.verify()
                 _write_json_atomic(destination, stored)
                 _write_json_atomic(
                     room_path / "operation-index" / f"{operation_hash}.json",
