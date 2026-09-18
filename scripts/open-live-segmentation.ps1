@@ -1,7 +1,10 @@
+param(
+    [string]$SlicerPath
+)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$slicerPath = 'C:\Users\js7541\AppData\Local\slicer.org\3D Slicer 5.12.3\Slicer.exe'
 $modulePath = Join-Path $projectRoot 'LiveSegmentation'
 
 function Show-LauncherError([string]$Message) {
@@ -10,22 +13,36 @@ function Show-LauncherError([string]$Message) {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $slicerPath)) {
-        throw "3D Slicer 5.12.3 wurde nicht gefunden: $slicerPath"
+    if (-not $SlicerPath) {
+        # Same discovery as Install-LiveSegmentation.ps1: newest per-user Slicer.
+        $slicerRoot = Join-Path $env:LOCALAPPDATA 'slicer.org'
+        $candidates = @(
+            Get-ChildItem -LiteralPath $slicerRoot -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName 'Slicer.exe' } |
+                Where-Object { Test-Path -LiteralPath $_ } |
+                Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending
+        )
+        if (-not $candidates) {
+            throw '3D Slicer wurde nicht gefunden. Installiere Slicer oder starte dieses Skript mit -SlicerPath.'
+        }
+        $SlicerPath = $candidates[0]
+    }
+    if (-not (Test-Path -LiteralPath $SlicerPath)) {
+        throw "3D Slicer wurde nicht gefunden: $SlicerPath"
     }
     if (-not (Test-Path -LiteralPath (Join-Path $modulePath 'LiveSegmentation.py'))) {
         throw "Das Live-Segmentation-Modul wurde nicht gefunden: $modulePath"
     }
 
     Start-Process `
-        -FilePath $slicerPath `
+        -FilePath $SlicerPath `
         -ArgumentList @(
             '--additional-module-path',
             $modulePath,
             '--python-code',
             "slicer.util.selectModule('LiveSegmentation')"
         ) `
-        -WorkingDirectory (Split-Path -Parent $slicerPath)
+        -WorkingDirectory (Split-Path -Parent $SlicerPath)
 } catch {
     Show-LauncherError $_.Exception.Message
     exit 1
