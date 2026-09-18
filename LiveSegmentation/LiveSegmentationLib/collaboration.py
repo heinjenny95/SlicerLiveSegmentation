@@ -1675,23 +1675,34 @@ class _HeldSharedLock:
         self._owner_record = dict(owner_record)
         self._stop = threading.Event()
         self._thread = None
+        # The heartbeat replaces owner.json; verify() must not read it halfway.
+        self._owner_file_guard = threading.Lock()
+
+    def _current_token(self):
+        for attempt in range(3):
+            token = self._client._lock_owner_token(self._lock_path)
+            if token is not None or attempt == 2:
+                return token
+            time.sleep(0.05)
+        return None
 
     def start_heartbeat(self, interval_seconds):
         def beat():
             while not self._stop.wait(interval_seconds):
-                if self._client._lock_owner_token(self._lock_path) != self._token:
-                    # Never touch a lock that is not (or momentarily not) ours.
-                    continue
-                try:
-                    # Replacing owner.json also updates the directory timestamp,
-                    # which is what clients before this change look at.
-                    _write_json_atomic(
-                        self._lock_path / "owner.json",
-                        {**self._owner_record, "heartbeat_at": _utc_iso()},
-                        durable=False,
-                    )
-                except Exception:
-                    pass
+                with self._owner_file_guard:
+                    if self._current_token() != self._token:
+                        # Never touch a lock that is not (or momentarily not) ours.
+                        continue
+                    try:
+                        # Replacing owner.json also updates the directory
+                        # timestamp, which is what older clients look at.
+                        _write_json_atomic(
+                            self._lock_path / "owner.json",
+                            {**self._owner_record, "heartbeat_at": _utc_iso()},
+                            durable=False,
+                        )
+                    except Exception:
+                        pass
 
         self._thread = threading.Thread(
             target=beat, name="LiveSegmentation-lock-heartbeat", daemon=True
@@ -1705,7 +1716,9 @@ class _HeldSharedLock:
 
     def verify(self):
         """Raise if another client has taken this lock over in the meantime."""
-        if self._client._lock_owner_token(self._lock_path) != self._token:
+        with self._owner_file_guard:
+            token = self._current_token()
+        if token != self._token:
             raise LiveCollaborationError(
                 "The shared-folder lock was taken over by another computer before "
                 "this change could be written. Nothing was written; try again."
