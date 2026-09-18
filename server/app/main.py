@@ -142,6 +142,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="X-LiveSeg-User header is required")
         return user
 
+    def require_room_member(room_id: str, user: str = Depends(require_user)) -> str:
+        """Allow a room's endpoints only to users who have joined that room.
+
+        Joining needs the room name and the signature of its source volume. A
+        valid token alone used to be enough to read and write any room whose id
+        was known, which made every token holder a member of every project on
+        the server.
+        """
+        with database.connect() as connection:
+            room = connection.execute(
+                "SELECT id FROM live_rooms WHERE id = ?", (room_id,)
+            ).fetchone()
+            if room is None:
+                raise HTTPException(status_code=404, detail="Live room not found")
+            member = connection.execute(
+                "SELECT 1 FROM live_room_members WHERE room_id = ? AND user = ?",
+                (room_id, user),
+            ).fetchone()
+        if member is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Join this room with its source volume before using it",
+            )
+        return user
+
     def role_for(connection: sqlite3.Connection, room_id: str, user: str) -> str:
         room = connection.execute(
             "SELECT created_by FROM live_rooms WHERE id = ?", (room_id,)
@@ -217,7 +242,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if now_epoch - float(details.get("updated_epoch", 0.0)) <= 120.0
             }
             preflight_registry[room_key] = participants
-            public_participants = [dict(item) for item in participants.values()]
+            # The volume signature is what admits a user to a room. Tell the
+            # caller only whether another participant has the same one; echoing
+            # the caller's own value keeps 0.15.1 clients, which compare the
+            # field, working.
+            public_participants = []
+            for item in participants.values():
+                matches = item["volume_signature"] == payload.volume_signature
+                public_participants.append(
+                    {
+                        **item,
+                        "volume_signature": payload.volume_signature
+                        if matches
+                        else "different-source-volume",
+                        "volume_signature_matches": matches,
+                    }
+                )
         with database.connect() as connection:
             room = connection.execute(
                 "SELECT name, volume_signature, schema_version FROM live_rooms WHERE name = ? COLLATE NOCASE",
@@ -309,6 +349,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "SELECT COALESCE(MAX(sequence), 0) FROM live_operations WHERE room_id = ?",
                 (room["id"],),
             ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO live_room_members(room_id, user, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (room["id"], user, iso_now()),
+            )
             if created:
                 connection.execute(
                     """
@@ -338,7 +385,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         after: int = 0,
         limit: int = 200,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         del user
         if after < 0:
@@ -365,7 +412,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_live_operation(
         room_id: str,
         payload: LiveOperationCreate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         if len(payload.payload) > resolved_settings.max_upload_bytes * 2:
             raise HTTPException(status_code=413, detail="Live operation exceeds size limit")
@@ -551,7 +598,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def update_live_presence(
         room_id: str,
         payload: LivePresenceUpdate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         with database.connect() as connection:
             room = connection.execute(
@@ -569,7 +616,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def leave_live_room(
         room_id: str,
         presence_session_id: str | None = None,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, bool]:
         with database.transaction() as connection:
             room = connection.execute(
@@ -588,7 +635,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         after: int = 0,
         limit: int = 200,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         del user
         if after < 0:
@@ -615,7 +662,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_chat_message(
         room_id: str,
         payload: LiveChatMessageCreate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         duplicate = False
         with database.transaction(immediate=True) as connection:
@@ -669,7 +716,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/live/rooms/{room_id}/locks")
     def list_segment_locks(
-        room_id: str, user: str = Depends(require_user)
+        room_id: str, user: str = Depends(require_room_member)
     ) -> list[dict[str, Any]]:
         del user
         with database.connect() as connection:
@@ -703,7 +750,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         segment_id: str,
         payload: LiveSegmentLockUpdate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
             lock_state = connection.execute(
@@ -777,7 +824,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/live/rooms/{room_id}/roles")
     def list_room_roles(
-        room_id: str, user: str = Depends(require_user)
+        room_id: str, user: str = Depends(require_room_member)
     ) -> list[dict[str, str]]:
         del user
         with database.connect() as connection:
@@ -799,7 +846,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         target_user: str,
         payload: LiveRoleUpdate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, str]:
         with database.transaction(immediate=True) as connection:
             if role_for(connection, room_id, user) != "admin":
@@ -830,7 +877,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/live/rooms/{room_id}/reviews")
     def list_reviews(
-        room_id: str, user: str = Depends(require_user)
+        room_id: str, user: str = Depends(require_room_member)
     ) -> list[dict[str, Any]]:
         del user
         with database.connect() as connection:
@@ -846,7 +893,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         segment_id: str,
         payload: LiveReviewUpdate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
             role = role_for(connection, room_id, user)
@@ -895,7 +942,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_access_request(
         room_id: str,
         payload: LiveAccessRequestCreate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         request_id = str(uuid.uuid4())
         record = {
@@ -924,7 +971,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def list_access_requests(
         room_id: str,
         segment_id: str | None = None,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         del user
         with database.connect() as connection:
@@ -946,7 +993,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         segment_id: str,
         payload: LiveOwnerTransfer,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
             lock = connection.execute(
@@ -990,7 +1037,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def list_conflicts(
         room_id: str,
         unresolved_only: bool = False,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         del user
         with database.connect() as connection:
@@ -1008,7 +1055,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         room_id: str,
         conflict_id: str,
         payload: LiveConflictResolution,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
             role_for(connection, room_id, user)
@@ -1031,7 +1078,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/live/rooms/{room_id}/material-template")
     def get_material_template(
-        room_id: str, user: str = Depends(require_user)
+        room_id: str, user: str = Depends(require_room_member)
     ) -> dict[str, Any] | None:
         del user
         with database.connect() as connection:
@@ -1045,7 +1092,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_material_template(
         room_id: str,
         payload: LiveMaterialTemplate,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
             if role_for(connection, room_id, user) != "admin":
@@ -1074,7 +1121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def list_audit(
         room_id: str,
         limit: int = 100,
-        user: str = Depends(require_user),
+        user: str = Depends(require_room_member),
     ) -> list[dict[str, Any]]:
         del user
         with database.connect() as connection:

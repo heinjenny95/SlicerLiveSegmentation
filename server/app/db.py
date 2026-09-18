@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS live_rooms (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS live_room_members (
+    room_id TEXT NOT NULL REFERENCES live_rooms(id) ON DELETE CASCADE,
+    user TEXT NOT NULL,
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, user)
+);
+
 CREATE TABLE IF NOT EXISTS live_operations (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,

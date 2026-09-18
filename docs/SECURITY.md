@@ -28,6 +28,23 @@ tokens; the shared-folder and Direct LAN transports remain trusted-network modes
 - crash-recovery journals are stored locally and loaded only for an exact
   context match.
 
+## HTTPS server: who can use a room
+
+A token or API key only proves who is calling. To use a room, a user must
+also have joined it, which requires the room name and the signature of its
+source volume; every room endpoint answers `403` otherwise. Before this rule
+(up to 0.15.1), any valid token could read and write any room whose id was
+known, and the connection check returned other participants' volume
+signatures, which was all that joining needed. The connection check now only
+says whether another participant's source volume matches the caller's.
+
+What this does not provide: membership cannot be revoked by a room admin yet,
+everyone who has the source volume and a token can join, and a `viewer` can
+still chat and file access requests. Give one server to one circle of trust,
+or run separate servers, when projects must not see each other at all. Rooms
+created by an older server have no members; participants become members the
+next time they join, which the plugin does at the start of every session.
+
 ## Direct-LAN responsibilities
 
 The one-click relay uses plain HTTP and a bearer-like temporary session code; it

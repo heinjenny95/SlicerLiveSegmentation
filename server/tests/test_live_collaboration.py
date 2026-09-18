@@ -1992,6 +1992,12 @@ def test_server_delayed_leave_cannot_remove_newer_presence_session(client, heade
         presence_url + "?presence_session_id=old-session", headers=headers
     )
     assert delayed_leave.status_code == 200
+    # Bob joins like a real client does; room endpoints are for members only.
+    client.post(
+        "/api/live/rooms/join",
+        headers={"X-LiveSeg-User": "bob"},
+        json={"room_name": "server reconnect", "volume_signature": "9" * 64},
+    )
     users = client.post(
         presence_url,
         headers={"X-LiveSeg-User": "bob"},
