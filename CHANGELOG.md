@@ -10,6 +10,19 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- One damaged operation no longer stops a room for every participant, forever
+  (L-09). An operation with an undecodable payload, bounds outside the volume,
+  or a file truncated by a NAS power loss made every pull fail at its sequence
+  number and was reported as a connection problem. Such an operation is now
+  refused before it gets a sequence number in the Shared Folder, Direct LAN,
+  and SSH folder transports. When one is met while reading (written by an
+  older client or damaged on disk), it is skipped with an entry in the
+  Activity log; because every participant skips it, the room stays
+  consistent. A file that cannot be read is only given up on after 30 seconds,
+  so a file that is still being written is not skipped by mistake.
+- Decoding an operation never inflates more data than its bounds allow, so a
+  few kilobytes can no longer expand to gigabytes inside Slicer or in the
+  Direct LAN host's Slicer process (L-09).
 - A room snapshot could erase a collaborator's latest edits for every
   participant, including the author (L-02). The snapshot was built from the
   publisher's last known sequence but appended, with replace semantics, after

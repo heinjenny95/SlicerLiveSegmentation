@@ -121,6 +121,7 @@ LIVE_EDIT_POLL_INTERVAL_SECONDS = 0.05
 SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
 AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
 CARRIED_TOMBSTONE_LIMIT = 200
+DAMAGED_OPERATION_GRACE_SECONDS = 30.0
 JOURNAL_WRITE_RETRY_SECONDS = 5.0
 FULL_PROJECT_BACKUP_SETTINGS_VERSION = 2
 GUI_WORK_BUDGET_SECONDS = 0.008
@@ -1142,6 +1143,35 @@ def encode_bounded_crop_edits(baseline, crop, crop_bounds, volume_shape, pending
     return result
 
 
+def operation_defect(operation, volume_shape=None):
+    """Return why a voxel operation cannot be applied, or None if it can.
+
+    Operations come from other computers and from files on a share. One that
+    cannot be decoded must be rejected before it is published and skipped when
+    it is read; otherwise every participant stops at its sequence number for
+    good. Decompression is bounded by the size the bounds imply.
+    """
+    if operation.get("segment_deleted"):
+        return None
+    try:
+        if operation.get("encoding") != LIVE_ENCODING:
+            return "unsupported encoding"
+        bounds = [int(value) for value in operation["voxel_bbox"]]
+        shape = tuple(int(value) for value in operation["volume_shape"])
+        if len(bounds) != 6 or len(shape) != 3:
+            return "bounds or volume shape have the wrong length"
+        if volume_shape is not None and shape != tuple(int(v) for v in volume_shape):
+            return "operation belongs to a different volume geometry"
+        for axis in range(3):
+            low, high = bounds[2 * axis], bounds[2 * axis + 1]
+            if low < 0 or high <= low or high > shape[axis]:
+                return "bounds are empty or outside the volume"
+        PackedOperationMask(operation)
+    except (KeyError, TypeError, ValueError, zlib.error) as exc:
+        return f"payload cannot be decoded ({exc})"
+    return None
+
+
 def decode_mask_delta(operation):
     """Return crop-local changed and value arrays for one encoded operation."""
     if operation.get("encoding") != LIVE_ENCODING:
@@ -1153,8 +1183,13 @@ def decode_mask_delta(operation):
         raise ValueError("Live-operation bounds are empty")
     voxel_count = int(np.prod(crop_shape, dtype=np.int64))
     packed_bytes = (voxel_count + 7) // 8
-    raw = zlib.decompress(base64.b64decode(operation["payload"], validate=True))
-    if len(raw) != packed_bytes * 2:
+    # Never inflate more than the bounds allow: a tiny payload can otherwise
+    # expand to gigabytes inside Slicer or the Direct LAN host.
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(
+        base64.b64decode(operation["payload"], validate=True), packed_bytes * 2 + 1
+    )
+    if len(raw) != packed_bytes * 2 or not decoder.eof:
         raise ValueError("Live-operation payload length does not match its bounds")
     changed = np.unpackbits(
         np.frombuffer(raw[:packed_bytes], dtype=np.uint8), bitorder="little"
@@ -2381,6 +2416,11 @@ class SharedFolderRoomClient:
         operation_id = str(operation.get("client_operation_id") or "").strip()
         if not operation_id:
             raise LiveCollaborationError("Live operation is missing its client ID")
+        defect = operation_defect(operation)
+        if defect is not None:
+            raise LiveCollaborationError(
+                f"Refusing to publish a damaged live operation: {defect}"
+            )
         operation_hash = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:20]
         operations_path = room_path / "operations"
         operation_index_path = room_path / "operation-index" / f"{operation_hash}.json"
@@ -2718,7 +2758,32 @@ class SharedFolderRoomClient:
 
         def read_operation(item):
             sequence, path = item
-            operation = _read_json_file(path)
+            try:
+                operation = _read_json_file(path)
+            except LiveCollaborationError as exc:
+                # Operation files are written atomically, so an unreadable one
+                # that has been there for a while is damaged for good (for
+                # example after a NAS power loss). Report it as a placeholder
+                # the receiver skips; a younger file is retried on the next poll.
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except OSError:
+                    raise exc from None
+                if age < DAMAGED_OPERATION_GRACE_SECONDS:
+                    raise
+                operation = {
+                    "segment_id": "",
+                    "author": "",
+                    "client_operation_id": f"unreadable-{sequence}",
+                    "_undecodable": f"operation file cannot be read ({exc})",
+                }
+            if not isinstance(operation, dict):
+                operation = {
+                    "segment_id": "",
+                    "author": "",
+                    "client_operation_id": f"unreadable-{sequence}",
+                    "_undecodable": "operation file does not contain an operation",
+                }
             operation["sequence"] = sequence
             return operation
 
@@ -9204,6 +9269,15 @@ class LiveCollaborationController:
             prepared_bytes = 0
             for operation in operations:
                 item = dict(operation)
+                defect = item.get("_undecodable") or operation_defect(
+                    item, getattr(self, "volume_shape", None)
+                )
+                if defect is not None:
+                    # One damaged operation must not stop the room at its
+                    # sequence number for every participant, forever.
+                    item["_undecodable"] = str(defect)
+                    prepared.append(item)
+                    continue
                 if not item.get("segment_deleted"):
                     bounds = item["voxel_bbox"]
                     predicted_bytes = (int(np.prod([bounds[index + 1] - bounds[index] for index in (0, 2, 4)], dtype=np.int64)) + 7) // 8 * 2
@@ -10175,6 +10249,9 @@ class LiveCollaborationController:
         try:
             while self._incoming_operations and time.perf_counter() < deadline:
                 operation = self._incoming_operations[0]
+                if operation.get("_undecodable") and self._incoming_iterator is None:
+                    self._skip_damaged_operation(self._incoming_operations.popleft())
+                    continue
                 if self._incoming_iterator is None:
                     node = self._segmentation_node()
                     if node is None:
@@ -10231,6 +10308,25 @@ class LiveCollaborationController:
             self._show_error(f"Could not prepare incoming edit: {exc}")
         finally:
             self.session_metrics.record("gui-incoming", time.perf_counter() - started)
+
+    def _skip_damaged_operation(self, operation):
+        """Pass over an operation nobody can apply and say so."""
+        sequence = int(operation.get("sequence", 0) or 0)
+        self.last_sequence = max(int(self.last_sequence), sequence)
+        self._acknowledge_local_operation(operation)
+        self.session_metrics.increment("damaged_operations_skipped")
+        author = str(operation.get("author") or "unknown author")
+        label = str(operation.get("segment_name") or operation.get("segment_id") or "?")
+        self._append_activity(
+            f"Skipped damaged edit #{sequence} by {author} on label {label}: "
+            f"{operation.get('_undecodable')}. Everyone skips it, so the room stays "
+            "consistent; if that edit mattered, its author can repaint it."
+        )
+        import slicer
+
+        slicer.util.showStatusMessage(
+            f"Live: skipped damaged edit #{sequence} (see Activity)", 6000
+        )
 
     def _queue_snapshot_operations(self, operations):
         for operation in operations or []:
