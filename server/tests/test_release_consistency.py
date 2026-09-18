@@ -3,7 +3,10 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import subprocess
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +45,38 @@ def test_every_version_carrier_matches_the_version_file():
     }
     found = {name: match.group(1) if match else None for name, match in carriers.items()}
     assert found == {name: version for name in carriers}
+
+
+def test_tracked_files_do_not_contain_personal_user_paths():
+    # A maintainer's profile path (and with it an institutional account name)
+    # was published in scripts/open-live-segmentation.ps1.
+    windows_profile = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+([^\\/\s\"'<>$%{}]+)")
+    posix_home = re.compile(r"(?<![\w/])/(?:home|Users)/([^/\s\"'<>$%{}]+)")
+    placeholders = {"<name>", "name", "user", "username", "researcher", "public"}
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split("\0")
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git is not available")
+    violations = []
+    for relative in filter(None, tracked):
+        path = PROJECT_ROOT / relative
+        if path.suffix.lower() in {".png", ".jpg", ".svg", ".ico", ".zip"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for pattern in (windows_profile, posix_home):
+            for match in pattern.finditer(text):
+                if match.group(1).lower() not in placeholders:
+                    violations.append(f"{relative}: {match.group(0)}")
+    assert violations == []
 
 
 def test_module_self_test_does_not_pin_a_version_literal():

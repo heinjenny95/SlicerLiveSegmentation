@@ -18,3 +18,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 - The release manifest no longer reports `ruff: passed`, `automated_tests: 124`,
   or Slicer smoke-test results that the build script never ran (L-19). It now
   separates `measured_by_this_script` from `maintainer_asserted_validation`.
+- `scripts/open-live-segmentation.ps1` no longer contains a maintainer's
+  personal Windows profile path, which exposed an account name and only worked
+  on one computer (L-20). It finds the newest per-user Slicer like the
+  installer does and accepts `-SlicerPath`. A test now rejects personal
+  profile paths in tracked files. The path remains in the Git history and in
+  the published 0.15.1 source archive.
