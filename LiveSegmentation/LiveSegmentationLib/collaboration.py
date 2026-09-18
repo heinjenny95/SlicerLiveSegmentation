@@ -120,6 +120,7 @@ CONTROLLER_TIMER_INTERVAL_MILLISECONDS = 50
 LIVE_EDIT_POLL_INTERVAL_SECONDS = 0.05
 SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
 AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
+CARRIED_TOMBSTONE_LIMIT = 200
 JOURNAL_WRITE_RETRY_SECONDS = 5.0
 FULL_PROJECT_BACKUP_SETTINGS_VERSION = 2
 GUI_WORK_BUDGET_SECONDS = 0.008
@@ -1484,8 +1485,22 @@ class LiveRoomClient:
             operations, target, apply_mask_delta, encode_mask_delta
         )
 
-    def publish_room_snapshot(self, room_id, segment_operations, compact=True, label=""):
+    def publish_room_snapshot(
+        self, room_id, segment_operations, compact=True, label="", expected_sequence=None
+    ):
         del compact
+        if expected_sequence is not None:
+            # A snapshot replaces the room state. If anything was published after
+            # the state it was built from, it would erase that work for everyone.
+            # The server has no compare-and-append yet, so this check narrows the
+            # window instead of closing it.
+            newer = self.operations(room_id, int(expected_sequence), limit=1)
+            if newer:
+                return {
+                    "skipped": "stale",
+                    "expected_sequence": int(expected_sequence),
+                    "latest_sequence": int(newer[-1].get("sequence", 0)),
+                }
         group_id = str(uuid.uuid4())
         results = []
         for index, operation in enumerate(segment_operations):
@@ -1585,6 +1600,28 @@ class LiveRoomClient:
     def reserve_project_backup(self, room_id, interval_seconds, force=False):
         del room_id, interval_seconds, force
         return None
+
+
+def _publish_snapshot_at(client, room_id, operations, label, base_sequence):
+    """Publish a snapshot only if the room is still at ``base_sequence``.
+
+    A Direct LAN host that still runs an older version does not know the
+    argument; it then gets the previous, unconditional call.
+    """
+    if base_sequence is None:
+        return client.publish_room_snapshot(room_id, operations, compact=True, label=label)
+    try:
+        return client.publish_room_snapshot(
+            room_id,
+            operations,
+            compact=True,
+            label=label,
+            expected_sequence=int(base_sequence),
+        )
+    except (TypeError, LiveCollaborationError) as exc:
+        if "expected_sequence" not in str(exc):
+            raise
+        return client.publish_room_snapshot(room_id, operations, compact=True, label=label)
 
 
 class _HeldSharedLock:
@@ -2695,10 +2732,15 @@ class SharedFolderRoomClient:
         operations = []
         start_sequence = after_sequence + 1
         if start_sequence not in operations_by_sequence:
+            # Older operations were archived by a room snapshot. Only the first
+            # operation of such a system snapshot is a safe place to resume:
+            # an ordinary per-label replace also has kind "snapshot", and
+            # jumping to it would skip operations of every other label for good.
             snapshots = [
                 sequence
                 for sequence, operation in operations_by_sequence.items()
-                if operation.get("operation_kind") == "snapshot"
+                if operation.get("system_snapshot")
+                and int(operation.get("snapshot_group_index") or 0) == 0
             ]
             if snapshots:
                 start_sequence = min(snapshots)
@@ -3556,8 +3598,68 @@ class SharedFolderRoomClient:
         selected = records[-max(1, min(int(limit), 5000)) :]
         return [operation_summary(item, decode_mask_delta) for item in selected]
 
-    def publish_room_snapshot(self, room_id, segment_operations, compact=True, label=""):
-        """Append a compatible full-state batch and archive older loose files."""
+    def _tombstones_to_carry(self, room_path, before_sequence, live_segment_ids):
+        """Return deletions that compaction is about to move out of the live feed.
+
+        A reader that is behind the compaction point resumes at the snapshot and
+        never sees the archived operations. Without this, a label deleted in
+        that range would stay on that reader's screen for good.
+        """
+        latest_by_segment = {}
+        for path in room_path.joinpath("operations").glob("*.json"):
+            sequence = self._operation_sequence(path)
+            if sequence is None or sequence > before_sequence:
+                continue
+            try:
+                operation = _read_json_file(path)
+            except LiveCollaborationError:
+                continue
+            segment_id = str(operation.get("segment_id") or "")
+            if segment_id and sequence >= latest_by_segment.get(segment_id, (0, None))[0]:
+                latest_by_segment[segment_id] = (sequence, operation)
+        dropped_keys = {
+            "sequence",
+            "author",
+            "created_at",
+            "client_operation_id",
+            "base_sequence",
+            "changed_voxels",
+            "snapshot_group_id",
+            "snapshot_group_index",
+            "snapshot_group_count",
+            "snapshot_label",
+            "system_snapshot",
+        }
+        carried = []
+        for segment_id, (_, operation) in sorted(
+            latest_by_segment.items(), key=lambda item: item[1][0]
+        ):
+            if operation.get("segment_deleted") and segment_id not in live_segment_ids:
+                carried.append(
+                    {
+                        **{
+                            key: value
+                            for key, value in operation.items()
+                            if key not in dropped_keys
+                        },
+                        "carried_tombstone": True,
+                        "deleted_by": operation.get("deleted_by")
+                        or operation.get("author"),
+                    }
+                )
+        return carried[-CARRIED_TOMBSTONE_LIMIT:]
+
+    def publish_room_snapshot(
+        self, room_id, segment_operations, compact=True, label="", expected_sequence=None
+    ):
+        """Append a compatible full-state batch and archive older loose files.
+
+        ``expected_sequence`` is the room sequence the snapshot was built from.
+        A snapshot replaces the room state, so publishing one that does not
+        include a collaborator's latest operations would erase them for every
+        participant. With ``expected_sequence`` the snapshot is skipped, under
+        the sequence lock, when the room has moved on.
+        """
         room_path = self._require_room(room_id)
         # Explicit compaction must include operations that are still inside the
         # hot-feed archive grace period.
@@ -3567,6 +3669,19 @@ class SharedFolderRoomClient:
         group_id = str(uuid.uuid4())
         created = []
         with self._sequence_lock(room_path) as sequence_lock:
+            before_sequence = self._latest_sequence(room_path)
+            if expected_sequence is not None and before_sequence != int(expected_sequence):
+                return {
+                    "skipped": "stale",
+                    "expected_sequence": int(expected_sequence),
+                    "latest_sequence": before_sequence,
+                }
+            if compact and before_sequence > 0:
+                segment_operations = self._tombstones_to_carry(
+                    room_path,
+                    before_sequence,
+                    {str(item.get("segment_id") or "") for item in segment_operations},
+                ) + list(segment_operations)
             original_creators = self._segment_creators(room_path)
             for segment_id, owner in original_creators.items():
                 lock_path = self._segment_lock_path(room_path, segment_id)
@@ -3581,7 +3696,6 @@ class SharedFolderRoomClient:
                             "updated_at": _utc_iso(),
                         },
                     )
-            before_sequence = self._latest_sequence(room_path)
             sequence = before_sequence
             count = len(segment_operations)
             _, recent_operations = self._recent_feed_state(
@@ -4242,7 +4356,13 @@ class HybridRoomClient:
                 mirrored_args = list(args)
                 if mirrored_args:
                     mirrored_args[0] = self._fallback_room["id"]
-                getattr(self.fallback_client, method)(*mirrored_args, **kwargs)
+                # Sequence numbers of the two stores are independent.
+                mirrored_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key != "expected_sequence"
+                }
+                getattr(self.fallback_client, method)(*mirrored_args, **mirrored_kwargs)
             except Exception as exc:
                 self._fallback_join_error = str(exc)
 
@@ -4330,7 +4450,10 @@ class HybridRoomClient:
         fallback_args = list(args)
         if fallback_args:
             fallback_args[0] = self._fallback_room["id"]
-        return getattr(self.fallback_client, method)(*fallback_args, **kwargs)
+        fallback_kwargs = {
+            key: value for key, value in kwargs.items() if key != "expected_sequence"
+        }
+        return getattr(self.fallback_client, method)(*fallback_args, **fallback_kwargs)
 
     def join(self, room_name, signature):
         self._start_fallback_join(room_name, signature)
@@ -8785,9 +8908,14 @@ class LiveCollaborationController:
                 )
             )
         )
+        snapshot_base_sequence = None
+        snapshot_was_requested = False
         if should_snapshot:
             snapshot_operations = self._snapshot_operations(defer_encode=True)
             snapshot_label = self._snapshot_label
+            # The snapshot describes the room exactly at this sequence.
+            snapshot_base_sequence = int(self.last_sequence)
+            snapshot_was_requested = bool(self._snapshot_requested)
             self._snapshot_requested = False
             self._snapshot_label = ""
         if push_idle and (self.outgoing or snapshot_operations):
@@ -8800,6 +8928,8 @@ class LiveCollaborationController:
                     list(self.outgoing),
                     snapshot_operations,
                     snapshot_label,
+                    snapshot_base_sequence,
+                    snapshot_was_requested,
                 ),
                 name="LiveSegmentation-edit-push",
                 daemon=True,
@@ -8972,6 +9102,8 @@ class LiveCollaborationController:
         outgoing,
         snapshot_operations,
         snapshot_label,
+        snapshot_base_sequence=None,
+        snapshot_was_requested=False,
     ):
         started = time.monotonic()
         try:
@@ -9025,9 +9157,19 @@ class LiveCollaborationController:
                         {**metadata, **encoded}
                         for encoded in encode_chunked_mask_snapshot(item["_snapshot_baseline"])
                     )
-                snapshot = client.publish_room_snapshot(
-                    room_id, encoded_snapshots, compact=True, label=snapshot_label
+                snapshot = _publish_snapshot_at(
+                    client,
+                    room_id,
+                    encoded_snapshots,
+                    snapshot_label,
+                    snapshot_base_sequence,
                 )
+                if isinstance(snapshot, dict) and snapshot.get("skipped"):
+                    snapshot = {
+                        **snapshot,
+                        "label": snapshot_label,
+                        "was_requested": bool(snapshot_was_requested),
+                    }
             self._worker_results.put(
                 {
                     "lane": "edit-push",
@@ -9899,6 +10041,13 @@ class LiveCollaborationController:
             operations = result.get("operations") or []
             for operation in operations:
                 sequence = int(operation.get("sequence", 0))
+                if operation.get("system_snapshot"):
+                    # Everybody counts from the newest snapshot in the room, not
+                    # only from their own; otherwise every idle participant
+                    # publishes another full snapshot right after the first one.
+                    self._last_snapshot_sequence = max(
+                        self._last_snapshot_sequence, sequence
+                    )
                 if sequence > max(self.last_sequence, self._incoming_received_sequence):
                     self._incoming_operations.append(operation)
                     self._incoming_received_sequence = sequence
@@ -9912,7 +10061,14 @@ class LiveCollaborationController:
             if result.get("advanced") is not None:
                 self._update_advanced_state(result["advanced"])
             self._handle_action_results(result.get("action_results") or [])
-            if result.get("snapshot"):
+            if result.get("snapshot") and result["snapshot"].get("skipped"):
+                # A collaborator published something after the snapshot was
+                # built. Nothing was written; an explicitly requested snapshot
+                # is rebuilt once those operations have been applied.
+                if result["snapshot"].get("was_requested"):
+                    self._snapshot_requested = True
+                    self._snapshot_label = str(result["snapshot"].get("label") or "")
+            elif result.get("snapshot"):
                 self._last_snapshot_sequence = max(
                     self._last_snapshot_sequence,
                     int(result["snapshot"].get("last_sequence", self.last_sequence)),
@@ -10945,6 +11101,12 @@ class LiveCollaborationController:
                     self.segment_locks_state.pop(segment_id, None)
                     self.review_states_state.pop(segment_id, None)
                     node.Modified()
+                    if operation.get("carried_tombstone"):
+                        # Repeated by a room snapshot for participants that were
+                        # behind the compaction point; not a new deletion.
+                        self.last_sequence = sequence
+                        applied_count += 1
+                        continue
                     actor = (
                         "You"
                         if operation.get("author") == self.user_name
