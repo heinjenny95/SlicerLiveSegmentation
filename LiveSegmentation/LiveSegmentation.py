@@ -955,4 +955,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 class LiveSegmentationTest(ScriptedLoadableModuleTest):
     def runTest(self):
         self.delayDisplay("Live Segmentation module loaded")
-        self.assertEqual(PLUGIN_VERSION, "0.14.6")
+        # The release number lives in LiveSegmentationLib/version.py only; a
+        # literal here went stale for three releases and failed every run.
+        self.assertRegex(PLUGIN_VERSION, r"^\d+\.\d+\.\d+$")
