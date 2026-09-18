@@ -59,39 +59,80 @@ def public_chat_message(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def changed_voxel_coordinates(operation: dict[str, Any]) -> set[tuple[int, int, int]]:
-    bounds = [int(value) for value in operation["voxel_bbox"]]
-    z0, z1, y0, y1, x0, x1 = bounds
-    shape = (z1 - z0, y1 - y0, x1 - x0)
-    count = shape[0] * shape[1] * shape[2]
-    packed_bytes = (count + 7) // 8
-    raw = zlib.decompress(base64.b64decode(operation["payload"], validate=True))
-    changed = raw[:packed_bytes]
-    result = set()
-    plane = shape[1] * shape[2]
-    for index in range(count):
-        if changed[index // 8] & (1 << (index % 8)):
-            local_z, remainder = divmod(index, plane)
-            local_y, local_x = divmod(remainder, shape[2])
-            result.add((z0 + local_z, y0 + local_y, x0 + local_x))
-    return result
+# Conflict detection is advisory; it must never be what makes the server slow.
+MAX_CONFLICT_CANDIDATES = 64
 
 
-def changed_voxel_count(operation: dict[str, Any]) -> int:
-    bounds = [int(value) for value in operation["voxel_bbox"]]
-    z0, z1, y0, y1, x0, x1 = bounds
+def changed_voxel_bits(operation: dict[str, Any], max_raw_bytes: int | None = None) -> bytes:
+    """Return the packed "changed" bitset of an operation, validating its size.
+
+    Decompression is bounded by the size the bounds imply: a payload of a few
+    hundred kilobytes must not be able to inflate to gigabytes. A payload that
+    does not match its bounds exactly raises ValueError.
+    """
+    z0, z1, y0, y1, x0, x1 = (int(value) for value in operation["voxel_bbox"])
     voxel_count = (z1 - z0) * (y1 - y0) * (x1 - x0)
+    if voxel_count <= 0:
+        raise ValueError("voxel_bbox is empty")
     packed_bytes = (voxel_count + 7) // 8
-    raw = zlib.decompress(base64.b64decode(operation["payload"], validate=True))
-    return sum(byte.bit_count() for byte in raw[:packed_bytes])
+    if max_raw_bytes is not None and packed_bytes * 2 > max_raw_bytes:
+        raise ValueError("voxel_bbox is larger than this server accepts in one operation")
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(
+        base64.b64decode(operation["payload"], validate=True), packed_bytes * 2 + 1
+    )
+    if len(raw) != packed_bytes * 2 or not decoder.eof:
+        raise ValueError("payload length does not match voxel_bbox")
+    return raw[:packed_bytes]
 
 
-def operation_overlap(first: dict[str, Any], second: dict[str, Any]) -> int:
+def changed_voxel_count(operation: dict[str, Any], changed: bytes | None = None) -> int:
+    changed = changed_voxel_bits(operation) if changed is None else changed
+    return int.from_bytes(changed, "little").bit_count()
+
+
+def _row_bits(changed: bytes, bounds: list[int], z: int, y: int, x0: int, x1: int) -> int:
+    height = bounds[3] - bounds[2]
+    width = bounds[5] - bounds[4]
+    start = ((z - bounds[0]) * height + (y - bounds[2])) * width + (x0 - bounds[4])
+    length = x1 - x0
+    chunk = int.from_bytes(changed[start // 8 : (start + length + 7) // 8], "little")
+    return (chunk >> (start % 8)) & ((1 << length) - 1)
+
+
+def operation_overlap(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    second_changed: bytes | None = None,
+) -> int:
+    """Count voxels both operations changed, one bit row at a time.
+
+    The previous version built a Python set with one tuple per changed voxel
+    of each bounding box, inside the write transaction and on the event loop:
+    a 700-byte request over a 128-cubed box blocked the whole server for
+    seconds.
+    """
     if str(first.get("segment_id")) != str(second.get("segment_id")):
         return 0
     if first.get("segment_deleted") or second.get("segment_deleted"):
         return 1
-    return len(changed_voxel_coordinates(first) & changed_voxel_coordinates(second))
+    first_bounds = [int(value) for value in first["voxel_bbox"]]
+    second_bounds = [int(value) for value in second["voxel_bbox"]]
+    low = [max(first_bounds[2 * axis], second_bounds[2 * axis]) for axis in range(3)]
+    high = [min(first_bounds[2 * axis + 1], second_bounds[2 * axis + 1]) for axis in range(3)]
+    if any(low[axis] >= high[axis] for axis in range(3)):
+        return 0
+    first_changed = changed_voxel_bits(first)
+    if second_changed is None:
+        second_changed = changed_voxel_bits(second)
+    overlap = 0
+    for z in range(low[0], high[0]):
+        for y in range(low[1], high[1]):
+            overlap += (
+                _row_bits(first_changed, first_bounds, z, y, low[2], high[2])
+                & _row_bits(second_changed, second_bounds, z, y, low[2], high[2])
+            ).bit_count()
+    return overlap
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -408,8 +449,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ).fetchall()
         return [public_live_operation(row) for row in rows]
 
+    # A plain function: FastAPI runs it in its thread pool, so decoding and the
+    # database write of one operation cannot stall every other request.
     @app.post("/api/live/rooms/{room_id}/operations", status_code=201)
-    async def create_live_operation(
+    def create_live_operation(
         room_id: str,
         payload: LiveOperationCreate,
         user: str = Depends(require_room_member),
@@ -426,6 +469,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         range_ends = (payload.voxel_bbox[1], payload.voxel_bbox[3], payload.voxel_bbox[5])
         if any(end > size for end, size in zip(range_ends, payload.volume_shape, strict=True)):
             raise HTTPException(status_code=422, detail="voxel_bbox exceeds volume_shape")
+        incoming = payload.model_dump()
+        try:
+            # Validated before the write transaction starts. Clients of one
+            # stored operation that cannot be decoded would stop at it for good.
+            incoming_changed = changed_voxel_bits(
+                incoming,
+                max_raw_bytes=max(64 * 1024 * 1024, resolved_settings.max_upload_bytes * 4),
+            )
+        except (ValueError, zlib.error) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid live operation payload: {exc}"
+            ) from exc
 
         duplicate = False
         conflicts = []
@@ -469,23 +524,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         status_code=423,
                         detail=f"Label is locked by {lock_state['owner']}",
                     )
-                incoming = payload.model_dump()
-                # Count packed mask bits directly. A full-volume checkpoint must not
-                # materialize millions of Python coordinate tuples just for metrics.
-                changed_voxels = changed_voxel_count(incoming)
+                changed_voxels = changed_voxel_count(incoming, incoming_changed)
                 if payload.base_sequence and not payload.system_snapshot:
                     concurrent = connection.execute(
                         """
                         SELECT * FROM live_operations
                         WHERE room_id = ? AND sequence > ? AND segment_id = ?
                           AND author != ? AND system_snapshot = 0
-                        ORDER BY sequence ASC
+                        ORDER BY sequence DESC
+                        LIMIT ?
                         """,
-                        (room_id, payload.base_sequence, payload.segment_id, user),
+                        (
+                            room_id,
+                            payload.base_sequence,
+                            payload.segment_id,
+                            user,
+                            MAX_CONFLICT_CANDIDATES,
+                        ),
                     ).fetchall()
-                    for previous_row in concurrent:
+                    for previous_row in reversed(concurrent):
                         previous = public_live_operation(previous_row)
-                        overlap = operation_overlap(previous, incoming)
+                        try:
+                            overlap = operation_overlap(previous, incoming, incoming_changed)
+                        except (ValueError, zlib.error):
+                            # Stored by an older server without validation.
+                            continue
                         if overlap:
                             conflicts.append(
                                 {
