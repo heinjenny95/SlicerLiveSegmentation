@@ -8,6 +8,18 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Security
+
+- HTTPS server: a valid token alone no longer gives access to every room
+  (L-03). Room endpoints now require that the user has joined the room, which
+  needs the signature of its source volume; everything else gets `403`. The
+  connection check no longer returns other participants' volume signatures,
+  which had let any token holder join any room a colleague was checking. It
+  reports only whether the source volumes match; 0.15.1 clients keep working.
+  The database gains a `live_room_members` table automatically. After a server
+  upgrade, participants of existing rooms become members on their next join.
+  See `docs/SECURITY.md` for what this does not cover.
+
 ### Fixed
 
 - An edit the room refused because the label had just been locked by someone
