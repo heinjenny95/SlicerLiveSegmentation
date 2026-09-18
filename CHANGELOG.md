@@ -20,6 +20,18 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   upgrade, participants of existing rooms become members on their next join.
   See `docs/SECURITY.md` for what this does not cover.
 
+- HTTPS server: one small request can no longer exhaust memory or stall the
+  server for everyone (L-04). The upload limit only applied to the compressed
+  payload, so 0.7 MB could inflate to about 1 GB; decompression is now bounded
+  by the size the operation's bounds imply, with a cap on the bounds. The
+  conflict check built a Python set with one tuple per voxel of each bounding
+  box, inside the database write transaction and on the event loop, so a
+  700-byte request over a 128-cubed box blocked every request for seconds. It
+  now compares bit rows, looks at no more than the 64 most recent concurrent
+  operations, and the endpoint runs in the thread pool. A payload that does
+  not match its bounds is answered with `422` instead of being stored (or
+  causing a `500`), so it cannot stop the room's readers later.
+
 ### Fixed
 
 - An edit the room refused because the label had just been locked by someone
