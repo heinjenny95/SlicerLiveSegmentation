@@ -8564,6 +8564,40 @@ class LiveCollaborationController:
             f"Label is locked by {owner}; the local edit was reverted", 3500
         )
 
+    def _deleted_baselines(self):
+        store = getattr(self, "_deleted_segment_baselines", None)
+        if store is None:
+            store = self._deleted_segment_baselines = {}
+        return store
+
+    def _restore_rejected_deletion(self, operation):
+        """Bring back a label whose deletion the room refused."""
+        segment_id = str(operation.get("segment_id") or "")
+        baseline = self._deleted_baselines().pop(segment_id, None)
+        node = self._segmentation_node()
+        if node is None or not segment_id:
+            return
+        metadata = {
+            "segment_id": segment_id,
+            "segment_name": operation.get("segment_name") or segment_id,
+            "color_hex": operation.get("color_hex") or "#4A90E2",
+        }
+        self._applying_remote = True
+        try:
+            self._ensure_segment(node, metadata)
+        finally:
+            self._applying_remote = False
+        key = (node.GetID(), segment_id)
+        if baseline is not None:
+            self.baselines[key] = baseline
+        self._restore_locked_segment(node, segment_id, baseline)
+        self._known_segment_ids.add(segment_id)
+        self._remember_segment_metadata(node, segment_id)
+        self._append_activity(
+            f"Label {metadata['segment_name']} is locked by someone else; "
+            "its deletion was refused and the label was restored"
+        )
+
     def _prepare_outgoing(self):
         import slicer
 
@@ -8603,6 +8637,9 @@ class LiveCollaborationController:
             self.outgoing.append(operation)
             self.outgoing_keys.add(key)
             self.pending_segment_deletions.pop(segment_id, None)
+            # Kept until the room confirms the deletion: if it is refused
+            # because the label was locked meanwhile, the label comes back.
+            self._deleted_baselines()[segment_id] = self.baselines.get(key)
             self.baselines.pop(key, None)
             self.baseline_bounds.pop(key, None)
             self.metadata_updates.discard(key)
@@ -9195,8 +9232,16 @@ class LiveCollaborationController:
                     str(operation.get("segment_id") or ""), []
                 ).append(operation)
 
+            rejected_ids = []
+
             def push_group(group):
-                result = {"ids": [], "rejected": [], "conflicts": [], "errors": []}
+                result = {
+                    "ids": [],
+                    "rejected": [],
+                    "rejected_ids": [],
+                    "conflicts": [],
+                    "errors": [],
+                }
                 for operation in group:
                     try:
                         if _uses_shared_folder(client):
@@ -9211,7 +9256,10 @@ class LiveCollaborationController:
                         message = str(exc)
                         if "locked by" not in message:
                             raise
+                        # Handled, but never published: it leaves the outgoing
+                        # queue without ever becoming an awaited echo.
                         result["ids"].append(operation["client_operation_id"])
+                        result["rejected_ids"].append(operation["client_operation_id"])
                         result["rejected"].append(operation["segment_id"])
                         result["errors"].append(message)
                 return result
@@ -9220,6 +9268,7 @@ class LiveCollaborationController:
                 push_group, grouped_operations.values(), max_workers=4
             ):
                 outgoing_ids.extend(group_result["ids"])
+                rejected_ids.extend(group_result["rejected_ids"])
                 rejected_segments.extend(group_result["rejected"])
                 conflicts_detected.extend(group_result["conflicts"])
                 command_errors.extend(group_result["errors"])
@@ -9253,6 +9302,7 @@ class LiveCollaborationController:
                     "lane": "edit-push",
                     "session_token": session_token,
                     "outgoing_ids": outgoing_ids,
+                    "rejected_ids": rejected_ids,
                     "rejected_segments": rejected_segments,
                     "conflicts_detected": conflicts_detected,
                     "command_errors": command_errors,
@@ -10103,8 +10153,18 @@ class LiveCollaborationController:
                     operation["client_operation_id"]
                     for operation in self.awaiting_echo
                 }
+                rejected_ids = set(result.get("rejected_ids") or [])
                 for operation in sent_operations:
                     operation_id = operation["client_operation_id"]
+                    if operation_id in rejected_ids:
+                        # The room refused it (label locked by someone else), so
+                        # no echo will ever arrive. Waiting for one would hide
+                        # every later edit of these voxels and block snapshots
+                        # for the rest of the session.
+                        self.session_metrics.operation_acknowledged(operation_id)
+                        if operation.get("segment_deleted"):
+                            self._restore_rejected_deletion(operation)
+                        continue
                     if operation_id in self._applied_local_operation_ids:
                         self._applied_local_operation_ids.discard(operation_id)
                     elif operation_id not in awaiting_ids:
@@ -11210,6 +11270,7 @@ class LiveCollaborationController:
                     self.segment_locks_state.pop(segment_id, None)
                     self.review_states_state.pop(segment_id, None)
                     node.Modified()
+                    self._deleted_baselines().pop(segment_id, None)
                     if operation.get("carried_tombstone"):
                         # Repeated by a room snapshot for participants that were
                         # behind the compaction point; not a new deletion.

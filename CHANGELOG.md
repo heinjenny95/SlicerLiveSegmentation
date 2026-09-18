@@ -10,6 +10,15 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- An edit the room refused because the label had just been locked by someone
+  else was still treated as sent and waited for an echo that never came
+  (L-07). For the rest of the session, painting the same voxels again was never
+  published, automatic snapshots were blocked, and the refused edit stayed in
+  the recovery journal. A refused deletion made the label vanish for that
+  participant only, without any message. Refused operations are now dropped
+  from the pending state, and a refused deletion restores the label from the
+  room state with an Activity entry.
+
 - One damaged operation no longer stops a room for every participant, forever
   (L-09). An operation with an undecodable payload, bounds outside the volume,
   or a file truncated by a NAS power loss made every pull fail at its sequence
