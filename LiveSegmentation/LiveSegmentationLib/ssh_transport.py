@@ -336,6 +336,7 @@ class SshRoomClient(LanRoomClient):
 
     def _read_responses(self):
         buffered = bytearray()
+        search_from = 0
         try:
             while not self._closed.is_set():
                 chunk = self._receive_chunk()
@@ -344,11 +345,12 @@ class SshRoomClient(LanRoomClient):
                 if not chunk:
                     raise LiveCollaborationError("SSH response stream closed or exceeded the frame limit")
                 buffered.extend(chunk)
-                while (end := buffered.find(b"\n")) >= 0:
+                while (end := buffered.find(b"\n", search_from)) >= 0:
                     if end + 1 > MAX_FRAME:
                         raise LiveCollaborationError("SSH response exceeded the frame limit")
                     response = json.loads(buffered[:end])
                     del buffered[:end + 1]
+                    search_from = 0
                     if "stage" in response:
                         self.connection_stage = str(response["stage"])
                         if self.stage_callback:
@@ -361,6 +363,9 @@ class SshRoomClient(LanRoomClient):
                             pending.put_nowait(response)
                         except queue.Full:
                             pass
+                # The retained prefix has no newline. Search only new bytes on
+                # the next recv, so large fragmented frames take linear work.
+                search_from = len(buffered)
                 if len(buffered) >= MAX_FRAME:
                     raise LiveCollaborationError("SSH response exceeded the frame limit")
         except Exception as exc:

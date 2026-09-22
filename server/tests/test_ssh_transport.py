@@ -393,6 +393,28 @@ def test_oversized_ssh_frame_is_rejected(monkeypatch, terminated):
     assert client._closed.is_set()
 
 
+def test_large_fragmented_response_is_scanned_only_once(monkeypatch):
+    import ssh_transport
+
+    scanned = []
+
+    class CountedBuffer(bytearray):
+        def find(self, sub, start=0):
+            scanned.append(len(self) - start)
+            return super().find(sub, start)
+
+    monkeypatch.setattr(ssh_transport, "bytearray", CountedBuffer, raising=False)
+    payload = {"id": "test", "result": "abc" * 20000}
+    frame = (json.dumps(payload) + "\n").encode()
+    pieces = iter([frame[index:index + 256] for index in range(0, len(frame), 256)] + [b""])
+    client = SshRoomClient("linux-host/folder", "alice", "test-user")
+    client._receive_chunk = lambda: next(pieces)
+    client._pending["test"] = result = queue.Queue(maxsize=1)
+    client._read_responses()
+    assert result.get_nowait() == payload
+    assert sum(scanned) <= len(frame), "Each arriving chunk rescanned the entire accumulated frame"
+
+
 @pytest.mark.parametrize("isolated", [False, True])
 def test_ssh_request_deadline_still_applies(tmp_path, isolated):
     server = LocalSSHServer(tmp_path, delay_health=True)
