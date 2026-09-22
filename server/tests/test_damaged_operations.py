@@ -202,6 +202,7 @@ def test_controller_advances_past_a_damaged_operation_and_reports_it(monkeypatch
     controller.awaiting_echo = [{"client_operation_id": "mine"}]
     controller.outgoing = []
     controller._applied_local_operation_ids = set()
+    controller._deferred_visibility_ids = set()
     controller._append_activity = activity.append
     controller._sync_operation_journal = lambda: None
     controller.session_metrics = types.SimpleNamespace(

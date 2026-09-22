@@ -34,6 +34,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Collaborative undo, revision restore, conflict-resolution snapshots, and crash
+  recovery no longer generate an inverse edit while waiting for their server
+  echo (L-06). Verification distinguishes already-visible local strokes from
+  queued room actions; drawing can continue while those actions are pending.
+
 - Joining or rejoining a compacted Shared Folder/SSH/Direct LAN room no longer
   stays connected with an empty segmentation. Small initial-sync pages were
   bounded from the old cursor instead of the first available system snapshot;

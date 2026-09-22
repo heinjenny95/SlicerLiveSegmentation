@@ -4783,6 +4783,7 @@ class LiveCollaborationController:
         self.outgoing_keys = set()
         self.awaiting_echo = []
         self._applied_local_operation_ids = set()
+        self._deferred_visibility_ids = set()
         self._known_segment_ids = set()
         self._segment_metadata = {}
         self._preserve_added_segment_ids = False
@@ -5929,6 +5930,7 @@ class LiveCollaborationController:
             if not operation_id or operation_id in existing:
                 continue
             self.outgoing.append(dict(operation))
+            self._deferred_visibility_ids.add(operation_id)
             existing.add(operation_id)
             recovered += 1
             self.session_metrics.operation_queued(operation_id)
@@ -7372,6 +7374,7 @@ class LiveCollaborationController:
             self.outgoing_keys.clear()
             self.awaiting_echo.clear()
             self._applied_local_operation_ids.clear()
+            self._deferred_visibility_ids.clear()
             self._segment_metadata.clear()
             self.pending_segment_deletions.clear()
             self._segment_revisions.clear()
@@ -7644,6 +7647,7 @@ class LiveCollaborationController:
         self.outgoing_keys.clear()
         self.awaiting_echo.clear()
         self._applied_local_operation_ids.clear()
+        self._deferred_visibility_ids.clear()
         self._segment_metadata.clear()
         self._preserve_added_segment_ids = False
         self.pending_segment_deletions.clear()
@@ -8742,6 +8746,10 @@ class LiveCollaborationController:
             pending_operations = [
                 dict(operation) for operation in [*self.awaiting_echo, *self.outgoing]
                 if str(operation.get("segment_id") or "") == key[1]
+                # Undo/restore/recovery requests are not visible until their
+                # ordered echo. Diff only against edits already shown locally;
+                # otherwise verification generates the inverse of the request.
+                and operation.get("client_operation_id") not in self._deferred_visibility_ids
             ]
             private_baseline = previous.fork() if isinstance(previous, ChunkedMaskBaseline) else previous.copy()
             force_snapshot = key in self.force_snapshots
@@ -10160,6 +10168,7 @@ class LiveCollaborationController:
                 for operation in sent_operations:
                     operation_id = operation["client_operation_id"]
                     if operation_id in rejected_ids:
+                        self._deferred_visibility_ids.discard(operation_id)
                         # The room refused it (label locked by someone else), so
                         # no echo will ever arrive. Waiting for one would hide
                         # every later edit of these voxels and block snapshots
@@ -10416,6 +10425,7 @@ class LiveCollaborationController:
                 "base_sequence": int(self.last_sequence),
             }
             self.outgoing.append(queued)
+            self._deferred_visibility_ids.add(queued["client_operation_id"])
             self.session_metrics.operation_queued(queued["client_operation_id"])
             self.session_metrics.increment("snapshot_edits_queued")
         self._sync_operation_journal()
@@ -10560,6 +10570,7 @@ class LiveCollaborationController:
             **encoded,
         }
         self.outgoing.append(queued)
+        self._deferred_visibility_ids.add(queued["client_operation_id"])
         self.session_metrics.operation_queued(queued["client_operation_id"])
         self.session_metrics.increment("collaborative_undo_queued")
         self._sync_operation_journal()
@@ -11122,6 +11133,7 @@ class LiveCollaborationController:
         operation_id = str(operation.get("client_operation_id") or "")
         if not operation_id:
             return
+        self._deferred_visibility_ids.discard(operation_id)
         awaiting_count = len(self.awaiting_echo)
         self.awaiting_echo = [
             queued
