@@ -34,6 +34,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Joining or rejoining a compacted Shared Folder/SSH/Direct LAN room no longer
+  stays connected with an empty segmentation. Small initial-sync pages were
+  bounded from the old cursor instead of the first available system snapshot;
+  when archived history was larger than the page, every response stayed empty.
+  The page limit now counts operations from that snapshot, without weakening
+  the rule against skipping gaps to ordinary per-label replacements.
+
 - The Slicer lifecycle smoke test now fails when rejoining restores fewer or
   more voxels than expected. Its failure branch was accidentally nested after
   an unconditional raise in the deleted-label check and could never run;

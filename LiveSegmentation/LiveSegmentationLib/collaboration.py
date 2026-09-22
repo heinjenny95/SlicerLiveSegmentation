@@ -2822,7 +2822,10 @@ class SharedFolderRoomClient:
             ]
             if snapshots:
                 start_sequence = min(snapshots)
-        for sequence in range(start_sequence, min(latest, after_sequence + limit) + 1):
+        # After compaction the safe first snapshot may be far beyond the old
+        # cursor. The page size bounds returned operations, not the archived
+        # sequence gap; otherwise a small initial-sync batch stays empty forever.
+        for sequence in range(start_sequence, min(latest, start_sequence + limit - 1) + 1):
             operation = operations_by_sequence.get(sequence)
             if operation is None:
                 break
