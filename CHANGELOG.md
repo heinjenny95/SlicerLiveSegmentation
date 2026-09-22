@@ -34,6 +34,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- The Slicer lifecycle smoke test now fails when rejoining restores fewer or
+  more voxels than expected. Its failure branch was accidentally nested after
+  an unconditional raise in the deleted-label check and could never run;
+  an `ok=true` result could therefore include zero restored voxels. Regression
+  tests execute the actual guard with missing, extra, and correctly restored
+  voxels, as well as a deleted label that reappears.
+
 - An edit the room refused because the label had just been locked by someone
   else was still treated as sent and waited for an echo that never came
   (L-07). For the rest of the session, painting the same voxels again was never

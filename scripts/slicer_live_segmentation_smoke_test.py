@@ -1561,11 +1561,6 @@ def run_probe():
                 timer_active = (
                     timer_active() if callable(timer_active) else bool(timer_active)
                 )
-            if deletion_sync and any(
-                rejoined.GetSegmentation().GetSegment(probe_id) is not None
-                for probe_id in deleted_probe_ids
-            ):
-                raise RuntimeError("A deleted label reappeared after leaving and rejoining")
                 queued_results = []
                 while not controller._worker_results.empty():
                     queued_results.append(controller._worker_results.get_nowait())
@@ -1585,6 +1580,11 @@ def run_probe():
                     f"{[(item.get('lane'), item.get('session_token'), bool(item.get('error')), len(item.get('operations') or [])) for item in queued_results]}, "
                     f"last error: {controller._last_error})"
                 )
+            if deletion_sync and any(
+                rejoined.GetSegmentation().GetSegment(probe_id) is not None
+                for probe_id in deleted_probe_ids
+            ):
+                raise RuntimeError("A deleted label reappeared after leaving and rejoining")
             replicas = [
                 node
                 for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
