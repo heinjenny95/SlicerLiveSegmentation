@@ -326,25 +326,43 @@ class SshRoomClient(LanRoomClient):
         except Exception:
             pass
 
+    def _receive_chunk(self):
+        try:
+            return self._channel.recv(65536)
+        except TimeoutError:
+            # An idle read is not a failed request. Keep the partial frame;
+            # BufferedFile.readline would discard it when a timeout interrupts.
+            return None
+
     def _read_responses(self):
+        buffered = bytearray()
         try:
             while not self._closed.is_set():
-                line = self._stdout.readline(MAX_FRAME + 1)
-                if not line or len(line) > MAX_FRAME:
-                    raise LiveCollaborationError("SSH response stream closed or exceeded the frame limit")
-                response = json.loads(line)
-                if "stage" in response:
-                    self.connection_stage = str(response["stage"])
-                    if self.stage_callback:
-                        self.stage_callback(self.connection_stage)
+                chunk = self._receive_chunk()
+                if chunk is None:
                     continue
-                with self._pending_lock:
-                    pending = self._pending.get(str(response.get("id")))
-                if pending is not None:
-                    try:
-                        pending.put_nowait(response)
-                    except queue.Full:
-                        pass
+                if not chunk:
+                    raise LiveCollaborationError("SSH response stream closed or exceeded the frame limit")
+                buffered.extend(chunk)
+                while (end := buffered.find(b"\n")) >= 0:
+                    if end + 1 > MAX_FRAME:
+                        raise LiveCollaborationError("SSH response exceeded the frame limit")
+                    response = json.loads(buffered[:end])
+                    del buffered[:end + 1]
+                    if "stage" in response:
+                        self.connection_stage = str(response["stage"])
+                        if self.stage_callback:
+                            self.stage_callback(self.connection_stage)
+                        continue
+                    with self._pending_lock:
+                        pending = self._pending.get(str(response.get("id")))
+                    if pending is not None:
+                        try:
+                            pending.put_nowait(response)
+                        except queue.Full:
+                            pass
+                if len(buffered) >= MAX_FRAME:
+                    raise LiveCollaborationError("SSH response exceeded the frame limit")
         except Exception as exc:
             self._fail_pending(str(exc))
             self.close()
@@ -496,6 +514,10 @@ class SshProcessRoomClient(SshRoomClient):
 
     def preflight(self, room_name, signature, plugin_version=PLUGIN_VERSION, protocol_version=COLLABORATION_PROTOCOL_VERSION):
         return self._rpc("preflight", room_name, signature, plugin_version, protocol_version)
+
+    def _receive_chunk(self):
+        # Local anonymous pipes block until data/EOF; close() reaps the worker.
+        return self._stdout.read1(65536)
 
     def close(self):
         super().close()

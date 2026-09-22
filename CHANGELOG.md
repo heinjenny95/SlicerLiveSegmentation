@@ -34,6 +34,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- SSH sessions no longer close after an idle read timeout (L-14). The reader
+  retains partial UTF-8/JSON frames across pauses, including in the isolated
+  SSH worker, while per-request deadlines, stream limits, and explicit close
+  remain in force.
+
 - Collaborative undo, revision restore, conflict-resolution snapshots, and crash
   recovery no longer generate an inverse edit while waiting for their server
   echo (L-06). Verification distinguishes already-visible local strokes from

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shlex
 import socket
 import subprocess
@@ -345,3 +346,68 @@ def test_explicit_password_does_not_contact_an_ssh_agent(ssh_server, tmp_path, m
         assert client.join("password-room", "a" * 64)["id"]
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_idle_ssh_session_survives_read_timeouts(ssh_server, tmp_path, isolated):
+    ssh_server.pin(tmp_path / "known_hosts")
+    client = ssh_server.client("alice", tmp_path / "known_hosts", isolated=isolated)
+    client.timeout_seconds = 0.5
+    try:
+        room = client.join("idle-room", "a" * 64)
+        time.sleep(1.1)  # More than two read deadlines, with no RPC pending.
+        assert client.health_check(room["id"])
+        assert ssh_server.authenticated == 1, "Idle must not reconnect with cached credentials"
+    finally:
+        client.close()
+
+
+def test_partial_ssh_response_survives_idle_timeout():
+    client = SshRoomClient("linux-host/folder", "alice", "test-user")
+    pieces = iter([b'{"id":"test","result":"caf', TimeoutError(), b'\xc3', TimeoutError(), b'\xa9"}\n', b''])
+
+    class Channel:
+        def recv(self, size):
+            value = next(pieces)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    client._channel = Channel()
+    client._pending["test"] = result = queue.Queue(maxsize=1)
+    client._read_responses()
+    assert result.get_nowait() == {"id": "test", "result": "caf\u00e9"}
+
+
+@pytest.mark.parametrize("terminated", [False, True])
+def test_oversized_ssh_frame_is_rejected(monkeypatch, terminated):
+    import ssh_transport
+
+    monkeypatch.setattr(ssh_transport, "MAX_FRAME", 32)
+    client = SshRoomClient("linux-host/folder", "alice", "test-user")
+    pieces = iter([b"x" * 33 + (b"\n" if terminated else b"")])
+    client._receive_chunk = lambda: next(pieces)
+    client._pending["test"] = result = queue.Queue(maxsize=1)
+    client._read_responses()
+    assert "frame limit" in result.get_nowait()["error"]
+    assert client._closed.is_set()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_ssh_request_deadline_still_applies(tmp_path, isolated):
+    server = LocalSSHServer(tmp_path, delay_health=True)
+    server.pin(tmp_path / "known_hosts")
+    client = server.client("alice", tmp_path / "known_hosts", isolated=isolated)
+    client.timeout_seconds = 0.3
+    try:
+        room = client.join("deadline-room", "b" * 64)
+        started = time.monotonic()
+        with pytest.raises(LiveCollaborationError, match="did not respond within"):
+            client.health_check(room["id"])
+        assert time.monotonic() - started < 0.9
+        # A late response must not destroy the connection or satisfy another RPC.
+        time.sleep(1.1)
+        assert client.send_chat(room["id"], "after timeout", "chat-after-timeout")
+    finally:
+        client.close()
+        server.close()
