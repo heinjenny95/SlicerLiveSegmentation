@@ -34,6 +34,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Leaving a room no longer clears unacknowledged edits from the optional crash
+  journal (L-08). Unsettled local work, including edits still being captured or
+  encoded, keeps a hidden, detached OFFLINE RECOVERY segmentation in the scene.
+  The standard editor treats that copy as read-only; new joins do not erase it.
+  An explicit warning and Save action make clear that this is not a disk backup:
+  save it before closing Slicer. Clean, settled replicas are still removed.
+
 - Native Segment Editor undo/redo history is cleared and disabled during live
   collaboration (L-05), so restoring an old whole-segmentation state cannot
   erase colleagues' labels. Use the collaborative Undo action instead. The

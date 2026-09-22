@@ -249,6 +249,13 @@ owner.
   Native Segment Editor undo/redo is disabled for the live session because it
   would restore a complete old segmentation, including colleagues' labels.
   Its previous history limit is restored after leaving the room.
+- **Leaving with pending edits:** unacknowledged encoded operations remain in
+  the optional local crash journal. If local work may still be unshared, a hidden
+  **OFFLINE RECOVERY** segmentation is kept in the scene, detached from live
+  sync and read-only in the standard editor. **Save offline recovery…** opens
+  Slicer's Save dialog. Save these nodes locally before closing Slicer: the
+  retained scene copy is not a disk backup, and unencoded strokes are not yet
+  covered by the crash journal. It is never automatically merged into a room.
 - **Review queue and QA:** review states are sorted into a visible queue.
   On-demand quality checks report empty labels, disconnected or very small
   components, and overlaps between labels without changing voxel data.

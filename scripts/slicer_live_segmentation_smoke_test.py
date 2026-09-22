@@ -33,6 +33,17 @@ def wait_for_connection(controller, timeout=12.0):
         raise RuntimeError(controller._last_error or "Live room did not connect")
 
 
+def wait_for_settled_edits(controller, timeout=10.0):
+    """A clean-leave test must finish pending edits; pending-leave has its own probe."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pump_events(0.08)
+        controller.on_timer()
+        if not controller._has_unsettled_local_work():
+            return
+    raise RuntimeError("Edits did not settle before the clean-leave lifecycle test")
+
+
 def controller_workers(controller):
     return tuple(
         getattr(controller, name, None)
@@ -1488,6 +1499,7 @@ def run_probe():
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_LIFECYCLE", "0") == "1":
             from LiveSegmentationLib.collaboration import apply_mask_delta
 
+            wait_for_settled_edits(controller)
             expected_rejoin_mask = np.zeros(image.shape, dtype=np.uint8)
             for operation in controller.client.operations(controller.room_id, 0):
                 if operation["segment_id"] == segment_id:
@@ -1599,10 +1611,13 @@ def run_probe():
             if editor is None or editor.segmentationNode() != replicas[0]:
                 raise RuntimeError("Rejoining did not attach the clean room replica")
             second_node_id = replicas[0].GetID()
+            wait_for_settled_edits(controller)
             controller.leave()
             pump_events(0.2)
             if editor.segmentationNode() is not None:
                 raise RuntimeError("Second leave did not clear Segment Editor")
+            if slicer.mrmlScene.GetNodeByID(second_node_id) is not None:
+                raise RuntimeError("Second clean leave kept the old room segmentation")
             if any(
                 node.GetAttribute("LiveSegmentation.SharedReplica") == "1"
                 for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")

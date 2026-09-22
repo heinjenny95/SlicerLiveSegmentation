@@ -125,7 +125,14 @@
    overlapping labels. Verify every issue is reported and no voxel changes.
 8. Disconnect before a queued edit is acknowledged, close Slicer, rejoin the
    exact same context, and recover it. Verify replay is idempotent. An explicit
-   **Leave live room** must clear the journal.
+   **Leave live room** must preserve unacknowledged edits in the enabled journal.
+   Leave immediately after painting, while capture/encoding is still pending,
+   and during connection loss: a hidden OFFLINE RECOVERY segmentation must stay
+   in the scene, detached from live sync and read-only in the standard editor.
+   Save it locally before closing Slicer; raw unencoded work is not yet in the
+   crash journal. Rejoining must not remove that copy. Clean settled rooms
+   should still be removed. `scripts/slicer_live_leave_smoke_test.py` checks
+   these states with synthetic data in an isolated Slicer process.
 9. Export research metrics and verify the JSON contains aggregate timings and
    counts but no user, room, URL, path, image, or segmentation payload.
 

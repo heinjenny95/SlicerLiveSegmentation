@@ -6124,13 +6124,15 @@ class LiveCollaborationController:
     def _disconnect_for_connection_loss(self, message):
         message = str(message or "The collaboration location stopped responding")
         shared_folder_session = _uses_shared_folder(self.client)
-        self.leave(notify_remote=False)
+        recovery_kept = self.leave(notify_remote=False)
         if shared_folder_session:
             self.shared_folder_edit.setCurrentIndex(-1)
             self.shared_folder_edit.setEditText("")
         self._show_error(
             f"{message} The live session was reset locally; choose a reachable "
-            "shared folder or server and join again.",
+            "shared folder or server and join again."
+            + (" Unshared work was retained as a hidden OFFLINE RECOVERY segmentation. "
+               "Save it to local storage before closing Slicer." if recovery_kept else ""),
             popup=True,
         )
 
@@ -7578,6 +7580,16 @@ class LiveCollaborationController:
                 pass
             self._show_error(exc, popup=True)
 
+    def _has_unsettled_local_work(self):
+        """Conservatively retain the replica if a local edit may not be shared yet."""
+        return bool(
+            self.outgoing or self.awaiting_echo or self.dirty_segments
+            or self.metadata_updates or self.pending_segment_deletions
+            or self._local_capture is not None or self._local_encode_pending
+            or self._pending_segmentation_event_ids or self._pending_segmentation_event_unspecified
+            or self._segment_verifications
+        )
+
     def leave(self, notify_remote=True):
         client = self.client
         connecting_client = self._connecting_client
@@ -7585,11 +7597,10 @@ class LiveCollaborationController:
         self._leave_client_in_background(connecting_client, None)
         room_id = self.room_id
         segmentation_node_id = self.segmentation_node_id
-        if notify_remote:
-            if self._operation_journal is not None:
-                self._operation_journal.submit({}, [])
-        else:
-            self._sync_operation_journal()
+        preserve_recovery = bool(segmentation_node_id and self._has_unsettled_local_work())
+        # Explicit Leave is not consent to discard edits. Already encoded work
+        # keeps its optional crash journal; raw work stays in a detached node.
+        self._sync_operation_journal()
         self._joining = False
         self._join_started_at = 0.0
         self._join_status_second = -1
@@ -7706,8 +7717,12 @@ class LiveCollaborationController:
             self.lan_host_button.setText("Start LAN host")
             self.lan_host_checkbox.checked = False
             self.lan_status_label.setText("LAN host stopped")
+        recovery_kept = False
         try:
-            self.owner.clear_live_segmentation(segmentation_node_id)
+            if preserve_recovery:
+                recovery_kept = self.owner.clear_live_segmentation(segmentation_node_id, preserve_recovery=True) is not None
+            else:
+                self.owner.clear_live_segmentation(segmentation_node_id)
         except Exception:
             pass
         self._set_connection_inputs_enabled(True)
@@ -7789,9 +7804,13 @@ class LiveCollaborationController:
             self.owner.clear_remote_highlights()
         except Exception:
             pass
-        self.status_label.setText("● Offline")
+        self.status_label.setText(
+            "● Offline – unshared work retained locally; save the OFFLINE RECOVERY segmentation"
+            if recovery_kept else "● Offline"
+        )
         self.status_label.setStyleSheet("color: #777;")
         self.users_label.setText("Nobody else is connected")
+        return recovery_kept
 
     def cleanup(self):
         self._cleaned_up = True
@@ -7799,7 +7818,7 @@ class LiveCollaborationController:
         if self._ssh_trust_dialog is not None:
             self._ssh_trust_dialog.reject()
         # Preserve unacknowledged edits if Slicer exits or the module is
-        # destroyed unexpectedly. An explicit Leave remains the clean discard.
+        # destroyed unexpectedly. Explicit Leave preserves pending edits too.
         self.leave(notify_remote=False)
         try:
             import qt

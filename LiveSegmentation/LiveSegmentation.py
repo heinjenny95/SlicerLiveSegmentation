@@ -56,6 +56,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._live_session_active = False
         self._previous_segment_editor_overwrite_mode = None
         self._previous_segment_editor_undo_limit = None
+        self._recovery_editor = None
+        self._previous_editor_read_only = None
 
     def setup(self):
         super().setup()
@@ -105,6 +107,15 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.open_segment_editor_button.enabled = False
         actions.addWidget(self.open_segment_editor_button)
         data_form.addRow(actions)
+        self.recovery_notice = qt.QLabel()
+        self.recovery_notice.setWordWrap(True)
+        self.recovery_notice.setStyleSheet("color: #b26a00;")
+        self.recovery_notice.hide()
+        data_form.addRow(self.recovery_notice)
+        self.save_recovery_button = qt.QPushButton("Save offline recovery…")
+        self.save_recovery_button.hide()
+        self.save_recovery_button.connect("clicked()", self._save_offline_recovery)
+        data_form.addRow(self.save_recovery_button)
         self.layout.addWidget(data_group)
 
         self.source_volume_selector.connect(
@@ -122,10 +133,53 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.layout.addStretch(1)
 
         self._select_scene_defaults()
+        self._recovery_editor = self._standard_segment_editor_widget()
+        if self._recovery_editor is not None:
+            self._recovery_editor.connect("segmentationNodeChanged(vtkMRMLSegmentationNode*)", self._guard_recovery_editing)
+            self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
         if self.live_collaboration is not None:
             self.live_collaboration.cleanup()
+        if self._recovery_editor is not None:
+            self._recovery_editor.disconnect("segmentationNodeChanged(vtkMRMLSegmentationNode*)", self._guard_recovery_editing)
+            self._guard_recovery_editing(None)
+            self._recovery_editor = None
+
+    def _guard_recovery_editing(self, node):
+        """Segment Editor may auto-select the first node when reopened offline."""
+        editor = self._recovery_editor
+        if editor is None:
+            return
+        if node is not None and node.GetAttribute("LiveSegmentation.LocalRecovery") == "1":
+            if self._previous_editor_read_only is None:
+                self._previous_editor_read_only = bool(editor.readOnly)
+            editor.setReadOnly(True)
+        elif self._previous_editor_read_only is not None:
+            previous = self._previous_editor_read_only
+            self._previous_editor_read_only = None
+            editor.setReadOnly(previous)
+
+    def enter(self):
+        self._refresh_recovery_notice()
+
+    def _save_offline_recovery(self):
+        slicer.util.openSaveDataDialog()
+        self._refresh_recovery_notice()
+
+    def _refresh_recovery_notice(self):
+        if not hasattr(self, "recovery_notice"):
+            return
+        recoveries = [node for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+                      if node.GetAttribute("LiveSegmentation.LocalRecovery") == "1"]
+        self.recovery_notice.setVisible(bool(recoveries))
+        self.save_recovery_button.setVisible(bool(recoveries))
+        if recoveries:
+            self.recovery_notice.setText(
+                f"{len(recoveries)} offline recovery segmentation(s) retained in this scene. "
+                "They are hidden and are NOT shared. Save the OFFLINE RECOVERY nodes "
+                "to local .seg.nrrd files before closing Slicer; they are not automatic disk backups."
+            )
 
     def _select_scene_defaults(self):
         if self.source_volume_selector.currentNode() is None:
@@ -224,6 +278,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._set_reference_geometry_if_empty()
 
     def on_segmentation_changed(self, node=None):
+        if node is not None and node.GetAttribute("LiveSegmentation.LocalRecovery") == "1":
+            self.segmentation_selector.setCurrentNode(None)
+            return
         self._set_reference_geometry_if_empty(node)
 
     def _create_segmentation_node(self, name="Live Segmentation"):
@@ -283,8 +340,18 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             )
         return segmentation_node
 
-    def clear_live_segmentation(self, segmentation_node_id=None):
-        """Detach and remove all room-managed segmentation replicas from the scene."""
+    def clear_live_segmentation(self, segmentation_node_id=None, preserve_recovery=False):
+        """Detach replicas, retaining unsettled work without copying large labelmaps."""
+        recovery_node = None
+        if preserve_recovery and segmentation_node_id:
+            recovery_node = slicer.mrmlScene.GetNodeByID(segmentation_node_id)
+            if recovery_node is not None:
+                recovery_node.SetAttribute("LiveSegmentation.SharedReplica", None)
+                recovery_node.SetAttribute("LiveSegmentation.LocalRecovery", "1")
+                recovery_node.SetName("OFFLINE RECOVERY – " + recovery_node.GetName())
+                recovery_node.SetSaveWithScene(True)
+                if recovery_node.GetDisplayNode() is not None:
+                    recovery_node.GetDisplayNode().SetVisibility(False)
         editor = self._standard_segment_editor_widget()
         if editor is not None:
             try:
@@ -319,6 +386,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
         removable = []
         for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+            if node.GetAttribute("LiveSegmentation.LocalRecovery") == "1":
+                continue
             if node.GetAttribute("LiveSegmentation.SharedReplica") == "1" or (
                 segmentation_node_id and node.GetID() == segmentation_node_id
             ):
@@ -326,6 +395,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         for node in removable:
             slicer.mrmlScene.RemoveNode(node)
         self.clear_remote_highlights()
+        self._refresh_recovery_notice()
+        return recovery_node
 
     def apply_material_template(self, payload):
         """Create/update standard room labels without replacing existing voxel data."""
