@@ -112,6 +112,10 @@
 4. Make an edit, let the other user edit a different voxel in the same label,
    and run **Undo my last shared edit**. Verify the first edit is inverted as a
    new history sequence while the later collaborator voxel remains.
+   Native Segment Editor undo/redo must not restore an old room state: its
+   history limit is zero while connected and restored after leaving. The
+   isolated `scripts/slicer_live_undo_smoke_test.py` probe checks the actual
+   Slicer undo stack, with an offline positive control and a post-leave check.
 5. Select an earlier history row and **Compare with current**. Verify a separate
    display-only segmentation shows green Added and red Removed voxels and does
    not enter the shared history.

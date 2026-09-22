@@ -246,6 +246,9 @@ owner.
   an inverse operation instead of rewinding shared history and preserves voxels
   changed later by another participant. **Compare with current** creates a
   display-only Added/Removed overlay for a selected historical sequence.
+  Native Segment Editor undo/redo is disabled for the live session because it
+  would restore a complete old segmentation, including colleagues' labels.
+  Its previous history limit is restored after leaving the room.
 - **Review queue and QA:** review states are sorted into a visible queue.
   On-demand quality checks report empty labels, disconnected or very small
   components, and overlaps between labels without changing voxel data.

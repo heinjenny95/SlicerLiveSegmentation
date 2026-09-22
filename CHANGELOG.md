@@ -34,6 +34,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Native Segment Editor undo/redo history is cleared and disabled during live
+  collaboration (L-05), so restoring an old whole-segmentation state cannot
+  erase colleagues' labels. Use the collaborative Undo action instead. The
+  previous native undo-history limit is restored on leaving the room. Verified
+  with the real Slicer undo stack, including offline undo after leaving.
+
 - SSH sessions no longer close after an idle read timeout (L-14). The reader
   retains partial UTF-8/JSON frames across pauses, including in the isolated
   SSH worker, while per-request deadlines, stream limits, and explicit close

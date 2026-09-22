@@ -55,6 +55,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.live_collaboration = None
         self._live_session_active = False
         self._previous_segment_editor_overwrite_mode = None
+        self._previous_segment_editor_undo_limit = None
 
     def setup(self):
         super().setup()
@@ -144,8 +145,26 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         editor = self._standard_segment_editor_widget()
         if active:
             self._enable_exclusive_segment_editing(editor)
+            self._guard_segment_editor_undo(editor)
         else:
             self._restore_segment_editor_overwrite_mode(editor)
+            self._restore_segment_editor_undo(editor)
+
+    def _guard_segment_editor_undo(self, editor):
+        """Native Undo restores the whole segmentation, including colleagues' work."""
+        if editor is None:
+            return
+        if self._previous_segment_editor_undo_limit is None:
+            self._previous_segment_editor_undo_limit = int(editor.maximumNumberOfUndoStates)
+        # This clears old snapshots and prevents new ones. setUndoEnabled only
+        # changes button visibility in Slicer; it does not disable undo().
+        editor.setMaximumNumberOfUndoStates(0)
+
+    def _restore_segment_editor_undo(self, editor):
+        previous = self._previous_segment_editor_undo_limit
+        self._previous_segment_editor_undo_limit = None
+        if editor is not None and previous is not None:
+            editor.setMaximumNumberOfUndoStates(previous)
 
     def _enable_exclusive_segment_editing(self, editor):
         """Make the most recent paint stroke own every voxel it touches.
@@ -441,6 +460,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             editor.setMasterVolumeNode(volume_node)
         if self._live_session_active:
             self._enable_exclusive_segment_editing(editor)
+            self._guard_segment_editor_undo(editor)
 
     def open_segment_editor(self):
         if self.live_collaboration is None or not self.live_collaboration.connected:
