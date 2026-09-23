@@ -4131,6 +4131,38 @@ class SharedFolderRoomClient:
             "valid": expected in {None, actual},
         }
 
+    def prepare_project_backup(self, room_id, backup_name, destination, expected_sha256):
+        """Worker-only: copy a selected room backup and verify the local bytes."""
+        name = str(backup_name)
+        if (not name or "/" in name or "\\" in name or ":" in name
+                or Path(name).suffix.lower() != ".mrb"):
+            raise LiveCollaborationError("Invalid backup filename")
+        path = self._require_room(room_id) / "backups" / name
+        meta_path = path.with_suffix(".mrb.json")
+        meta = _read_json_file(meta_path) if meta_path.is_file() else {}
+        checksum = meta.get("sha256")
+        if not isinstance(checksum, str) or re.fullmatch(r"[0-9a-fA-F]{64}", checksum) is None:
+            raise LiveCollaborationError(
+                "This legacy backup has no valid stored checksum. Automatic restore is disabled; "
+                "keep your current work saved and inspect/import it manually with Slicer's Add Data."
+            )
+        if checksum != expected_sha256:
+            raise LiveCollaborationError("The backup checksum changed since selection. Refresh the backup list.")
+        shutil.copyfile(path, destination)
+        if sha256_file(destination) != checksum:
+            raise LiveCollaborationError("Backup checksum mismatch; the current scene has not been changed")
+        with zipfile.ZipFile(destination) as bundle:
+            names = bundle.namelist()
+            if not any(name.lower().endswith(".mrml") for name in names):
+                raise LiveCollaborationError("Backup contains no MRML scene")
+            for name in names:
+                parts = name.replace("\\", "/").split("/")
+                if name.startswith(("/", "\\")) or ".." in parts or ":" in name:
+                    raise LiveCollaborationError("Backup contains an unsafe archive path")
+            if bundle.testzip() is not None:
+                raise LiveCollaborationError("Backup archive integrity check failed")
+        return {"sha256": checksum, "size_bytes": Path(destination).stat().st_size}
+
     def prune_project_backups(self, room_id, keep_unpinned=50):
         room_path = self._require_room(room_id)
         backups = [item for item in self.list_project_backups(room_id) if not item["pinned"]]
@@ -4947,6 +4979,8 @@ class LiveCollaborationController:
         self._last_backup_check = 0.0
         self._backup_worker = None
         self._backup_saving = False
+        self._backup_restore_worker = None
+        self._backup_restore_job = None
         self._last_error = None
         self._last_transport_warning = None
         self._last_transport_result_at = 0.0
@@ -6911,21 +6945,123 @@ class LiveCollaborationController:
         if not backup:
             self._show_error("Select a backup first", popup=True)
             return
+        if not self.connected or not self.initial_sync_complete:
+            self._show_error("Join and synchronize the room before preparing a backup", popup=True)
+            return
+        if (self._backup_restore_job is not None
+                or (self._backup_restore_worker is not None and self._backup_restore_worker.is_alive())):
+            self._show_error("A backup is still being prepared; leave the room to cancel", popup=True)
+            return
+        client = self.client.fallback_client if isinstance(self.client, HybridRoomClient) else self.client
+        if not hasattr(client, "prepare_project_backup"):
+            self._show_error("Verified project restore is available for shared-folder backups only", popup=True)
+            return
+        job = {"lock": threading.Lock(), "cancelled": False, "staging": None,
+               "session_token": self._session_token, "name": str(backup["name"])}
+        self._backup_restore_job = job
+        self._backup_restore_worker = threading.Thread(
+            target=self._prepare_backup_restore,
+            args=(job, client, self.room_id, backup.get("sha256")),
+            name="LiveSegmentation-backup-restore", daemon=True,
+        )
+        self.backup_status_label.setText("Downloading and verifying backup in background; current work stays open…")
+        self._backup_restore_worker.start()
+
+    @staticmethod
+    def _cleanup_restore_staging(staging):
+        if staging is not None:
+            try:
+                staging.cleanup()
+            except OSError:
+                logging.exception("Could not remove local backup-restore staging")
+
+    def _cancel_backup_restore(self):
+        job = self._backup_restore_job
+        if job is None:
+            return
+        with job["lock"]:
+            job["cancelled"] = True
+            staging, job["staging"] = job["staging"], None
+        self._backup_restore_job = None
+        self._cleanup_restore_staging(staging)
+
+    def _prepare_backup_restore(self, job, client, room_id, expected_sha256):
+        staging = None
+        result = {"lane": "backup-restore", "session_token": job["session_token"], "job": job}
+        try:
+            staging = tempfile.TemporaryDirectory(prefix="LiveSegmentation-restore-")
+            local_path = Path(staging.name) / "project.mrb"
+            client.prepare_project_backup(room_id, job["name"], local_path, expected_sha256)
+            result["path"] = str(local_path)
+            with job["lock"]:
+                if not job["cancelled"]:
+                    job["staging"], staging = staging, None
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            self._cleanup_restore_staging(staging)
+            self._worker_results.put(result)
+
+    def _finish_backup_restore(self, result):
+        job = result["job"]
+        with job["lock"]:
+            staging, job["staging"] = job["staging"], None
+        try:
+            if (job is not self._backup_restore_job or job["cancelled"]
+                    or job["session_token"] != self._session_token or not self.connected):
+                return
+            if result.get("error"):
+                raise LiveCollaborationError(result["error"])
+            if staging is None:
+                return
+            if self._has_unsettled_local_work() or not self.initial_sync_complete:
+                raise LiveCollaborationError("New edits are still synchronizing. Nothing was loaded; try Restore again after sync.")
+            self._open_prepared_backup(result["path"], job)
+        except Exception as exc:
+            self.backup_status_label.setText(f"Backup restore failed: {exc}")
+            self._show_error(f"Could not restore backup: {exc}", popup=True)
+        finally:
+            if self._backup_restore_job is job:
+                self._backup_restore_job = None
+            self._cleanup_restore_staging(staging)
+
+    def _open_prepared_backup(self, path, job):
         import qt
         import slicer
-
         answer = qt.QMessageBox.question(
             slicer.util.mainWindow(),
             "Restore Slicer project backup",
-            "This leaves the live room and replaces the current Slicer scene. Continue?",
+            "The local backup copy passed checksum and archive checks.\n\n"
+            "Leave the live room and import the backup as offline scene data? "
+            "Other current scene data are kept (duplicates may appear). "
+            "This does not roll back the shared room. Save important current work first.",
             qt.QMessageBox.Yes | qt.QMessageBox.No,
+            qt.QMessageBox.No,
         )
         if answer != qt.QMessageBox.Yes:
+            self.backup_status_label.setText("Backup restore cancelled; current work remains open")
             return
-        path = str(backup["path"])
+        # A modal question runs Qt events: edits/Leave/rejoin can happen meanwhile.
+        if (job["cancelled"] or job["session_token"] != self._session_token
+                or not self.connected or self._has_unsettled_local_work()):
+            raise LiveCollaborationError("The room or local work changed during confirmation. Nothing was loaded.")
         self.leave()
-        if not slicer.util.loadScene(path):
-            slicer.util.errorDisplay(f"Could not restore backup: {path}")
+        existing_ids = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")}
+        try:
+            loaded = slicer.util.loadScene(path, properties={"clear": False})
+        finally:
+            # A saved live replica must not be deleted as stale live state on a
+            # later Join. Detach only newly imported nodes, even on partial failure.
+            for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+                if node.GetID() in existing_ids:
+                    continue
+                node.SetAttribute("LiveSegmentation.BackupImport", "1")
+                node.SetAttribute("LiveSegmentation.SharedReplica", None)
+                node.SetAttribute("LiveSegmentation.RoomId", None)
+                node.SetName(f"OFFLINE BACKUP — {node.GetName()}")
+        if not loaded:
+            raise LiveCollaborationError("Slicer could not import the verified local backup; some nodes may be partially loaded")
+        self.backup_status_label.setText("Verified backup imported offline; shared room unchanged")
 
     def run_room_diagnostics(self, checked=False):
         del checked
@@ -7698,6 +7834,7 @@ class LiveCollaborationController:
         )
 
     def leave(self, notify_remote=True):
+        self._cancel_backup_restore()
         client = self.client
         connecting_client = self._connecting_client
         self._connecting_client = None
@@ -10115,6 +10252,9 @@ class LiveCollaborationController:
                     self._ask_ssh_host_trust(result["ssh_host_key"])
                 if not self.connected and not self._joining:
                     self.timer.stop()
+                continue
+            if result.get("lane") == "backup-restore":
+                self._finish_backup_restore(result)
                 continue
             if result.get("session_token") != self._session_token or not self.connected:
                 continue

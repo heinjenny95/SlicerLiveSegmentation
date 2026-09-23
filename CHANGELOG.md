@@ -34,6 +34,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Project backup restore now downloads to local staging and verifies the stored
+  checksum and MRB archive in a background worker (L-15). A failed or stale
+  preparation leaves the room/scene untouched. Opening requires a fresh explicit
+  confirmation with no unsettled local edits, imports offline without clearing
+  other scene data, and never rolls back the shared room. Legacy backups without
+  stored checksums require manual inspection/import. Local MRML import still runs
+  on Slicer's GUI thread and may pause for a large scene.
+
 - Restoring a room revision now also queues deletion of labels that did not
   exist in it, including an entirely empty revision (L-17), and restores names
   and colors. It refuses to queue anything if local work or the applied room

@@ -1455,6 +1455,9 @@ def run_probe():
                 "size_bytes": backup_path.stat().st_size,
                 "valid_mrb": True,
             }
+            backup_expected_mask = widget.segment_mask_in_reference_geometry(
+                segmentation, segment_id, volume, image.shape).copy()
+            backup_segmentation_name = segmentation.GetName()
 
         deletion_sync = None
         deleted_probe_ids = ("LiveSeg-LocalDeletionProbe", "LiveSeg-RemoteDeletionProbe")
@@ -1861,6 +1864,55 @@ def run_probe():
                 "session_reset_locally": True,
                 "ui_responsive": True,
             }
+
+        if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_BACKUP_RESTORE", "0") == "1":
+            if backup is None or not controller.connected:
+                raise RuntimeError("Backup restore probe needs BACKUP=1 and an active room")
+            wait_for_settled_edits(controller)
+            sentinel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTextNode", "Keep current local work")
+            sentinel.SetText("not part of the backup")
+            records = controller.client.list_project_backups(controller.room_id)
+            controller._selected_backup = lambda: next(r for r in records if r["name"] == backup["file"])
+            original_question = qt.QMessageBox.question
+            original_load = slicer.util.loadScene
+            loaded_paths = []
+
+            def load_local(path, **kwargs):
+                if Path(path) == backup_path or kwargs != {"properties": {"clear": False}}:
+                    raise RuntimeError("Restore attempted network import or scene replacement")
+                loaded_paths.append(path)
+                return original_load(path, **kwargs)
+
+            try:
+                qt.QMessageBox.question = lambda *args: qt.QMessageBox.Yes
+                slicer.util.loadScene = load_local
+                controller.restore_selected_backup()
+                deadline = time.monotonic() + 30
+                while controller._backup_restore_job is not None and time.monotonic() < deadline:
+                    controller.on_timer()
+                    pump_events(0.05)
+            finally:
+                qt.QMessageBox.question = original_question
+                slicer.util.loadScene = original_load
+            if not loaded_paths or controller.connected:
+                raise RuntimeError(f"Backup restore did not import offline: {controller._last_error}")
+            if slicer.mrmlScene.GetNodeByID(sentinel.GetID()) != sentinel:
+                raise RuntimeError("Backup import discarded current local scene data")
+            restored = [node for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+                        if node.GetName() == f"OFFLINE BACKUP — {backup_segmentation_name}"
+                        and node.GetAttribute("LiveSegmentation.BackupImport") == "1"
+                        and node.GetAttribute("LiveSegmentation.SharedReplica") is None
+                        and node.GetSegmentation().GetSegment(segment_id) is not None]
+            if len(restored) != 1:
+                raise RuntimeError("Backup did not restore exactly one offline segmentation")
+            restored_mask = widget.segment_mask_in_reference_geometry(restored[0], segment_id, volume, image.shape)
+            if not np.array_equal(restored_mask, backup_expected_mask):
+                raise RuntimeError("Restored backup voxels differ from saved state")
+            if Path(loaded_paths[0]).exists():
+                raise RuntimeError("Local backup staging was not cleaned")
+            backup["restore"] = {"verified_local_import": True, "offline": True,
+                                 "current_local_data_kept": True, "exact_voxels": True,
+                                 "staging_cleaned": True}
 
         return {
             "ok": True,
