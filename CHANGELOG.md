@@ -34,6 +34,16 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Historical reconstruction now uses the same ordered cross-label ownership
+  and immutable protection decisions as live replay (L-17). Deleted/recreated
+  labels also retain the correct new metadata. It keeps sparse 64-cubed
+  baselines and emits a snapshot followed by bounded patches for widely spread
+  components, not a full-volume allocation per label and edit. Restore, undo,
+  comparison and conflict-choice consumers accept all chunks instead of only
+  the first one; the comparison display and union/undo still have dense GUI
+  work and are not claimed to be fully memory-bounded. A guarded 2000-cubed
+  sparse test refuses any attempted full-volume allocation.
+
 - Cross-label voxel claims now respect foreign label locks (L-17). The folder
   transport captures the protected IDs under the room sequence lock; HTTP
   captures them in the write transaction and migrates a JSON field in its

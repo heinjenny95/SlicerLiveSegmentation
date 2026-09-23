@@ -400,11 +400,32 @@ def reconstruct_snapshot_operations(
     apply_mask_delta,
     encode_mask_delta,
 ):
-    """Reconstruct all known segments at a historical global sequence."""
+    """Replay ordered ownership, emitting a bounded snapshot/patch stream.
+
+    A label may have multiple output operations. The initial snapshot clears
+    it; subsequent patches fill occupied chunks without allocating its dense
+    volume (or the dense union of far-apart components).
+    """
+    # Runtime import avoids the module-initialization cycle. This is the same
+    # NumPy-only codec/baseline used by live replay, never a Slicer/MRML object.
+    try:
+        from .collaboration import (
+            ChunkedMaskBaseline,
+            PackedOperationMask,
+            encode_mask_crop_snapshot,
+            iter_operation_tiles,
+        )
+    except ImportError:
+        from collaboration import (
+            ChunkedMaskBaseline,
+            PackedOperationMask,
+            encode_mask_crop_snapshot,
+            iter_operation_tiles,
+        )
+    del apply_mask_delta  # Kept in the public call signature for compatibility.
     ordered = sorted(operations, key=lambda item: int(item.get("sequence", 0)))
     metadata = {}
     masks = {}
-    active_segments = set()
     target_sequence = int(target_sequence)
     for operation in ordered:
         if int(operation.get("sequence", 0)) > target_sequence:
@@ -412,7 +433,7 @@ def reconstruct_snapshot_operations(
         segment_id = str(operation.get("segment_id") or "")
         if not segment_id:
             continue
-        if segment_id not in metadata or operation.get("metadata_update"):
+        if segment_id not in masks or operation.get("metadata_update"):
             metadata[segment_id] = {
                 "segment_id": segment_id,
                 "segment_name": operation.get("segment_name") or segment_id,
@@ -420,21 +441,45 @@ def reconstruct_snapshot_operations(
             }
         if operation.get("segment_deleted"):
             masks.pop(segment_id, None)
-            active_segments.discard(segment_id)
             continue
         shape = tuple(int(value) for value in operation["volume_shape"])
         current = masks.get(segment_id)
         if current is None or current.shape != shape:
-            current = np.zeros(shape, dtype=np.uint8)
-        masks[segment_id] = apply_mask_delta(current, operation)
-        active_segments.add(segment_id)
+            current = ChunkedMaskBaseline(shape)
+        masks[segment_id] = current
+        packed_operation = {**operation, "_packed": PackedOperationMask(operation)}
+        for tile in iter_operation_tiles(packed_operation, current):
+            if tile.get("_completion_only"):
+                continue
+            changed, values = tile["_decoded"]
+            bounds = tile["voxel_bbox"]
+            values, _ = protect_voxel_claims(
+                tile, changed, values,
+                lambda label, box: masks[label].region(box) if label in masks else None,
+            )
+            current.set_region(bounds, changed, values)
+            claimed = changed & (values != 0)
+            if np.any(claimed):
+                for other_id, other in masks.items():
+                    if other_id != segment_id:
+                        other.set_region(bounds, claimed, np.zeros_like(values))
     result = []
-    for segment_id in sorted(active_segments, key=str.casefold):
-        empty = np.zeros_like(masks[segment_id])
-        encoded = encode_mask_delta(empty, masks[segment_id], replace=True)
-        if encoded is None:
-            continue
-        result.append({**metadata[segment_id], **encoded})
+    for segment_id in sorted(masks, key=str.casefold):
+        baseline = masks[segment_id]
+        label_operations = []
+        for coordinate, chunk in sorted(baseline.chunks.items()):
+            encoded = encode_mask_delta(np.zeros_like(chunk), chunk)
+            if encoded is not None:
+                origin = [value * baseline.chunk_size for value in coordinate]
+                encoded["voxel_bbox"] = [value + origin[index // 2]
+                                          for index, value in enumerate(encoded["voxel_bbox"])]
+                encoded["volume_shape"] = list(baseline.shape)
+                label_operations.append(encoded)
+        if len(label_operations) == 1:
+            label_operations[0]["operation_kind"] = "snapshot"
+        else:
+            label_operations.insert(0, encode_mask_crop_snapshot(None, None, baseline.shape))
+        result.extend({**metadata[segment_id], **encoded} for encoded in label_operations)
     return result
 
 

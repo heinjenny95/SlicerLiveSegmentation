@@ -548,8 +548,15 @@ def run_probe():
             )
             if not np.array_equal(before, after) or other[occupied] or other[free] != 1:
                 raise RuntimeError("A cross-label claim changed protected voxels in real Slicer")
+            historical = controller._historical_label_baselines(
+                controller.client.state_at_sequence(controller.room_id, result["sequence"])
+            )
+            if (not np.array_equal(historical[segment_id].to_dense(), after)
+                    or not np.array_equal(historical[claim_id].to_dense(), other)):
+                raise RuntimeError("Historical ownership differs from the live Slicer labelmaps")
             protected_claims = {"locked_label_unchanged": True,
-                                "blocked_overlap_voxels": 1, "accepted_free_voxels": 1}
+                                "blocked_overlap_voxels": 1, "accepted_free_voxels": 1,
+                                "history_matches_live": True}
             controller.client.set_segment_lock(controller.room_id, segment_id, False)
             peer.leave(controller.room_id)
 

@@ -10571,7 +10571,8 @@ class LiveCollaborationController:
             queued = {
                 **operation,
                 "client_operation_id": str(uuid.uuid4()),
-                "operation_kind": "snapshot",
+                "operation_kind": operation.get("operation_kind") or "snapshot",
+                "metadata_update": True,
                 "base_sequence": int(self.last_sequence),
             }
             self.outgoing.append(queued)
@@ -10593,6 +10594,24 @@ class LiveCollaborationController:
             pass
         self._comparison_node_id = None
 
+    @staticmethod
+    def _historical_label_baselines(operations):
+        """Read the bounded per-label snapshot/patch stream returned by history."""
+        masks = {}
+        for operation in operations or []:
+            segment_id = str(operation.get("segment_id") or "")
+            if not segment_id:
+                continue
+            if operation.get("segment_deleted"):
+                masks.pop(segment_id, None)
+                continue
+            baseline = masks.setdefault(segment_id, ChunkedMaskBaseline(operation["volume_shape"]))
+            if operation.get("operation_kind") == "snapshot":
+                baseline.clear()
+            changed, values = decode_mask_delta(operation)
+            baseline.set_region(operation["voxel_bbox"], changed, values)
+        return masks
+
     def _show_revision_comparison(self, historical_operations, sequence):
         """Overlay voxels added/removed since a historical room sequence."""
         import slicer
@@ -10603,13 +10622,7 @@ class LiveCollaborationController:
         shape = tuple(int(value) for value in self.volume_shape)
         added = np.zeros(shape, dtype=bool)
         removed = np.zeros(shape, dtype=bool)
-        historical = {}
-        for operation in historical_operations or []:
-            segment_id = str(operation.get("segment_id") or "")
-            if segment_id:
-                historical[segment_id] = apply_mask_delta(
-                    np.zeros(shape, dtype=np.uint8), operation
-                ).astype(bool)
+        historical = self._historical_label_baselines(historical_operations)
         current_ids = set(node.GetSegmentation().GetSegmentIDs())
         for segment_id in current_ids | set(historical):
             current = (
@@ -10620,6 +10633,8 @@ class LiveCollaborationController:
             previous = historical.get(segment_id)
             if previous is None:
                 previous = np.zeros(shape, dtype=bool)
+            else:
+                previous = previous.to_dense().astype(bool)
             added |= current & ~previous
             removed |= previous & ~current
 
@@ -10666,21 +10681,15 @@ class LiveCollaborationController:
         segment_id = str(target.get("segment_id") or "")
         if not segment_id:
             raise LiveCollaborationError("The edit selected for undo has no label")
-        before_operation = next(
-            (
-                operation
-                for operation in (value or {}).get("before") or []
-                if str(operation.get("segment_id") or "") == segment_id
-            ),
-            None,
-        )
+        before_operations = [operation for operation in (value or {}).get("before") or []
+                             if str(operation.get("segment_id") or "") == segment_id]
         if target.get("segment_deleted"):
-            if before_operation is None:
+            if not before_operations:
                 raise LiveCollaborationError(
                     "The deleted label did not exist before this edit"
                 )
             self._queue_snapshot_operations(
-                [{**before_operation, "undo_of_sequence": int(sequence)}]
+                [{**operation, "undo_of_sequence": int(sequence)} for operation in before_operations]
             )
             return
 
@@ -10690,15 +10699,12 @@ class LiveCollaborationController:
                 "The label no longer exists; restore a revision instead"
             )
         current = self._read_mask(node, segment_id)
-        previous = (
-            apply_mask_delta(np.zeros_like(current), before_operation)
-            if before_operation is not None
-            else np.zeros_like(current)
-        )
+        previous = self._historical_label_baselines(before_operations).get(segment_id)
         changed, target_values = decode_mask_delta(target)
         z0, z1, y0, y1, x0, x1 = [int(value) for value in target["voxel_bbox"]]
         current_region = current[z0:z1, y0:y1, x0:x1]
-        previous_region = previous[z0:z1, y0:y1, x0:x1]
+        previous_region = (previous.region(target["voxel_bbox"]) if previous is not None
+                           else np.zeros_like(current_region))
         # Only revert voxels that still carry the value written by the target
         # operation. Later edits by collaborators are preserved.
         restore = changed & (current_region == target_values)
@@ -10755,17 +10761,12 @@ class LiveCollaborationController:
                 resolution = request.get("resolution")
                 state = (value or {}).get("state") if isinstance(value, dict) else None
                 if resolution in {"other", "union"} and state:
-                    selected = next(
-                        (
-                            item
-                            for item in state
-                            if str(item.get("segment_id")) == str(request.get("segment_id"))
-                        ),
-                        None,
-                    )
-                    if selected is not None and resolution == "other":
-                        self._queue_snapshot_operations([selected])
-                    elif selected is not None and resolution == "union":
+                    selected_operations = [item for item in state
+                                           if str(item.get("segment_id")) == str(request.get("segment_id"))]
+                    if selected_operations and resolution == "other":
+                        self._queue_snapshot_operations(selected_operations)
+                    elif selected_operations and resolution == "union":
+                        selected = selected_operations[0]
                         node = self._segmentation_node()
                         segment_id = str(request.get("segment_id"))
                         current = (
@@ -10773,7 +10774,7 @@ class LiveCollaborationController:
                             if node is not None
                             else np.zeros(tuple(selected["volume_shape"]), dtype=np.uint8)
                         )
-                        other = apply_mask_delta(np.zeros_like(current), selected)
+                        other = self._historical_label_baselines(selected_operations)[segment_id].to_dense()
                         union = np.logical_or(current, other).astype(np.uint8)
                         encoded = encode_mask_delta(np.zeros_like(union), union, replace=True)
                         self._queue_snapshot_operations(
