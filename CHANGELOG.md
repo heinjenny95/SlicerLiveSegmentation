@@ -34,6 +34,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Shared-folder/SSH and HTTP publishers now reject edits whose base precedes
+  the label's last deletion (L-17). The deletion barrier survives restores,
+  compaction, process restarts and a missing polling cache. An informed restore
+  remains possible. Clients handle the refusal without reconnecting, awaiting
+  an impossible echo, or restoring a refused obsolete deletion. All folder
+  publishers must use the updated code; existing wrongly accepted historical
+  operations are not rewritten or claimed to be repaired retroactively.
+
 - A locally pending label deletion no longer bypasses ordered voxel ownership
   (L-17). Incoming edits to that hidden label still clear their claims from
   siblings before the deletion takes effect, matching other peers and a fresh

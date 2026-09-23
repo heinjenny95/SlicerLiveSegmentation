@@ -2424,6 +2424,22 @@ class SharedFolderRoomClient:
         )
         return conflicts
 
+    def _label_deletion_barriers(self, room_path, state, latest_sequence):
+        """Cache original deletion generations without losing them at compaction.
+
+        The append-only history remains authoritative. Old rooms and interrupted
+        cache writes rebuild once; normal brush strokes only read the hot state.
+        This is always called under the room sequence lock.
+        """
+        if (state.get("latest_sequence") == latest_sequence
+                and isinstance(state.get("label_deletions"), dict)):
+            return dict(state["label_deletions"])
+        deleted = {}
+        for previous in self._all_operation_records(room_path):
+            if previous.get("segment_deleted") and not previous.get("carried_tombstone"):
+                deleted[str(previous["segment_id"])] = int(previous["sequence"])
+        return deleted
+
     def push_operation(self, room_id, operation, defer_conflicts=False):
         room_path = self._require_room(room_id)
         operation_id = str(operation.get("client_operation_id") or "").strip()
@@ -2509,7 +2525,18 @@ class SharedFolderRoomClient:
                 latest_sequence = self._latest_sequence(room_path)
             else:
                 latest_sequence = hot_latest
+            label_deletions = self._label_deletion_barriers(
+                room_path, state, latest_sequence
+            )
+            deletion_sequence = int(label_deletions.get(segment_id, 0))
+            if base_sequence < deletion_sequence:
+                raise LiveCollaborationError(
+                    f"Label was deleted at sequence {deletion_sequence}; "
+                    "this edit predates that deletion. Sync before restoring the label."
+                )
             sequence = latest_sequence + 1
+            if operation.get("segment_deleted"):
+                label_deletions[segment_id] = sequence
             stored = {
                 **operation,
                 "sequence": sequence,
@@ -2595,6 +2622,7 @@ class SharedFolderRoomClient:
                     "updated_at": _utc_iso(),
                     "recent_operations": recent_operations,
                     "inline_operations": inline_operations,
+                    "label_deletions": label_deletions,
                 },
                 label="live-operation cache",
             )
@@ -3760,6 +3788,14 @@ class SharedFolderRoomClient:
                     "expected_sequence": int(expected_sequence),
                     "latest_sequence": before_sequence,
                 }
+            state_path = room_path / "sequence-state.json"
+            try:
+                state = _read_json_file(state_path) if state_path.is_file() else {}
+            except LiveCollaborationError:
+                state = {}
+            label_deletions = self._label_deletion_barriers(
+                room_path, state, before_sequence
+            )
             if compact and before_sequence > 0:
                 segment_operations = self._tombstones_to_carry(
                     room_path,
@@ -3842,6 +3878,7 @@ class SharedFolderRoomClient:
                     "updated_at": _utc_iso(),
                     "recent_operations": recent_operations,
                     "inline_operations": _bounded_inline_operations(created),
+                    "label_deletions": label_deletions,
                 },
                 durable=False,
             )
@@ -9274,12 +9311,14 @@ class LiveCollaborationController:
                 ).append(operation)
 
             rejected_ids = []
+            stale_deletion_ids = []
 
             def push_group(group):
                 result = {
                     "ids": [],
                     "rejected": [],
                     "rejected_ids": [],
+                    "stale_deletion_ids": [],
                     "conflicts": [],
                     "errors": [],
                 }
@@ -9295,13 +9334,17 @@ class LiveCollaborationController:
                         result["conflicts"].extend((pushed or {}).get("conflicts") or [])
                     except Exception as exc:
                         message = str(exc)
-                        if "locked by" not in message:
+                        stale_deletion = "Label was deleted at sequence" in message
+                        if "locked by" not in message and not stale_deletion:
                             raise
                         # Handled, but never published: it leaves the outgoing
                         # queue without ever becoming an awaited echo.
                         result["ids"].append(operation["client_operation_id"])
                         result["rejected_ids"].append(operation["client_operation_id"])
-                        result["rejected"].append(operation["segment_id"])
+                        if stale_deletion:
+                            result["stale_deletion_ids"].append(operation["client_operation_id"])
+                        else:
+                            result["rejected"].append(operation["segment_id"])
                         result["errors"].append(message)
                 return result
 
@@ -9310,6 +9353,7 @@ class LiveCollaborationController:
             ):
                 outgoing_ids.extend(group_result["ids"])
                 rejected_ids.extend(group_result["rejected_ids"])
+                stale_deletion_ids.extend(group_result["stale_deletion_ids"])
                 rejected_segments.extend(group_result["rejected"])
                 conflicts_detected.extend(group_result["conflicts"])
                 command_errors.extend(group_result["errors"])
@@ -9344,6 +9388,7 @@ class LiveCollaborationController:
                     "session_token": session_token,
                     "outgoing_ids": outgoing_ids,
                     "rejected_ids": rejected_ids,
+                    "stale_deletion_ids": stale_deletion_ids,
                     "rejected_segments": rejected_segments,
                     "conflicts_detected": conflicts_detected,
                     "command_errors": command_errors,
@@ -10195,6 +10240,7 @@ class LiveCollaborationController:
                     for operation in self.awaiting_echo
                 }
                 rejected_ids = set(result.get("rejected_ids") or [])
+                stale_deletion_ids = set(result.get("stale_deletion_ids") or [])
                 for operation in sent_operations:
                     operation_id = operation["client_operation_id"]
                     if operation_id in rejected_ids:
@@ -10204,7 +10250,12 @@ class LiveCollaborationController:
                         # every later edit of these voxels and block snapshots
                         # for the rest of the session.
                         self.session_metrics.operation_acknowledged(operation_id)
-                        if operation.get("segment_deleted"):
+                        if operation_id in stale_deletion_ids:
+                            key = (self.segmentation_node_id, operation["segment_id"])
+                            self.dirty_segments.discard(key)
+                            self.metadata_updates.discard(key)
+                            self._segment_verifications.pop(key, None)
+                        elif operation.get("segment_deleted"):
                             self._restore_rejected_deletion(operation)
                         continue
                     if operation_id in self._applied_local_operation_ids:

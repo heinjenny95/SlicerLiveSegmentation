@@ -503,6 +503,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 if role_for(connection, room_id, user) == "viewer":
                     raise HTTPException(status_code=403, detail="Viewers cannot edit labels")
+                deletion_sequence = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) FROM live_operations
+                    WHERE room_id = ? AND segment_id = ? AND segment_deleted = 1
+                    """, (room_id, payload.segment_id),
+                ).fetchone()[0]
+                if payload.base_sequence < deletion_sequence:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(f"Label was deleted at sequence {deletion_sequence}; "
+                                "this edit predates that deletion. "
+                                "Sync before restoring the label."),
+                    )
                 lock_state = connection.execute(
                     """
                     SELECT owner, locked, expires_epoch FROM live_segment_locks
