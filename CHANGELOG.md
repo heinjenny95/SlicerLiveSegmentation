@@ -34,6 +34,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Project-backup network copying, hashing, metadata and retention run in a
+  dedicated background worker (L-15), not Slicer's GUI thread. The upload is
+  checked against the local source checksum before publication. Completion is
+  reported only after verification; stale completions cannot update a newly
+  joined room. Slicer's local `saveScene` still runs synchronously on its GUI
+  thread and may pause a large scene. Backup restore is not changed here.
+
 - Shared-folder/SSH and HTTP publishers now reject edits whose base precedes
   the label's last deletion (L-17). The deletion barrier survives restores,
   compaction, process restarts and a missing polling cache. An informed restore

@@ -1375,6 +1375,13 @@ def run_probe():
                 raise RuntimeError("The shared room did not reserve a project backup")
             if not controller._create_project_backup(reservation):
                 raise RuntimeError(controller._last_error or "Project backup failed")
+            deadline = time.monotonic() + 30
+            while controller._backup_in_progress() and time.monotonic() < deadline:
+                slicer.app.processEvents()
+                time.sleep(0.02)
+            if controller._backup_in_progress():
+                raise RuntimeError("Project backup transfer did not finish")
+            controller._drain_worker_results()
             backup_path = Path(reservation["path"])
             if not backup_path.is_file() or not zipfile.is_zipfile(backup_path):
                 raise RuntimeError("The project backup is missing or is not a valid MRB bundle")

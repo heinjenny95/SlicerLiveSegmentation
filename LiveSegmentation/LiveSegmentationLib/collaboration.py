@@ -4896,6 +4896,8 @@ class LiveCollaborationController:
         self._last_lock_poll = 0.0
         self._last_health_check = 0.0
         self._last_backup_check = 0.0
+        self._backup_worker = None
+        self._backup_saving = False
         self._last_error = None
         self._last_transport_warning = None
         self._last_transport_result_at = 0.0
@@ -6581,6 +6583,9 @@ class LiveCollaborationController:
 
     def create_backup_now(self, checked=False):
         del checked
+        if self._backup_in_progress():
+            self.backup_status_label.setText("A project backup is still transferring/verifying.")
+            return
         if not self.connected or not _uses_shared_folder(self.client):
             self._show_error("Join a shared-folder room before creating a backup", popup=True)
             return
@@ -9251,6 +9256,7 @@ class LiveCollaborationController:
         )
         backup_check = (
             bool(backup_enabled)
+            and not self._backup_in_progress()
             and _uses_shared_folder(self.client)
             and self.initial_sync_complete
             and not self.outgoing
@@ -10059,6 +10065,18 @@ class LiveCollaborationController:
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
             lane = str(result.get("lane") or "sync")
+            if lane == "project-backup":
+                if result.get("error"):
+                    self.backup_status_label.setText(f"Backup failed: {result['error']}")
+                    self._show_error(f"Could not save the project backup: {result['error']}")
+                else:
+                    self.backup_status_label.setText(
+                        f"Last complete project backup: {result['name']}"
+                        + (f" (retention warning: {result['warning']})" if result.get("warning") else "")
+                    )
+                    self._queue_action("list_backups")
+                    self._append_activity(f"Project backup verified and saved: {result['name']}")
+                continue
             if lane == "presence":
                 self._presence_worker_started_at = 0.0
                 self._presence_stall_status_second = -1
@@ -10723,11 +10741,8 @@ class LiveCollaborationController:
             elif action == "list_backups":
                 self._update_backup_tree(value or [])
             elif action == "backup_now":
-                if value and self._create_project_backup(value):
-                    self.backup_status_label.setText(
-                        "Manual project backup completed successfully."
-                    )
-                    self._queue_action("list_backups")
+                if value:
+                    self._create_project_backup(value)
             elif action == "pin_backup":
                 self._queue_action("list_backups")
             elif action == "verify_backup":
@@ -11110,74 +11125,134 @@ class LiveCollaborationController:
         else:
             self.lock_button.setText(f"Only {owner} can change this lock")
 
+    def _backup_in_progress(self):
+        worker = getattr(self, "_backup_worker", None)
+        return bool(getattr(self, "_backup_saving", False)) or (
+            worker is not None and worker.is_alive()
+        )
+
     def _create_project_backup(self, reservation):
+        """Save MRML locally on the GUI thread; transfer only bytes in a worker.
+
+        True means started, not uploaded. In particular no network Path access,
+        hashing, retention or failed-reservation cleanup is done on this thread.
+        """
         import slicer
 
+        if self._backup_in_progress():
+            return False
+        destination = Path(str(reservation["path"]))
+        staging = tempfile.TemporaryDirectory(prefix="LiveSegmentation-backup-")
+        local_bundle = Path(staging.name) / destination.name
+        # Capture before saveScene: it may process Qt events, including Leave.
+        client, room_id = self.client, self.room_id
+        user_name, session_token = self.user_name, self._session_token
+        retention = self.backup_retention_spin.value
+        retention = retention() if callable(retention) else retention
+        if isinstance(client, HybridRoomClient):
+            client = client.fallback_client
+        error = None
+        self._backup_saving = True
+        try:
+            self.backup_status_label.setText("Saving project locally before background transfer…")
+            saved = slicer.util.saveScene(str(local_bundle))
+            if session_token != self._session_token:
+                raise LiveCollaborationError("Room changed during local scene saving; backup not uploaded")
+            if saved is False or not local_bundle.is_file():
+                raise LiveCollaborationError("Slicer could not create the project bundle")
+        except Exception as exc:
+            error = str(exc)
+        # Capture the old room/client, not mutable controller state. Leave or
+        # a new join must not redirect an in-progress transfer to another room.
+        self._backup_worker = threading.Thread(
+            target=self._transfer_project_backup,
+            args=(dict(reservation), staging, local_bundle, client, room_id,
+                  user_name, int(retention), session_token, error),
+            name="LiveSegmentation-project-backup", daemon=True,
+        )
+        try:
+            self._backup_worker.start()
+        finally:
+            self._backup_saving = False
+        if session_token == self._session_token:
+            self.backup_status_label.setText(
+                f"Backup failed: {error}" if error else "Transferring and verifying project backup in background…"
+            )
+        return error is None
+
+    def _transfer_project_backup(
+        self, reservation, staging, local_bundle, client, room_id,
+        user_name, retention, session_token, save_error=None,
+    ):
         destination = Path(str(reservation["path"]))
         temporary_destination = _atomic_temporary_path(destination)
+        state_path = Path(str(reservation["state_path"]))
+        result = {"lane": "project-backup", "session_token": session_token,
+                  "name": destination.name}
+
+        def update_reservation(fields):
+            with client._named_lock(state_path.parent, "backup", timeout_seconds=3.0):
+                state = _read_json_file(state_path) if state_path.is_file() else {}
+                if state.get("token") == reservation.get("token"):
+                    _write_json_atomic(state_path, {**state, **fields})
+
         try:
+            if save_error:
+                raise LiveCollaborationError(save_error)
+            checksum = sha256_file(local_bundle)
+            size_bytes = local_bundle.stat().st_size
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="LiveSegmentation-backup-") as temp_dir:
-                local_bundle = Path(temp_dir) / destination.name
-                saved = slicer.util.saveScene(str(local_bundle))
-                if saved is False or not local_bundle.is_file():
-                    raise LiveCollaborationError("Slicer could not create the project bundle")
-                shutil.copyfile(local_bundle, temporary_destination)
-                os.replace(temporary_destination, destination)
-            checksum = sha256_file(destination)
+            shutil.copyfile(local_bundle, temporary_destination)
+            if (temporary_destination.stat().st_size != size_bytes
+                    or sha256_file(temporary_destination) != checksum):
+                raise LiveCollaborationError("Backup transfer checksum mismatch")
+            with temporary_destination.open("r+b") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary_destination, destination)
             _write_json_atomic(
                 destination.with_suffix(destination.suffix + ".json"),
                 {
                     "name": destination.name,
                     "created_at": _utc_iso(),
-                    "created_by": self.user_name,
-                    "size_bytes": destination.stat().st_size,
+                    "created_by": user_name,
+                    "size_bytes": size_bytes,
                     "sha256": checksum,
                     "pinned": False,
                 },
             )
-            _write_json_atomic(
-                Path(str(reservation["state_path"])),
+            update_reservation(
                 {
                     "last_backup_epoch": time.time(),
                     "completed_at": _utc_iso(),
-                    "completed_by": self.user_name,
+                    "completed_by": user_name,
                     "token": reservation["token"],
                     "file": destination.name,
-                    "size_bytes": destination.stat().st_size,
+                    "size_bytes": size_bytes,
                     "sha256": checksum,
                 },
             )
-            retention = self.backup_retention_spin.value
-            retention = retention() if callable(retention) else retention
-            if _uses_shared_folder(self.client):
-                self.client.prune_project_backups(self.room_id, int(retention))
-                self._queue_action("list_backups")
-            self.backup_status_label.setText(
-                f"Last complete project backup: {destination.name}"
-            )
-            slicer.util.showStatusMessage(
-                f"Live Segmentation backup saved: {destination.name}", 3500
-            )
-            return True
+            try:
+                client.prune_project_backups(room_id, retention)
+            except Exception as exc:
+                # The verified file is safe even if retention cannot finish.
+                result["warning"] = str(exc)
         except Exception as exc:
+            result["error"] = str(exc)
+            try:
+                update_reservation({"last_backup_epoch": 0.0,
+                                    "failed_at": _utc_iso(), "error": str(exc)})
+            except Exception:
+                pass
+        finally:
             try:
                 temporary_destination.unlink(missing_ok=True)
             except OSError:
                 pass
             try:
-                state_path = Path(str(reservation["state_path"]))
-                state = _read_json_file(state_path) if state_path.is_file() else {}
-                if state.get("token") == reservation.get("token"):
-                    state["last_backup_epoch"] = 0.0
-                    state["failed_at"] = _utc_iso()
-                    state["error"] = str(exc)
-                    _write_json_atomic(state_path, state)
-            except Exception:
-                pass
-            self.backup_status_label.setText(f"Backup failed: {exc}")
-            self._show_error(f"Could not save the automatic project backup: {exc}")
-            return False
+                staging.cleanup()
+            except OSError as exc:
+                result["warning"] = f"Local backup staging cleanup failed: {exc}"
+            self._worker_results.put(result)
 
     def _ensure_segment(self, node, operation):
         import slicer
