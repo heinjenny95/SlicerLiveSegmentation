@@ -6807,8 +6807,13 @@ class LiveCollaborationController:
         if sequence is None:
             self._show_error("Select a revision in the timeline first", popup=True)
             return
+        if (not self.connected or not self.initial_sync_complete
+                or self._has_unsettled_local_work() or self._incoming_operations):
+            self._show_error("Wait for pending edits to synchronize before restoring a revision", popup=True)
+            return
         self._restoring_sequence = sequence
-        self._queue_action("restore_revision", sequence=sequence)
+        self._queue_action("restore_revision", sequence=sequence,
+                           expected_sequence=int(self.last_sequence))
         self.on_timer()
 
     def compare_selected_revision(self, checked=False):
@@ -10581,6 +10586,36 @@ class LiveCollaborationController:
             self.session_metrics.increment("snapshot_edits_queued")
         self._sync_operation_journal()
 
+    def _queue_room_revision_restore(self, operations, expected_sequence):
+        """Restore the captured label set, without consuming work made meanwhile.
+
+        This queues ordinary protected, ordered edits; it is not an atomic
+        room rollback. Later edits and authoritative label locks still win.
+        """
+        if (not self.connected or not self.initial_sync_complete
+                or expected_sequence is None or int(expected_sequence) != self.last_sequence
+                or self._has_unsettled_local_work() or self._incoming_operations):
+            raise LiveCollaborationError(
+                "The room or local work changed while loading the revision. "
+                "Let synchronization finish, then select Restore again. Nothing was queued."
+            )
+        node = self._segmentation_node()
+        if node is None:
+            raise LiveCollaborationError("The shared segmentation is unavailable")
+        operations = list(operations or [])
+        for operation in operations:
+            defect = operation_defect(operation, self.volume_shape)
+            if defect or not operation.get("segment_id"):
+                raise LiveCollaborationError(f"Invalid historical state: {defect or 'missing label ID'}")
+        historical_ids = {str(operation["segment_id"]) for operation in operations
+                          if not operation.get("segment_deleted")}
+        deletions = []
+        for segment_id in sorted(set(node.GetSegmentation().GetSegmentIDs()) - historical_ids):
+            metadata = self._current_segment_metadata(node, segment_id)
+            deletions.append({**metadata, **encode_metadata_update(self.volume_shape),
+                              "segment_deleted": True})
+        self._queue_snapshot_operations(deletions + operations)
+
     def _remove_comparison_node(self):
         if not self._comparison_node_id:
             return
@@ -10739,7 +10774,9 @@ class LiveCollaborationController:
             value = result.get("value")
             request = result.get("request") or {}
             if result.get("error"):
-                if action == "compare_revision":
+                if action == "restore_revision":
+                    self._restoring_sequence = None
+                elif action == "compare_revision":
                     self.compare_revision_button.enabled = True
                 elif action == "undo_operation":
                     self.undo_shared_button.enabled = True
@@ -10751,10 +10788,15 @@ class LiveCollaborationController:
                 )
                 continue
             if action == "restore_revision":
-                self._queue_snapshot_operations(value)
                 self._restoring_sequence = None
+                try:
+                    self._queue_room_revision_restore(value, request.get("expected_sequence"))
+                except LiveCollaborationError as exc:
+                    self._show_error(str(exc))
+                    continue
                 slicer.util.showStatusMessage(
-                    f"Historical state queued as a new revision at sequence {request.get('sequence')}",
+                    f"Revision {request.get('sequence')} queued, including removal of later labels; "
+                    "label locks and subsequent edits still apply",
                     4500,
                 )
             elif action == "resolve_conflict":

@@ -519,6 +519,7 @@ def run_probe():
             from LiveSegmentationLib.collaboration import SharedFolderRoomClient, encode_mask_delta
 
             wait_for_settled_edits(controller)
+            restore_sequence = int(controller.last_sequence)
             before = widget.segment_mask_in_reference_geometry(
                 segmentation, segment_id, volume, image.shape
             )
@@ -559,6 +560,24 @@ def run_probe():
                                 "history_matches_live": True}
             controller.client.set_segment_lock(controller.room_id, segment_id, False)
             peer.leave(controller.room_id)
+            wait_for_settled_edits(controller)
+            controller._queue_action("restore_revision", sequence=restore_sequence,
+                                     expected_sequence=int(controller.last_sequence))
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                controller.on_timer()
+                pump_events(0.08)
+                if segmentation.GetSegmentation().GetSegment(claim_id) is None:
+                    break
+            if segmentation.GetSegmentation().GetSegment(claim_id) is not None:
+                raise RuntimeError("Restoring the room revision did not remove the later label")
+            wait_for_settled_edits(controller)
+            restored = widget.segment_mask_in_reference_geometry(
+                segmentation, segment_id, volume, image.shape
+            )
+            if not np.array_equal(before, restored):
+                raise RuntimeError("Restoring the label set changed the historical voxels")
+            protected_claims["revision_restore_removed_later_label"] = True
 
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS", "0") == "1":
             rapid_segment_id = segment_id

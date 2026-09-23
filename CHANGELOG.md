@@ -34,6 +34,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Restoring a room revision now also queues deletion of labels that did not
+  exist in it, including an entirely empty revision (L-17), and restores names
+  and colors. It refuses to queue anything if local work or the applied room
+  sequence changed while fetching history; existing local edits remain intact.
+  This is a series of ordinary protected operations, not an atomic room-wide
+  rollback: locks may refuse individual operations and subsequent concurrent
+  edits still participate in the global order.
+
 - Historical reconstruction now uses the same ordered cross-label ownership
   and immutable protection decisions as live replay (L-17). Deleted/recreated
   labels also retain the correct new metadata. It keeps sparse 64-cubed
