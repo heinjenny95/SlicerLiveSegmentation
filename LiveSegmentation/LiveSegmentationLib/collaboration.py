@@ -2456,11 +2456,14 @@ class SharedFolderRoomClient:
                 try:
                     indexed = _read_json_file(operation_index_path)
                     indexed_name = str(indexed.get("file") or "")
-                    if Path(indexed_name).name == indexed_name:
-                        indexed_path = operations_path / indexed_name
-                        if indexed_path.is_file():
-                            existing = indexed_path
-                except LiveCollaborationError:
+                    indexed_sequence = int(indexed.get("sequence", 0))
+                    if indexed_sequence > 0 and indexed_name == (
+                        f"{indexed_sequence:020d}--{operation_hash}.json"
+                    ):
+                        # Receipts deliberately survive compaction. Requiring the
+                        # loose payload here replays a lost-ack retry as a new edit.
+                        return {"sequence": indexed_sequence, "duplicate": True}
+                except (LiveCollaborationError, TypeError, ValueError):
                     pass
             if existing is None:
                 legacy_matches = sorted(operations_path.glob(f"*--{operation_hash}.json"))
@@ -3883,7 +3886,15 @@ class SharedFolderRoomClient:
                             for _, path in candidates:
                                 bundle.write(path, arcname=path.name)
                         os.replace(temporary, archive_path)
-                        for _, path in candidates:
+                        for item_sequence, path in candidates:
+                            # A different publisher's async receipt writer may
+                            # not have run. Persist it before removing the last
+                            # loose record used by legacy retry detection.
+                            operation_hash = path.stem.split("--", 1)[-1]
+                            _write_json_atomic(
+                                room_path / "operation-index" / f"{operation_hash}.json",
+                                {"sequence": item_sequence, "file": path.name},
+                            )
                             path.unlink(missing_ok=True)
                     finally:
                         temporary.unlink(missing_ok=True)

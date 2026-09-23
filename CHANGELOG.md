@@ -34,6 +34,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Shared-folder/SSH retries remain idempotent after history compaction (L-16).
+  A lost acknowledgement or replayed crash-journal operation now returns its
+  original sequence even after the loose payload was archived. Compaction
+  persists missing retry receipts before removing loose files, including those
+  from a different publisher whose background writer has not finished.
+
 - Leaving a room no longer clears unacknowledged edits from the optional crash
   journal (L-08). Unsettled local work, including edits still being captured or
   encoded, keeps a hidden, detached OFFLINE RECOVERY segmentation in the scene.
