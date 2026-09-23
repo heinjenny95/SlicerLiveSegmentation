@@ -34,6 +34,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- A locally pending label deletion no longer bypasses ordered voxel ownership
+  (L-17). Incoming edits to that hidden label still clear their claims from
+  siblings before the deletion takes effect, matching other peers and a fresh
+  join. Retained baselines also follow incoming claims while their labels are
+  hidden, so a refused deletion cannot restore outdated overlap.
+
 - Shared-folder/SSH retries remain idempotent after history compaction (L-16).
   A lost acknowledgement or replayed crash-journal operation now returns its
   original sequence even after the loose payload was archived. Compaction

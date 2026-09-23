@@ -10373,6 +10373,8 @@ class LiveCollaborationController:
                         return
                     operation["_metadata_before"] = self._current_segment_metadata(node, operation["segment_id"])
                     baseline = self.baselines.get((node.GetID(), operation["segment_id"]))
+                    if baseline is None:
+                        baseline = self._deleted_baselines().get(operation["segment_id"])
                     self._incoming_iterator = self._iter_incoming_operation(operation, node, baseline)
                 if self._incoming_piece is None:
                     self._applying_remote = True
@@ -11198,18 +11200,37 @@ class LiveCollaborationController:
         if node is None or not np.any(claimed):
             return
         segmentation = node.GetSegmentation()
-        for other_segment_id in list(segmentation.GetSegmentIDs()):
+        other_segment_ids = set(segmentation.GetSegmentIDs())
+        other_segment_ids.update(
+            key[1] for key in self.baselines if key[0] == node.GetID()
+        )
+        other_segment_ids.update(self._deleted_baselines())
+        for other_segment_id in sorted(other_segment_ids):
             other_segment_id = str(other_segment_id)
             if other_segment_id == str(winning_segment_id):
                 continue
             other_key = (node.GetID(), other_segment_id)
             baseline = self.baselines.get(other_key)
             if baseline is None:
+                baseline = self._deleted_baselines().get(other_segment_id)
+            if baseline is None:
                 # A label that has not entered the ordered shared state yet is
                 # an unsent local edit. Do not erase it before it gets a turn.
                 continue
             server_before = _baseline_region(baseline, operation_bounds)
             if not np.any(server_before[claimed]):
+                continue
+            if segmentation.GetSegment(other_segment_id) is None:
+                # A locally deleted label is invisible but its shared state is
+                # still live until the deletion is accepted. Keep the retained
+                # baseline current in case that deletion is refused.
+                if isinstance(baseline, ChunkedMaskBaseline):
+                    baseline.set_region(
+                        operation_bounds, claimed, np.zeros_like(server_before)
+                    )
+                else:
+                    z0, z1, y0, y1, x0, x1 = operation_bounds
+                    baseline[z0:z1, y0:y1, x0:x1][claimed] = 0
                 continue
             current_visible = self._read_mask_region(
                 node, other_segment_id, operation_bounds
@@ -11346,12 +11367,25 @@ class LiveCollaborationController:
                     # Confirm the shared order while the newer local tombstone
                     # waits to be sent. Never recreate a deleted local label
                     # merely because its older creation/paint echo arrived late.
-                    baseline = self.baselines.setdefault(key, ChunkedMaskBaseline(self.volume_shape))
+                    baseline = self.baselines.get(key)
+                    if baseline is None:
+                        baseline = self._deleted_baselines().get(segment_id)
+                    if baseline is None:
+                        baseline = ChunkedMaskBaseline(self.volume_shape)
+                    self.baselines[key] = baseline
                     if operation.get("operation_kind") == "snapshot":
                         baseline.clear()
                     decoded = operation.get("_decoded")
                     changed, values = decoded if decoded is not None else decode_mask_delta(operation)
                     baseline.set_region(operation["voxel_bbox"], changed, values)
+                    self._applying_remote = True
+                    try:
+                        self._apply_exclusive_voxel_claims(
+                            node, segment_id, operation["voxel_bbox"],
+                            np.logical_and(changed, values != 0),
+                        )
+                    finally:
+                        self._applying_remote = False
                     if not operation.get("_partial_operation"):
                         if operation.get("author") == self.user_name:
                             self._acknowledge_local_operation(operation)
