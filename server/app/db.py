@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS live_operations (
     metadata_update INTEGER NOT NULL DEFAULT 0,
     undo_of_sequence INTEGER,
     changed_voxels INTEGER,
+    protected_segment_ids TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     UNIQUE (room_id, author, client_operation_id)
 );
@@ -176,6 +177,7 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "live_operations", "changed_voxels", "INTEGER")
+            self._ensure_column(connection, "live_operations", "protected_segment_ids", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column(
                 connection,
                 "live_operations",

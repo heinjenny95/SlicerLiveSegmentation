@@ -49,6 +49,7 @@ try:
         operation_overlap_count,
         operation_summary,
         parse_invitation,
+        protect_voxel_claims,
         reconstruct_snapshot_operations,
         segmentation_quality_report,
         sha256_file,
@@ -70,6 +71,7 @@ except ImportError:  # regular-Python transport tests import this file directly
         operation_overlap_count,
         operation_summary,
         parse_invitation,
+        protect_voxel_claims,
         reconstruct_snapshot_operations,
         segmentation_quality_report,
         sha256_file,
@@ -2542,6 +2544,10 @@ class SharedFolderRoomClient:
                 "sequence": sequence,
                 "author": self.user_name,
                 "created_at": _utc_iso(),
+                # A caller cannot remove protection by forging this field.
+                # Lock mutations share this sequence lock, so all readers get
+                # the same decision, including after locks change or expire.
+                "protected_segment_ids": self._protected_segments(room_path),
             }
             try:
                 stored["changed_voxels"] = int(
@@ -3377,8 +3383,43 @@ class SharedFolderRoomClient:
         result = _parallel_map(read_lock, creators.items())
         return sorted(result, key=lambda item: item["segment_id"].casefold())
 
-    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0):
+    def _protected_segments(self, room_path):
+        """One small warm-path read, not one NAS request per material/stroke.
+
+        The derivative index is invalidated under the sequence lock BEFORE
+        any lock mutation; a crash then rebuilds it from authoritative files.
+        Mixed old/new writers are not supported for this protection feature.
+        """
+        path = room_path / "lock-protection-index.json"
+        try:
+            records = _read_json_file(path)["locks"] if path.is_file() else None
+        except (LiveCollaborationError, KeyError, TypeError):
+            records = None
+        if not isinstance(records, list):
+            records = _parallel_map(_read_json_file, (room_path / "locks").glob("*.json"))
+            records = [record for record in records if record.get("locked")]
+            _write_json_atomic(path, {"locks": records}, durable=False)
+        now = time.time()
+        return sorted({
+            str(record["segment_id"]) for record in records
+            if record.get("locked") and record.get("owner") != self.user_name
+            and not (float(record.get("expires_epoch") or 0)
+                     and now >= float(record["expires_epoch"]))
+        })
+
+    @contextmanager
+    def _lock_mutation(self, room_id):
         room_path = self._require_room(room_id)
+        with self._sequence_lock(room_path):
+            # Invalidate before writing, including failed/interrupted writes.
+            (room_path / "lock-protection-index.json").unlink(missing_ok=True)
+            yield room_path
+
+    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0):
+        with self._lock_mutation(room_id) as room_path:
+            return self._set_segment_lock(room_path, segment_id, locked, expires_minutes)
+
+    def _set_segment_lock(self, room_path, segment_id, locked, expires_minutes):
         segment_id = str(segment_id or "").strip()
         if not segment_id:
             raise LiveCollaborationError("Select a label first")
@@ -3544,7 +3585,10 @@ class SharedFolderRoomClient:
         return sorted(result, key=lambda item: str(item.get("segment_id", "")).casefold())
 
     def set_review_state(self, room_id, segment_id, state, note=""):
-        room_path = self._require_room(room_id)
+        with self._lock_mutation(room_id) as room_path:
+            return self._set_review_state(room_path, segment_id, state, note)
+
+    def _set_review_state(self, room_path, segment_id, state, note):
         state = str(state or "").strip()
         if state not in REVIEW_STATES:
             raise LiveCollaborationError("Choose a valid review state")
@@ -3573,6 +3617,8 @@ class SharedFolderRoomClient:
                         or self.user_name
                     ),
                     "locked": True,
+                    "expires_epoch": 0.0,
+                    "expires_at": None,
                     "updated_by": self.user_name,
                     "updated_at": _utc_iso(),
                 }
@@ -3611,7 +3657,10 @@ class SharedFolderRoomClient:
         return sorted(result, key=lambda item: str(item.get("created_at", "")))
 
     def transfer_segment_owner(self, room_id, segment_id, target_user):
-        room_path = self._require_room(room_id)
+        with self._lock_mutation(room_id) as room_path:
+            return self._transfer_segment_owner(room_path, segment_id, target_user)
+
+    def _transfer_segment_owner(self, room_path, segment_id, target_user):
         target_user = str(target_user or "").strip()
         if not target_user:
             raise LiveCollaborationError("Choose a new label owner")
@@ -11309,6 +11358,58 @@ class LiveCollaborationController:
         self.session_metrics.operation_acknowledged(operation_id)
         self._sync_operation_journal()
 
+    def _protect_incoming_claims(self, node, operation, changed, values):
+        def read_region(segment_id, bounds):
+            baseline = self.baselines.get((node.GetID(), segment_id))
+            if baseline is None:
+                baseline = self._deleted_baselines().get(segment_id)
+            return None if baseline is None else _baseline_region(baseline, bounds)
+
+        values, blocked = protect_voxel_claims(operation, changed, values, read_region)
+        if blocked is None or operation.get("author") != self.user_name:
+            return values, blocked
+        # Slicer's local overwrite may already have removed the protected
+        # sibling before the lock refresh arrived. Restore only those voxels;
+        # the common baseline itself has not changed.
+        was_applying = self._applying_remote
+        self._applying_remote = True
+        try:
+            bounds = operation["voxel_bbox"]
+            for segment_id in operation.get("protected_segment_ids") or []:
+                if node.GetSegmentation().GetSegment(segment_id) is None:
+                    continue
+                shared = read_region(segment_id, bounds)
+                if shared is None:
+                    continue
+                current = self._read_mask_region(node, segment_id, bounds)
+                restored = current.copy()
+                restore = blocked & (shared != 0)
+                restored[restore] = shared[restore]
+                if np.any(restored != current):
+                    update = getattr(self.owner, "update_segment_binary_labelmap_crop", None)
+                    if not (callable(update) and update(
+                        current, restored, bounds, node, segment_id, self.owner.get_volume_node()
+                    )):
+                        full = self._read_mask(node, segment_id)
+                        z0, z1, y0, y1, x0, x1 = bounds
+                        full[z0:z1, y0:y1, x0:x1] = restored
+                        self.owner.update_segment_binary_labelmap_from_array(
+                            full, node, segment_id, self.owner.get_volume_node()
+                        )
+                    self._remember_segment_revision(node, segment_id)
+                    self.owner.refresh_segmentation_display(node, segment_id)
+            sequence = int(operation["sequence"])
+            if getattr(self, "_last_protected_claim_sequence", None) != sequence:
+                self._last_protected_claim_sequence = sequence
+                message = "Voxels in another user's protected label were kept; the rest of your edit was synchronized"
+                self._append_activity(message)
+                import slicer
+
+                slicer.util.showStatusMessage(message, 5000)
+        finally:
+            self._applying_remote = was_applying
+        return values, blocked
+
     def _apply_exclusive_voxel_claims(
         self, node, winning_segment_id, operation_bounds, claimed_voxels
     ):
@@ -11503,6 +11604,7 @@ class LiveCollaborationController:
                         baseline.clear()
                     decoded = operation.get("_decoded")
                     changed, values = decoded if decoded is not None else decode_mask_delta(operation)
+                    values, _ = self._protect_incoming_claims(node, operation, changed, values)
                     baseline.set_region(operation["voxel_bbox"], changed, values)
                     self._applying_remote = True
                     try:
@@ -11547,6 +11649,7 @@ class LiveCollaborationController:
                 oz0, oz1, oy0, oy1, ox0, ox1 = operation_bounds
                 decoded = operation.get("_decoded")
                 changed, values = decoded if decoded is not None else decode_mask_delta(operation)
+                values, blocked = self._protect_incoming_claims(node, operation, changed, values)
                 baseline = self.baselines.get(key)
                 if baseline is None:
                     baseline = ChunkedMaskBaseline(self.volume_shape)
@@ -11585,6 +11688,12 @@ class LiveCollaborationController:
                     if self.initial_sync_complete
                     else np.zeros(current_region.shape, dtype=bool)
                 )
+                if blocked is not None:
+                    # Protection also wins over this author's optimistic stroke
+                    # (and later unsequenced paint in the same protected voxels).
+                    local_changes[
+                        oz0 - az0:oz1 - az0, oy0 - ay0:oy1 - ay0, ox0 - ax0:ox1 - ax0
+                    ][blocked] = False
 
                 if operation.get("operation_kind") == "snapshot":
                     if isinstance(baseline, ChunkedMaskBaseline):

@@ -514,6 +514,45 @@ def run_probe():
         else:
             raise RuntimeError(f"Unsupported smoke-test mode: {mode}")
 
+        protected_claims = None
+        if os.environ.get("LIVE_SEGMENTATION_SMOKE_TEST_PROTECTED_CLAIMS", "0") == "1":
+            from LiveSegmentationLib.collaboration import SharedFolderRoomClient, encode_mask_delta
+
+            wait_for_settled_edits(controller)
+            before = widget.segment_mask_in_reference_geometry(
+                segmentation, segment_id, volume, image.shape
+            )
+            occupied = tuple(int(v) for v in np.argwhere(before != 0)[0])
+            free = tuple(int(v) for v in np.argwhere(before == 0)[0])
+            peer = SharedFolderRoomClient(shared_folder, "protected-claim-peer")
+            peer.join(room_name, controller.source_volume_signature)
+            controller.client.set_segment_lock(controller.room_id, segment_id, True)
+            mask = np.zeros(image.shape, dtype=np.uint8)
+            mask[occupied] = mask[free] = 1
+            claim_id = "ProtectedClaimProbe"
+            result = peer.push_operation(controller.room_id, {
+                "client_operation_id": "protected-claim-smoke",
+                "segment_id": claim_id, "segment_name": "Protected claim probe",
+                "color_hex": "#0000FF",
+                **encode_mask_delta(np.zeros_like(mask), mask, replace=True),
+            })
+            deadline = time.monotonic() + 12
+            while controller.last_sequence < result["sequence"] and time.monotonic() < deadline:
+                controller.on_timer()
+                pump_events(0.08)
+            after = widget.segment_mask_in_reference_geometry(
+                segmentation, segment_id, volume, image.shape
+            )
+            other = widget.segment_mask_in_reference_geometry(
+                segmentation, claim_id, volume, image.shape
+            )
+            if not np.array_equal(before, after) or other[occupied] or other[free] != 1:
+                raise RuntimeError("A cross-label claim changed protected voxels in real Slicer")
+            protected_claims = {"locked_label_unchanged": True,
+                                "blocked_overlap_voxels": 1, "accepted_free_voxels": 1}
+            controller.client.set_segment_lock(controller.room_id, segment_id, False)
+            peer.leave(controller.room_id)
+
         if os.environ.get("LIVE_SEGMENTATION_SMOKE_RAPID_COMPONENTS", "0") == "1":
             rapid_segment_id = segment_id
             rapid_base_voxels = 35 if (
@@ -1816,6 +1855,7 @@ def run_probe():
             "receive_latency_seconds": receive_latency_seconds,
             "rapid_component_voxels": rapid_component_voxels,
             "cross_label_integrity": cross_label_integrity,
+            "protected_claims": protected_claims,
             "incremental_patch_probe_voxels": patch_voxels,
             "lifecycle": lifecycle,
             "backup": backup,

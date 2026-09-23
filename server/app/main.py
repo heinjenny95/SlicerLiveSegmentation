@@ -50,6 +50,7 @@ def public_live_operation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["system_snapshot"] = bool(data.get("system_snapshot", False))
     data["segment_deleted"] = bool(data.get("segment_deleted", False))
     data["metadata_update"] = bool(data.get("metadata_update", False))
+    data["protected_segment_ids"] = json.loads(data.get("protected_segment_ids") or "[]")
     return data
 
 
@@ -537,6 +538,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         status_code=423,
                         detail=f"Label is locked by {lock_state['owner']}",
                     )
+                protected_segment_ids = [row["segment_id"] for row in connection.execute(
+                    "SELECT segment_id FROM live_segment_locks "
+                    "WHERE room_id = ? AND locked = 1 AND owner != ? "
+                    "AND (expires_epoch = 0 OR expires_epoch > ?) ORDER BY segment_id",
+                    (room_id, user, time.time()),
+                )]
                 changed_voxels = changed_voxel_count(incoming, incoming_changed)
                 if payload.base_sequence and not payload.system_snapshot:
                     concurrent = connection.execute(
@@ -582,9 +589,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         snapshot_group_id, snapshot_group_index,
                         snapshot_group_count, system_snapshot, snapshot_label,
                         segment_deleted, metadata_update, undo_of_sequence,
-                        changed_voxels,
+                        changed_voxels, protected_segment_ids,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -609,6 +616,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         int(payload.metadata_update),
                         payload.undo_of_sequence,
                         changed_voxels,
+                        json.dumps(protected_segment_ids),
                         iso_now(),
                     ),
                 )

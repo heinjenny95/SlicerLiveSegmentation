@@ -34,6 +34,19 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Fixed
 
+- Cross-label voxel claims now respect foreign label locks (L-17). The folder
+  transport captures the protected IDs under the room sequence lock; HTTP
+  captures them in the write transaction and migrates a JSON field in its
+  database. Receivers use this immutable decision and the ordered baseline,
+  not their potentially stale UI lock state: protected voxels are clipped from
+  the incoming stroke while the rest is applied. The sender's optimistic
+  overwrite is corrected too. Folder lock/approval/ownership changes serialize
+  with publication and invalidate a small derivative lock index before writing;
+  warm brush strokes do not scan all label-lock files. Approval clears stale
+  expiry. All participants and the host/server must run the corrected code;
+  older readers cannot enforce this new operation field. No release or protocol
+  version change is made by this development commit.
+
 - Project-backup network copying, hashing, metadata and retention run in a
   dedicated background worker (L-15), not Slicer's GUI thread. The upload is
   checked against the local source checksum before publication. Completion is

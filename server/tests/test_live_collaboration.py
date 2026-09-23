@@ -1811,7 +1811,7 @@ def test_shared_folder_label_owner_can_lock_and_peer_edits_are_rejected(tmp_path
     )["sequence"] == 2
 
 
-def test_realtime_files_do_not_wait_for_segmentation_sequence_lock(tmp_path):
+def test_chat_and_presence_do_not_wait_for_segmentation_sequence_lock(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "alice", lock_timeout_seconds=0.2)
     bob = SharedFolderRoomClient(tmp_path, "bob", lock_timeout_seconds=0.2)
     room = alice.join("independent realtime lanes", "a" * 64)
@@ -1828,11 +1828,13 @@ def test_realtime_files_do_not_wait_for_segmentation_sequence_lock(tmp_path):
     with alice._sequence_lock(alice._room_path):
         bob.send_chat(room["id"], "Still live", "chat-with-busy-edit-lock")
         bob.presence(room["id"], {"active_segment_name": "Organ"})
-        alice.set_segment_lock(room["id"], "Organ", True)
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.5
     assert bob.chat_messages(room["id"], 0)[0]["text"] == "Still live"
+    # Protection decisions must serialize with voxel publication (L-17).
+    # Chat/presence remain independent, but a lock mutation is an edit barrier.
+    alice.set_segment_lock(room["id"], "Organ", True)
     assert alice.segment_locks(room["id"])[0]["locked"] is True
 
 

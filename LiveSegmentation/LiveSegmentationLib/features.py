@@ -370,6 +370,30 @@ def operation_summary(operation, decode_mask_delta=None):
     return result
 
 
+def protect_voxel_claims(operation, changed, values, read_region):
+    """Clip claims using the immutable protection decision of this operation.
+
+    Never consult present-day locks during replay: participants may receive
+    their UI lock refresh at different times, or join after an unlock.
+    """
+    protected = operation.get("protected_segment_ids") or []
+    if not protected:
+        return values, None
+    claimed = np.logical_and(changed, values != 0)
+    blocked = np.zeros(changed.shape, dtype=bool)
+    if np.any(claimed):
+        for segment_id in protected:
+            if segment_id != operation["segment_id"]:
+                region = read_region(segment_id, operation["voxel_bbox"])
+                if region is not None:
+                    blocked |= claimed & (region != 0)
+    if not np.any(blocked):
+        return values, None
+    result = values.copy()
+    result[blocked] = 0
+    return result, blocked
+
+
 def reconstruct_snapshot_operations(
     operations,
     target_sequence,
