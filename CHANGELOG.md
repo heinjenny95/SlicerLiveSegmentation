@@ -8,6 +8,17 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Presence
+
+- Explicitly leaving a shared-folder room now publishes a session-specific
+  departure before optional audit work. The next presence poll removes that
+  collaborator immediately instead of retaining them for the network grace
+  period. A heartbeat already in flight cannot resurrect the closed session;
+  an old departure cannot disconnect a newer session of the same user.
+  The departure report is also carried over LAN and SSH. Missing/partial
+  heartbeats without a confirmed departure still use the existing network
+  grace period. Rejoining starts a fresh presence session.
+
 ### Security
 
 - HTTPS server: a valid token alone no longer gives access to every room

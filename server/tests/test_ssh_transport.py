@@ -264,6 +264,15 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
             assert all("test-password" not in arg for arg in alice._process.args)
         with pytest.raises(LiveCollaborationError, match="Unsupported"):
             alice._rpc("__getattribute__", "password")
+        old_session = alice.presence_session_id
+        alice.leave(room["id"])
+        report = bob.presence_report(room["id"], {})
+        assert {user["user"] for user in report["users"]} == {"bob"}
+        assert report["departed_sessions"][0]["presence_session_id"] == old_session
+        alice.join("encrypted-room", "a" * 64)
+        assert alice.presence_session_id != old_session
+        alice.presence(room["id"], {})
+        assert "alice" in {user["user"] for user in bob.presence_report(room["id"], {})["users"]}
     finally:
         alice.close()
         bob.close()

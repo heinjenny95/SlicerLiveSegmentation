@@ -593,7 +593,12 @@ def run_local_worker():
             method = str(request.get("method", ""))
             if method not in LAN_RELAY_METHODS:
                 raise LiveCollaborationError("Unsupported local SSH request")
-            value = getattr(client, method)(*(request.get("args") or []), **(request.get("kwargs") or {}))
+            # The parent has already composed the wire arguments (including
+            # its session ID for presence/leave). Wrapping them a second time
+            # can replace that ID or pass an extra argument to leave(). Only
+            # preflight needs the SSH-specific report decoration here.
+            call = client.preflight if method == "preflight" else lambda *args, **kwargs: client._rpc(method, *args, **kwargs)
+            value = call(*(request.get("args") or []), **(request.get("kwargs") or {}))
             send({"id": request["id"], "result": value})
         except Exception as exc:
             send({"id": request.get("id"), "error": str(exc)})

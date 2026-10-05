@@ -1079,6 +1079,24 @@ def run_probe():
             if "thomas-smoke" not in controller.presence_by_user:
                 raise RuntimeError("Collaborator presence did not recover")
 
+            # Normal timer polling must notice an explicit departure without a
+            # manual refresh, rejoin, or waiting out the network grace period.
+            peer.leave(controller.room_id)
+            departure_started = time.monotonic()
+            deadline = departure_started + 5.0
+            while time.monotonic() < deadline and "thomas-smoke" in controller.presence_by_user:
+                pump_events(0.05)
+            if "thomas-smoke" in controller.presence_by_user:
+                raise RuntimeError("Explicit departure did not update the live roster")
+            departure_delay = time.monotonic() - departure_started
+            peer.join(room_name, room_metadata["volume_signature"])
+            peer.presence(controller.room_id, {"active_segment_name": "Rejoined session"})
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and "thomas-smoke" not in controller.presence_by_user:
+                pump_events(0.05)
+            if "thomas-smoke" not in controller.presence_by_user:
+                raise RuntimeError("Rejoined collaborator did not recover automatically")
+
             # Slicer's default Segment_1-style IDs are only unique inside one
             # scene. A live room must replace them before publication so two
             # users can create labels concurrently without crossing colors or
@@ -1324,6 +1342,8 @@ def run_probe():
             advanced_features = {
                 "rich_presence": True,
                 "presence_delay_grace_and_recovery": True,
+                "explicit_departure_and_rejoin": True,
+                "departure_detection_seconds": round(departure_delay, 3),
                 "global_label_identity": True,
                 "label_metadata_sync": True,
                 "stale_voxel_metadata_guard": True,

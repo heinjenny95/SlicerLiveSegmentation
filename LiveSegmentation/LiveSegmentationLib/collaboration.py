@@ -1755,6 +1755,7 @@ class SharedFolderRoomClient:
         self._artifact_worker_lock = threading.Lock()
         self._known_presence_users = {self.user_name}
         self._presence_paths_cache = {}
+        self._presence_records_cache = {}
         self._last_presence_directory_scan = 0.0
         self._last_operation_recovery_scan = 0.0
         self._last_chat_recovery_scan = 0.0
@@ -2347,6 +2348,8 @@ class SharedFolderRoomClient:
             if value
         }
         self._presence_paths_cache = {}
+        self._presence_records_cache = {}
+        self.presence_session_id = uuid.uuid4().hex
         self._last_presence_directory_scan = 0.0
         self._last_operation_recovery_scan = 0.0
         self._last_chat_recovery_scan = 0.0
@@ -2886,6 +2889,15 @@ class SharedFolderRoomClient:
         digest = hashlib.sha256(user_name.encode("utf-8")).hexdigest()[:12]
         return room_path / "presence" / f"{readable}--{digest}.json"
 
+    @staticmethod
+    def _presence_departure_path(room_path, user_name, session_id):
+        # Session-specific, immutable markers survive a heartbeat already in
+        # flight at leave time. An old leave cannot close a newer connection.
+        digest = hashlib.sha256(
+            f"{user_name}\0{session_id}".encode()
+        ).hexdigest()[:24]
+        return room_path / "presence" / f"{digest}.left"
+
     def _register_presence_user(self, room_path, user_name):
         """Keep a compact participant index so SMB directory caches cannot hide peers."""
         user_name = str(user_name or "").strip()
@@ -2927,8 +2939,12 @@ class SharedFolderRoomClient:
         )
 
     def _read_presence(self, room_path):
+        return self._read_presence_report(room_path)["users"]
+
+    def _read_presence_report(self, room_path):
         now = time.time()
         users = []
+        departed_sessions = []
         presence_path = room_path / "presence"
         if not presence_path.is_dir():
             raise LiveCollaborationError(
@@ -2955,23 +2971,51 @@ class SharedFolderRoomClient:
                 raise LiveCollaborationError(
                     f"Could not list shared presence: {exc}"
                 ) from exc
+        cached_records = dict(self._presence_records_cache)
+
         def read_user(path):
+            data = None
             try:
-                if not path.is_file():
-                    return None
-                data = _read_json_file(path)
-                if now - float(data.get("last_seen_epoch", 0.0)) <= self.presence_ttl_seconds:
-                    data.pop("last_seen_epoch", None)
-                    return data
+                if path.is_file():
+                    data = _read_json_file(path)
+                    if not isinstance(data, dict):
+                        data = None
             except (LiveCollaborationError, TypeError, ValueError):
                 pass
-            return None
+            candidate = data or cached_records.get(str(path)) or {}
+            user = str(candidate.get("user") or "")
+            session_id = str(candidate.get("presence_session_id") or "")
+            if user and session_id:
+                departure_path = self._presence_departure_path(room_path, user, session_id)
+                try:
+                    departure = (
+                        _read_json_file(departure_path) if departure_path.is_file() else {}
+                    )
+                    if (
+                        isinstance(departure, dict)
+                        and departure.get("left") is True
+                        and departure.get("user") == user
+                        and departure.get("presence_session_id") == session_id
+                    ):
+                        return path, data, None, departure
+                except (LiveCollaborationError, TypeError, ValueError):
+                    pass
+            try:
+                if data and now - float(data.get("last_seen_epoch", 0.0)) <= self.presence_ttl_seconds:
+                    active = dict(data)
+                    active.pop("last_seen_epoch", None)
+                    return path, data, active, None
+            except (TypeError, ValueError):
+                pass
+            return path, data, None, None
 
-        users.extend(
-            item
-            for item in _parallel_map(read_user, paths_by_name.values())
-            if item is not None
-        )
+        for path, record, active, departed in _parallel_map(read_user, paths_by_name.values()):
+            if record:
+                self._presence_records_cache[str(path)] = record
+            if active:
+                users.append(active)
+            if departed:
+                departed_sessions.append(departed)
         for item in users:
             user_name = str(item.get("user") or "").strip()
             if user_name:
@@ -2979,9 +3023,15 @@ class SharedFolderRoomClient:
                 self._presence_paths_cache[user_name] = self._presence_path_for_user(
                     room_path, user_name
                 )
-        return sorted(users, key=lambda item: str(item.get("user", "")).casefold())
+        return {
+            "users": sorted(users, key=lambda item: str(item.get("user", "")).casefold()),
+            "departed_sessions": departed_sessions,
+        }
 
     def presence(self, room_id, details):
+        return self.presence_report(room_id, details)["users"]
+
+    def presence_report(self, room_id, details):
         room_path = self._require_room(room_id)
         data = {
             "user": self.user_name,
@@ -2994,7 +3044,7 @@ class SharedFolderRoomClient:
             **(details or {}),
         }
         _write_presence_json(self._presence_path(room_path), data)
-        return self._read_presence(room_path)
+        return self._read_presence_report(room_path)
 
     def health_check(self, room_id=None):
         room_path = self._require_room(room_id or self._room_id)
@@ -3012,24 +3062,30 @@ class SharedFolderRoomClient:
 
     def leave(self, room_id, presence_session_id=None):
         room_path = self._require_room(room_id)
+        expected_session = str(presence_session_id or self.presence_session_id)
+        # Publish the departure before optional audit work, without taking an
+        # edit lock or deleting a heartbeat a rejoining client may have replaced.
+        _write_json_atomic(
+            self._presence_departure_path(room_path, self.user_name, expected_session),
+            {
+                "user": self.user_name,
+                "presence_session_id": expected_session,
+                "left": True,
+                "left_at": _utc_iso(),
+            },
+            durable=False,
+        )
         try:
             self._append_audit(room_path, "room.leave")
         except Exception:
             pass
-        try:
-            presence_path = self._presence_path(room_path)
-            current = _read_json_file(presence_path) if presence_path.is_file() else {}
-            expected_session = str(presence_session_id or self.presence_session_id)
-            current_session = str(current.get("presence_session_id") or "")
-            # A delayed cleanup from an earlier connection must not delete the
-            # heartbeat written by a newer session of the same user.
-            if not current_session or current_session == expected_session:
-                presence_path.unlink(missing_ok=True)
-        except (OSError, LiveCollaborationError):
-            pass
-        self._room_id = None
-        self._room_path = None
-        self._segment_owners_cache = {}
+        if presence_session_id is None:
+            # A direct client owns this session context. RPC helpers, however,
+            # reuse a per-user client: clearing it for a delayed old leave can
+            # break a newer connection already joined under the same name.
+            self._room_id = None
+            self._room_path = None
+            self._segment_owners_cache = {}
         return {"left": True}
 
     def _latest_message_sequence(self, room_path):
@@ -4254,6 +4310,7 @@ LAN_RELAY_METHODS = {
     "push_operation",
     "operations",
     "presence",
+    "presence_report",
     "health_check",
     "leave",
     "send_chat",
@@ -4416,12 +4473,34 @@ class LanRoomClient:
         if not self.access_code:
             raise ValueError("Enter or import the LAN session code")
 
+    def join(self, *args, **kwargs):
+        self.presence_session_id = uuid.uuid4().hex
+        return self._rpc("join", *args, **kwargs)
+
     def presence(self, room_id, details):
         return self._rpc(
             "presence",
             room_id,
             {**(details or {}), "presence_session_id": self.presence_session_id},
         )
+
+    def presence_report(self, room_id, details):
+        if getattr(self, "_supports_presence_report", True):
+            try:
+                return self._rpc(
+                    "presence_report",
+                    room_id,
+                    {**(details or {}), "presence_session_id": self.presence_session_id},
+                )
+            except LiveCollaborationError as exc:
+                if str(exc) not in {
+                    "Unsupported LAN collaboration request",
+                    "Direct LAN request failed: Unsupported LAN collaboration request",
+                }:
+                    raise
+                self._supports_presence_report = False
+        # An older LAN relay remains usable, but cannot confirm explicit leave.
+        return {"users": self.presence(room_id, details), "departed_sessions": []}
 
     def leave(self, room_id):
         return self._rpc("leave", room_id, self.presence_session_id)
@@ -9717,11 +9796,18 @@ class LiveCollaborationController:
     def _presence_lane(self, session_token, client, room_id, details):
         started = time.monotonic()
         try:
+            report_method = getattr(client, "presence_report", None)
+            report = (
+                report_method(room_id, details)
+                if callable(report_method)
+                else {"users": client.presence(room_id, details)}
+            )
             self._worker_results.put(
                 {
                     "lane": "presence",
                     "session_token": session_token,
-                    "users": client.presence(room_id, details),
+                    "users": report["users"],
+                    "departed_sessions": report.get("departed_sessions") or [],
                     "duration": time.monotonic() - started,
                 }
             )
@@ -10504,7 +10590,9 @@ class LiveCollaborationController:
                     self._incoming_operations.append(operation)
                     self._incoming_received_sequence = sequence
             if result.get("users") is not None:
-                self._update_presence(result["users"])
+                self._update_presence(
+                    result["users"], result.get("departed_sessions") or []
+                )
             if result.get("messages") is not None:
                 self._append_chat_messages(result["messages"])
             if result.get("locks") is not None:
@@ -12080,7 +12168,7 @@ class LiveCollaborationController:
 
         qt.QTimer.singleShot(250, show_latest)
 
-    def _update_presence(self, users):
+    def _update_presence(self, users, departed_sessions=()):
         now = time.monotonic()
         reported = {
             str(entry.get("user")): dict(entry)
@@ -12088,12 +12176,20 @@ class LiveCollaborationController:
             if entry.get("user") and entry.get("user") != self.user_name
         }
         previous = dict(self.presence_by_user)
+        departed = {
+            (str(entry.get("user") or ""), str(entry.get("presence_session_id") or ""))
+            for entry in departed_sessions
+            if entry.get("left") is True and entry.get("presence_session_id")
+        }
         for user, entry in reported.items():
             entry.pop("_presence_delayed", None)
             entry.pop("_presence_delay_seconds", None)
             self._presence_last_observed[user] = now
         for user, entry in previous.items():
             if user in reported:
+                continue
+            if (user, str(entry.get("presence_session_id") or "")) in departed:
+                self._presence_last_observed.pop(user, None)
                 continue
             last_observed = float(self._presence_last_observed.get(user, 0.0))
             delay = now - last_observed if last_observed else float("inf")
