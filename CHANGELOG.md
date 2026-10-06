@@ -32,6 +32,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   HTTP server cannot silently claim to support a universal freeze. All peers
   must use this updated build (mixed folder writers are not supported).
 
+### Interface
+
+- Group the everyday workflow into Data, Room and Label protection. Keep the
+  persistent chat button directly accessible; collapse follow-view, permissions,
+  inline comments, history, backups and diagnostics until needed. Move long
+  setup guidance into tooltips, hide empty preflight/SSH-status areas and put
+  path-history clearing and the renamed Connection speed test in diagnostics.
+
 ### Presence
 
 - Explicitly leaving a shared-folder room now publishes a session-specific

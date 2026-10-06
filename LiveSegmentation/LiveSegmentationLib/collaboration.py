@@ -5193,14 +5193,13 @@ class LiveCollaborationController:
         )
 
         self.group = qt.QGroupBox("Live collaboration")
-        layout = qt.QVBoxLayout(self.group)
-        explanation = qt.QLabel(
-            "Join the same room to see each other's segmentation changes automatically. "
-            "Use a shared/network folder, a trusted local LAN, or a Remote HTTPS server "
-            "for collaborators anywhere on the internet."
-        )
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        root_layout = qt.QVBoxLayout(self.group)
+        self.connection_group = ctk.ctkCollapsibleButton()
+        self.connection_group.text = "2 · Room"
+        self.connection_group.collapsed = False
+        layout = qt.QVBoxLayout(self.connection_group)
+        connection_layout = layout
+        root_layout.addWidget(self.connection_group)
 
         identity_layout = qt.QFormLayout()
         self.user_edit = qt.QLineEdit(default_user)
@@ -5243,8 +5242,8 @@ class LiveCollaborationController:
         )
         self.shared_folder_clear_button.clicked.connect(self.clear_recent_shared_folders)
         shared_folder_layout.addWidget(self.shared_folder_edit, 0, 0, 1, 2)
-        shared_folder_layout.addWidget(self.shared_folder_button, 1, 0)
-        shared_folder_layout.addWidget(self.shared_folder_clear_button, 1, 1)
+        shared_folder_layout.addWidget(self.shared_folder_button, 0, 2)
+        self.shared_folder_clear_button.hide()
         shared_folder_layout.setColumnStretch(0, 1)
         shared_folder_layout.setColumnStretch(1, 1)
         identity_layout.addRow(self.shared_folder_label, self.shared_folder_widget)
@@ -5254,7 +5253,7 @@ class LiveCollaborationController:
         self.join_button.setMinimumHeight(34)
         self.join_button.clicked.connect(self.toggle_connection)
         connection_actions = qt.QGridLayout()
-        connection_actions.addWidget(self.join_button, 0, 0, 1, 2)
+        connection_actions.addWidget(self.join_button, 0, 0)
         self.preflight_button = qt.QPushButton("Check connection")
         self.preflight_button.setToolTip(
             "Test reachability, permissions, protocol, plugin compatibility, source data, "
@@ -5269,14 +5268,14 @@ class LiveCollaborationController:
         )
         self.refresh_button.enabled = False
         self.refresh_button.clicked.connect(self.refresh_now)
-        connection_actions.addWidget(self.refresh_button, 2, 0)
-        self.benchmark_button = qt.QPushButton("Benchmark")
+        connection_actions.addWidget(self.refresh_button, 0, 1)
+        self.benchmark_button = qt.QPushButton("Connection speed test")
         self.benchmark_button.setToolTip(
-            "Measure non-destructive health and live-feed round trips for this room"
+            "Measure health/live-feed read round trips (minimum, median, p95, maximum). "
+            "No edits are made. This is not brush-to-screen synchronization latency."
         )
         self.benchmark_button.enabled = False
         self.benchmark_button.clicked.connect(self.run_connection_benchmark)
-        connection_actions.addWidget(self.benchmark_button, 2, 1)
         connection_actions.setColumnStretch(0, 1)
         connection_actions.setColumnStretch(1, 1)
         layout.addLayout(connection_actions)
@@ -5290,11 +5289,16 @@ class LiveCollaborationController:
         layout.addWidget(self.users_label)
         self.preflight_text = qt.QPlainTextEdit()
         self.preflight_text.setReadOnly(True)
-        self.preflight_text.setMaximumHeight(165)
+        self.preflight_text.setMaximumHeight(100)
         self.preflight_text.setPlaceholderText(
             "Run Check connection on both computers before joining. The check does not create or enter the room."
         )
         layout.addWidget(self.preflight_text)
+        self.preflight_text.hide()
+        self.collaborators_group = ctk.ctkCollapsibleButton()
+        self.collaborators_group.text = "Follow a collaborator"
+        self.collaborators_group.collapsed = True
+        collaborators_layout = qt.QVBoxLayout(self.collaborators_group)
         presence_actions = qt.QGridLayout()
         self.collaborator_combo = qt.QComboBox()
         self.collaborator_combo.setToolTip("Select an online collaborator")
@@ -5313,7 +5317,14 @@ class LiveCollaborationController:
         presence_actions.addWidget(self.open_activity_dock_button, 2, 0, 1, 2)
         presence_actions.setColumnStretch(0, 1)
         presence_actions.setColumnStretch(1, 1)
-        layout.addLayout(presence_actions)
+        collaborators_layout.addLayout(presence_actions)
+        layout.addWidget(self.collaborators_group)
+
+        self.labels_group = ctk.ctkCollapsibleButton()
+        self.labels_group.text = "3 · Label protection"
+        self.labels_group.collapsed = False
+        layout = qt.QVBoxLayout(self.labels_group)
+        root_layout.addWidget(self.labels_group)
 
         label_management_layout = qt.QFormLayout()
         self.label_combo = qt.QComboBox()
@@ -5333,10 +5344,15 @@ class LiveCollaborationController:
         self.lock_button.clicked.connect(self.toggle_selected_segment_lock)
         self.lock_mode_combo = qt.QComboBox()
         self.lock_mode_combo.addItem("Only I can edit", "others")
-        self.lock_mode_combo.addItem("Freeze for everyone (including me)", "all")
+        self.lock_mode_combo.addItem("Freeze (nobody can edit)", "all")
         self.lock_mode_combo.setToolTip("Choose before locking. Only the label owner or room admin can unlock. Everyone must use the same updated build.")
         layout.addWidget(self.lock_mode_combo)
         layout.addWidget(self.lock_button)
+        self.permissions_group = ctk.ctkCollapsibleButton()
+        self.permissions_group.text = "Permissions and review"
+        self.permissions_group.collapsed = True
+        permissions_layout = qt.QVBoxLayout(self.permissions_group)
+        layout.addWidget(self.permissions_group)
         lock_actions = qt.QGridLayout()
         self.lock_expiry_spin = qt.QSpinBox()
         self.lock_expiry_spin.minimum = 0
@@ -5355,7 +5371,7 @@ class LiveCollaborationController:
         lock_actions.addWidget(self.transfer_owner_button, 1, 1)
         lock_actions.setColumnStretch(0, 1)
         lock_actions.setColumnStretch(1, 1)
-        layout.addLayout(lock_actions)
+        permissions_layout.addLayout(lock_actions)
 
         review_actions = qt.QGridLayout()
         self.review_state_combo = qt.QComboBox()
@@ -5377,7 +5393,7 @@ class LiveCollaborationController:
         review_actions.addWidget(self.review_note_edit, 1, 0, 1, 2)
         review_actions.setColumnStretch(0, 1)
         review_actions.setColumnStretch(1, 1)
-        layout.addLayout(review_actions)
+        permissions_layout.addLayout(review_actions)
 
         role_actions = qt.QGridLayout()
         self.role_combo = qt.QComboBox()
@@ -5390,11 +5406,17 @@ class LiveCollaborationController:
         role_actions.addWidget(self.role_combo, 0, 1)
         role_actions.addWidget(self.set_role_button, 1, 0, 1, 2)
         role_actions.setColumnStretch(1, 1)
-        layout.addLayout(role_actions)
+        permissions_layout.addLayout(role_actions)
+
+        self.advanced_group = ctk.ctkCollapsibleButton()
+        self.advanced_group.text = "More tools"
+        self.advanced_group.collapsed = True
+        layout = qt.QVBoxLayout(self.advanced_group)
+        root_layout.addWidget(self.advanced_group)
 
         chat_group = ctk.ctkCollapsibleButton()
-        chat_group.text = "Room chat"
-        chat_group.collapsed = False
+        chat_group.text = "Comments and chat locations"
+        chat_group.collapsed = True
         chat_layout = qt.QVBoxLayout(chat_group)
         self.chat_history = qt.QPlainTextEdit()
         self.chat_history.setReadOnly(True)
@@ -5425,7 +5447,7 @@ class LiveCollaborationController:
         chat_location_layout.addWidget(self.chat_anchor_checkbox, 0, 0, 1, 2)
         chat_location_layout.addWidget(self.chat_location_combo, 1, 0, 1, 2)
         chat_location_layout.addWidget(self.jump_to_chat_button, 2, 0)
-        chat_location_layout.addWidget(self.open_chat_dock_button, 2, 1)
+        root_layout.insertWidget(2, self.open_chat_dock_button)
         chat_location_layout.setColumnStretch(0, 1)
         chat_location_layout.setColumnStretch(1, 1)
         chat_layout.addLayout(chat_location_layout)
@@ -5553,7 +5575,7 @@ class LiveCollaborationController:
 
         history_group = ctk.ctkCollapsibleButton()
         history_group.text = "Live activity, version history, and conflicts"
-        history_group.collapsed = False
+        history_group.collapsed = True
         history_layout = qt.QVBoxLayout(history_group)
         self.history_filter_edit = qt.QLineEdit()
         self.history_filter_edit.setPlaceholderText("Filter live activity by user, label, type, or sequence")
@@ -5630,7 +5652,7 @@ class LiveCollaborationController:
         layout.addWidget(history_group)
 
         project_group = ctk.ctkCollapsibleButton()
-        project_group.text = "Diagnostics, templates, and invitations"
+        project_group.text = "Diagnostics and sharing"
         project_group.collapsed = True
         project_layout = qt.QVBoxLayout(project_group)
         privacy = qt.QLabel(
@@ -5659,6 +5681,9 @@ class LiveCollaborationController:
         diagnostic_buttons.addWidget(self.run_diagnostics_button, 0, 0)
         diagnostic_buttons.addWidget(self.export_diagnostics_button, 0, 1)
         diagnostic_buttons.addWidget(self.export_metrics_button, 1, 0, 1, 2)
+        diagnostic_buttons.addWidget(self.benchmark_button, 2, 0, 1, 2)
+        diagnostic_buttons.addWidget(self.shared_folder_clear_button, 3, 0, 1, 2)
+        self.shared_folder_clear_button.show()
         diagnostic_buttons.setColumnStretch(0, 1)
         diagnostic_buttons.setColumnStretch(1, 1)
         project_layout.addLayout(diagnostic_buttons)
@@ -5739,16 +5764,11 @@ class LiveCollaborationController:
             "Allow insecure HTTP for a trusted local test only"
         )
         self.allow_insecure_http_checkbox.checked = False
-        self.server_security_label = qt.QLabel(
-            "For internet use, enter the same public https:// address and an individual "
-            "access token on every computer. No institutional intranet or shared drive is required."
-        )
-        self.server_security_label.setWordWrap(True)
+        self.server_security_label = qt.QLabel()
+        self.server_edit.setToolTip("Use the same HTTPS URL and your own access token. No shared drive is needed.")
         advanced_layout.addRow("Server URL", self.server_edit)
         advanced_layout.addRow("Access token", self.api_key_edit)
         advanced_layout.addRow(self.allow_insecure_http_checkbox)
-        advanced_layout.addRow(self.server_security_label)
-        layout.addWidget(self.server_settings)
 
         self.lan_settings = ctk.ctkCollapsibleButton()
         self.lan_settings.text = "Direct LAN address and host"
@@ -5784,16 +5804,13 @@ class LiveCollaborationController:
         lan_form.addRow("Host port", self.lan_port_spin)
         lan_form.addRow(self.lan_host_button)
         lan_form.addRow(self.lan_status_label)
-        layout.addWidget(self.lan_settings)
 
         # Connection addresses belong next to the connection selector, not at
         # the bottom of a long module panel. Reinsert both mode-specific panels
         # immediately below the identity form so their URL fields are visible
         # before the Join and Check connection buttons.
-        layout.removeWidget(self.server_settings)
-        layout.removeWidget(self.lan_settings)
-        layout.insertWidget(2, self.server_settings)
-        layout.insertWidget(2, self.lan_settings)
+        connection_layout.insertWidget(1, self.server_settings)
+        connection_layout.insertWidget(1, self.lan_settings)
 
         self.ssh_settings = ctk.ctkCollapsibleButton()
         self.ssh_settings.text = "Linux server login (SSH)"
@@ -5805,15 +5822,16 @@ class LiveCollaborationController:
         self.ssh_password_edit.setPlaceholderText("Session only; leave empty for SSH key/agent")
         self.ssh_python_edit = qt.QLineEdit("python3")
         self.ssh_python_edit.setToolTip("Remote Python 3.10+ executable with NumPy; an absolute path to an existing environment is supported.")
-        self.ssh_info_label = qt.QLabel(
+        self.ssh_info_label = qt.QLabel()
+        self.ssh_settings.setToolTip(
             "Enter host/absolute/folder above. The plugin runs a temporary helper over encrypted SSH; "
             "no Windows share or extra listening port is needed. The remote folder must already exist "
             "and be writable. Full MRB backups are not available in this mode; use Slicer Save to persistent storage."
         )
-        self.ssh_info_label.setWordWrap(True)
         self.ssh_storage_warning = qt.QLabel()
         self.ssh_storage_warning.setWordWrap(True)
         self.ssh_storage_warning.setStyleSheet("color: #b26a00; font-weight: bold;")
+        self.ssh_storage_warning.hide()
         self.ssh_install_button = qt.QPushButton("Install SSH support")
         self.ssh_install_button.clicked.connect(self.install_ssh_support)
         self.ssh_install_status = qt.QLabel()
@@ -5821,11 +5839,11 @@ class LiveCollaborationController:
         ssh_form.addRow("SSH login", self.ssh_user_edit)
         ssh_form.addRow("Password", self.ssh_password_edit)
         ssh_form.addRow("Remote Python", self.ssh_python_edit)
-        ssh_form.addRow(self.ssh_info_label)
         ssh_form.addRow(self.ssh_storage_warning)
         ssh_form.addRow(self.ssh_install_button)
         ssh_form.addRow(self.ssh_install_status)
-        layout.insertWidget(2, self.ssh_settings)
+        self.ssh_install_status.hide()
+        connection_layout.insertWidget(1, self.ssh_settings)
         self.shared_folder_edit.editTextChanged.connect(self._detect_ssh_folder)
         self.server_edit.editingFinished.connect(self._detect_ssh_server_address)
 
@@ -5905,6 +5923,9 @@ class LiveCollaborationController:
         if direct:
             self.lan_settings.collapsed = False
         self.ssh_settings.setVisible(mode == "ssh-folder")
+        if mode == "ssh-folder":
+            import importlib.util
+            self.ssh_install_button.setVisible(importlib.util.find_spec("paramiko") is None)
         self.shared_folder_button.setVisible(mode != "ssh-folder")
         self.shared_folder_edit.lineEdit().setPlaceholderText(
             "e.g. linux-host/dev/shm/team" if mode == "ssh-folder" else r"e.g. P:\LiveSegmentation or \\server\share"
@@ -5928,6 +5949,7 @@ class LiveCollaborationController:
             "Temporary RAM folder: /dev/shm is normally cleared on server restart. Save your results to persistent storage."
             if volatile else ""
         )
+        self.ssh_storage_warning.setVisible(volatile)
 
     def _detect_ssh_server_address(self):
         value = self._text(self.server_edit)
@@ -5945,6 +5967,7 @@ class LiveCollaborationController:
         import qt
         import slicer
 
+        self.ssh_install_status.show()
         if self._ssh_install_process is not None:
             return
         if importlib.util.find_spec("paramiko") is not None:
@@ -7537,6 +7560,7 @@ class LiveCollaborationController:
             if check.get("action"):
                 lines.append(f"       Action: {check['action']}")
         self.preflight_text.setPlainText("\n".join(lines))
+        self.preflight_text.show()
         if status == "pass":
             self.status_label.setText("● Connection check passed — ready to join")
             self.status_label.setStyleSheet("color: #188038; font-weight: bold;")
@@ -8135,6 +8159,7 @@ class LiveCollaborationController:
         self.backup_tree.clear()
         self.diagnostics_text.clear()
         self.preflight_text.clear()
+        self.preflight_text.hide()
         self.quality_text.clear()
         self.performance_label.setText("No live performance samples yet")
         if self.activity_dock_text is not None:
@@ -11492,7 +11517,8 @@ class LiveCollaborationController:
         current_status = self.lock_status_label.text
         current_status = current_status() if callable(current_status) else current_status
         self.lock_status_label.setText(
-            f"{current_status} · review: {review_state.replace('_', ' ')}"
+            str(current_status)
+            + (f" · review: {review_state.replace('_', ' ')}" if review_state != "draft" else "")
             + (f" — {review_note}" if review_note else "")
         )
         for index in range(self.review_state_combo.count):

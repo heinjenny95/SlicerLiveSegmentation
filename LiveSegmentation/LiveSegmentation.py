@@ -63,17 +63,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         super().setup()
         import ctk
 
-        introduction = qt.QLabel(
-            "Choose the source volume and join a room. The room automatically creates "
-            "or selects one shared Segmentation node; nobody has to create a separate "
-            "segmentation first. Drawing is done with Slicer's standard Segment Editor "
-            "or another separately installed tool."
-        )
-        introduction.setWordWrap(True)
-        self.layout.addWidget(introduction)
-
         data_group = ctk.ctkCollapsibleButton()
-        data_group.text = "Slicer data"
+        data_group.text = "1 · Data"
         data_group.collapsed = False
         data_form = qt.QFormLayout(data_group)
 
@@ -94,13 +85,11 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
         data_form.addRow("Source volume", self.source_volume_selector)
         data_form.addRow("Shared segmentation", self.segmentation_selector)
-        segmentation_hint = qt.QLabel(
+        self.segmentation_selector.setToolTip(
             "Leave this empty for a new shared segmentation. To start a new room "
             "from existing work, select that segmentation before joining. Existing "
             "rooms always load their own shared state."
         )
-        segmentation_hint.setWordWrap(True)
-        data_form.addRow(segmentation_hint)
 
         actions = qt.QHBoxLayout()
         self.open_segment_editor_button = qt.QPushButton("Open Segment Editor")
