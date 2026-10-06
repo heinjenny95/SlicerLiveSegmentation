@@ -37,6 +37,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   somebody else's label. Explicit ownership transfer hands over this edit
   privilege; old locks without a holder retain their original owner semantics.
 
+- Extend the native Slicer collaboration smoke test with both lock modes and
+  restoration of an attempted owner edit on a universally frozen label.
+  Keep mode and holder when ingesting polled locks into the controller, so
+  the native editor does not silently treat a received freeze as owner-editable.
+
 ### Interface
 
 - Group the everyday workflow into Data, Room and Label protection. Keep the

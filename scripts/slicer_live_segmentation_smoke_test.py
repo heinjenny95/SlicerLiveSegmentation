@@ -992,6 +992,39 @@ def run_probe():
             if (controller.segment_locks_state.get(segment_id) or {}).get("locked"):
                 raise RuntimeError("Controller did not unlock the selected label")
 
+            wait_for_settled_edits(controller)
+            frozen_before = widget.segment_mask_in_reference_geometry(segmentation, segment_id, volume, image.shape)
+            controller.lock_mode_combo.setCurrentIndex(1)
+            controller.toggle_selected_segment_lock()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                pump_events(0.10)
+                state = controller.segment_locks_state.get(segment_id) or {}
+                if state.get("locked") and state.get("lock_mode") == "all" and segment_id not in controller.pending_lock_changes:
+                    break
+            if not controller._locked_by_other(segment_id):
+                raise RuntimeError(f"Universal freeze did not block its own locker: state={state}, pending={controller.pending_lock_changes}, selected={controller._selected_segment_id()}, mode={controller._combo_current_data(controller.lock_mode_combo)}, errors={controller._last_error}")
+            frozen_edit = frozen_before.astype(np.uint8)
+            frozen_edit[0, 0, 0] = 1 - frozen_edit[0, 0, 0]
+            slicer.util.updateSegmentBinaryLabelmapFromArray(frozen_edit, segmentation, segment_id, volume)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                pump_events(0.10)
+                restored = widget.segment_mask_in_reference_geometry(segmentation, segment_id, volume, image.shape)
+                if np.array_equal(restored, frozen_before):
+                    break
+            if not np.array_equal(restored, frozen_before):
+                raise RuntimeError("A native owner edit changed a universally frozen label")
+            controller.toggle_selected_segment_lock()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                pump_events(0.10)
+                if not (controller.segment_locks_state.get(segment_id) or {}).get("locked") and segment_id not in controller.pending_lock_changes:
+                    break
+            if controller._locked_by_other(segment_id):
+                raise RuntimeError("Universal freeze did not unlock")
+            controller.lock_mode_combo.setCurrentIndex(0)
+
             controller.refresh_now()
             deadline = time.time() + 8
             while time.time() < deadline:
@@ -1008,6 +1041,7 @@ def run_probe():
                 "chat_optimistic": True,
                 "own_activity_visible": True,
                 "lock_round_trip": True,
+                "universal_freeze_restores_native_owner_edit": True,
                 "explicit_label_selector": True,
                 "backup_settings_editable": True,
                 "manual_refresh": True,
@@ -1834,6 +1868,17 @@ def run_probe():
             if not wait_until(lambda: controller._comparison_node_id is not None):
                 raise RuntimeError("Revision comparison overlay was not created")
 
+            # Earlier probes may have ended with metadata-only updates whose
+            # inverse is intentionally a no-op. Seed a real, fresh voxel edit.
+            undo_before = widget.segment_mask_in_reference_geometry(
+                segmentation, segment_id, volume, image.shape
+            ).astype(np.uint8)
+            undo_edit = undo_before.copy()
+            undo_edit[0, 0, 0] = 1 - undo_edit[0, 0, 0]
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                undo_edit, segmentation, segment_id, volume
+            )
+            wait_for_settled_edits(controller)
             sequence_before_undo = controller.last_sequence
             controller.undo_last_shared_edit()
             if not wait_until(

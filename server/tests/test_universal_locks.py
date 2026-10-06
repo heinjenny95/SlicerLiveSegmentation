@@ -60,6 +60,21 @@ def test_controller_universal_lock_blocks_owner_and_pending_freeze(monkeypatch):
     assert controller._locked_by_other("A")
 
 
+@pytest.mark.parametrize("mode,blocked", [("others", True), ("all", True)])
+def test_received_lock_keeps_mode_and_actual_holder(monkeypatch, mode, blocked):
+    scene, _ = install_fake_slicer(monkeypatch)
+    controller = Peer("alice", scene).controller
+    controller._update_segment_locks([{
+        "segment_id": "A", "owner": "alice", "locked": True,
+        "lock_mode": mode, "lock_holder": "admin",
+    }])
+    assert controller.segment_locks_state["A"]["lock_mode"] == mode
+    assert controller.segment_locks_state["A"]["lock_holder"] == "admin"
+    assert controller._locked_by_other("A") == blocked
+    controller.user_name = "admin"
+    assert controller._locked_by_other("A") == (mode == "all")
+
+
 def test_http_client_refuses_silent_universal_downgrade():
     client = c.LiveRoomClient.__new__(c.LiveRoomClient)
     client._request = lambda *args: {"locked": True, "owner": "alice"}

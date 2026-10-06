@@ -11459,6 +11459,8 @@ class LiveCollaborationController:
             states[segment_id] = {
                 "owner": owner,
                 "locked": bool(state.get("locked", False)),
+                "lock_mode": state.get("lock_mode", "others"),
+                "lock_holder": state.get("lock_holder") or owner,
                 "updated_at": state.get("updated_at"),
                 "updated_by": state.get("updated_by"),
                 "expires_at": state.get("expires_at"),
