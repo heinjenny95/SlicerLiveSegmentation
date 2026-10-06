@@ -40,6 +40,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   setup guidance into tooltips, hide empty preflight/SSH-status areas and put
   path-history clearing and the renamed Connection speed test in diagnostics.
 
+- Keep the connection speed test result visible instead of immediately
+  overwriting it with the previous diagnostics report (L-44). A separate
+  readable summary shows median health/feed response times, errors and the
+  distinction from end-to-end edit latency; detailed statistics stay available.
+
 ### Presence
 
 - Explicitly leaving a shared-folder room now publishes a session-specific

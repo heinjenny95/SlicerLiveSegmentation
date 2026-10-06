@@ -5671,6 +5671,9 @@ class LiveCollaborationController:
         self.performance_label = qt.QLabel("No live performance samples yet")
         self.performance_label.setWordWrap(True)
         project_layout.addWidget(self.performance_label)
+        self.benchmark_result_label = qt.QLabel("Speed test: read round trips, not end-to-end edit latency.")
+        self.benchmark_result_label.setWordWrap(True)
+        project_layout.addWidget(self.benchmark_result_label)
         diagnostic_buttons = qt.QGridLayout()
         self.run_diagnostics_button = qt.QPushButton("Run diagnostics")
         self.run_diagnostics_button.clicked.connect(self.run_room_diagnostics)
@@ -6268,6 +6271,7 @@ class LiveCollaborationController:
             return
         self.benchmark_button.enabled = False
         self.performance_label.setText("Running non-destructive connection benchmark…")
+        self.benchmark_result_label.setText("Testing connection response times…")
         self._queue_action("benchmark", after_sequence=int(self.last_sequence))
 
     def export_session_metrics(self, checked=False):
@@ -11091,6 +11095,7 @@ class LiveCollaborationController:
                     self.undo_shared_button.enabled = True
                 elif action == "benchmark":
                     self.benchmark_button.enabled = True
+                    self.benchmark_result_label.setText("Speed test failed; see connection error.")
                 self._show_error(
                     f"{str(action or 'Collaboration action').replace('_', ' ')} failed: "
                     f"{result['error']}"
@@ -11206,8 +11211,13 @@ class LiveCollaborationController:
                 self.diagnostics_text.setPlainText(
                     json.dumps(self.last_benchmark, ensure_ascii=False, indent=2)
                 )
-                self.diagnostics_text.setPlainText(
-                    json.dumps(self.last_diagnostics, ensure_ascii=False, indent=2)
+                health = (self.last_benchmark.get("health") or {}).get("median_ms", "unavailable")
+                feed = (self.last_benchmark.get("live_feed") or {}).get("median_ms", "unavailable")
+                self.benchmark_result_label.setText(
+                    f"{self.last_benchmark.get('rating', 'unknown').title()} · "
+                    f"median: health {health} ms / feed {feed} ms · "
+                    f"errors: {self.last_benchmark.get('error_count', 0)}. "
+                    "Read round trips, not end-to-end edit latency."
                 )
             elif action == "set_template":
                 self.material_template_state = value
