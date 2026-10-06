@@ -14,6 +14,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   Joining remains asynchronous and cancellable; SSH retains its 45-second
   setup allowance. This does not change the established-session watchdog.
 
+### Chat
+
+- Publish a bounded, immutable, sequence-addressed chat fast feed. Receivers
+  open the next message directly, without a preliminary existence check,
+  hot-cache refresh or directory scan. Legacy permanent chat remains readable
+  and retries remain idempotent. This reduces cache-induced NAS delays but
+  does not guarantee a latency bound on an unresponsive network share.
+
 ### Presence
 
 - Explicitly leaving a shared-folder room now publishes a session-specific

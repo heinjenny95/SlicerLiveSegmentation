@@ -3160,6 +3160,11 @@ class SharedFolderRoomClient:
             recent_messages.append({"sequence": sequence, "file": destination.name})
             recent_messages = recent_messages[-RECENT_FEED_LIMIT:]
             _write_json_atomic(destination, message, durable=False)
+            # Exact immutable names can be opened without waiting for SMB's
+            # cached directory listing or mutable chat-state generation.
+            live_path = room_path / "chat-live"
+            live_path.mkdir(exist_ok=True)
+            _write_json_atomic(live_path / f"{sequence:020d}.json", message, durable=False)
             _write_json_atomic(
                 message_index_path,
                 {"sequence": sequence, "file": destination.name},
@@ -3184,6 +3189,25 @@ class SharedFolderRoomClient:
     def chat_messages(self, room_id, after_sequence, limit=500):
         room_path = self._require_room(room_id)
         after_sequence = int(after_sequence)
+        fast_messages = []
+        for sequence in range(after_sequence + 1, after_sequence + 1 + max(1, min(int(limit), 64))):
+            try:
+                # Do not precede open with is_file(): a stale negative stat
+                # cache can hide the very message we are trying to discover.
+                with (room_path / "chat-live" / f"{sequence:020d}.json").open(
+                    "r", encoding="utf-8"
+                ) as stream:
+                    message = json.load(stream)
+                if not isinstance(message, dict) or int(message.get("sequence", 0)) != sequence:
+                    break
+                fast_messages.append(message)
+            except (FileNotFoundError, json.JSONDecodeError, ValueError):
+                break  # Legacy message / unpublished slot: use the old feed.
+            except OSError as exc:
+                raise LiveCollaborationError(f"Could not read shared chat: {exc}") from exc
+        if fast_messages:
+            self._known_presence_users.update(str(item.get("author") or "") for item in fast_messages)
+            return fast_messages
         selected = []
         chat_path = room_path / "chat"
         if not chat_path.is_dir():

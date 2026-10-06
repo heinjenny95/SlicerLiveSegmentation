@@ -1554,6 +1554,8 @@ def test_stale_chat_cache_recovery_scan_is_throttled(tmp_path):
     assert alice.chat_messages(room["id"], 0) == []
 
     bob.send_chat(room["id"], "hello", "recovery-chat")
+    # Exercise the backward-compatible recovery path for pre-fast-feed rooms.
+    (alice._room_path / "chat-live" / "00000000000000000001.json").unlink()
     collaboration_module._write_json_atomic(
         alice._room_path / "chat-state.json",
         {"latest_sequence": 0, "recent_messages": []},
