@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Connection
+
+- Allow 30 seconds (instead of 15) to join shared-folder, LAN and HTTPS rooms.
+  Joining remains asynchronous and cancellable; SSH retains its 45-second
+  setup allowance. This does not change the established-session watchdog.
+
 ### Presence
 
 - Explicitly leaving a shared-folder room now publishes a session-specific

@@ -393,7 +393,7 @@ def test_live_catch_up_batch_is_bounded_for_gui_responsiveness():
 
 
 def test_shared_folder_watchdogs_allow_institutional_smb_latency():
-    assert collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS == 15.0
+    assert collaboration_module.SHARED_FOLDER_JOIN_TIMEOUT_SECONDS == 30.0
     assert collaboration_module.SHARED_FOLDER_SLOW_RESPONSE_SECONDS == 10.0
     assert collaboration_module.SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS == 30.0
 

@@ -97,7 +97,7 @@ SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 # authentication, or Windows redirector reconnect.  Both deadlines are hard
 # watchdogs around background work, so increasing them never blocks Slicer's
 # GUI thread.
-SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 15.0
+SHARED_FOLDER_JOIN_TIMEOUT_SECONDS = 30.0
 SHARED_FOLDER_SLOW_RESPONSE_SECONDS = 10.0
 SHARED_FOLDER_RESPONSE_TIMEOUT_SECONDS = 30.0
 RECENT_SHARED_FOLDER_LIMIT = 8
