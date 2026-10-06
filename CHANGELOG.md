@@ -22,6 +22,16 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   and retries remain idempotent. This reduces cache-induced NAS delays but
   does not guarantee a latency bound on an unresponsive network share.
 
+### Label protection
+
+- Add owner-editable locks and universal freezes, including the owner's own
+  edits, deletion and metadata changes. Frozen sibling voxels also resist
+  cross-label overwrite. Folder/SSH/LAN and HTTP use the same semantics; the
+  HTTP database migrates old locks to owner-editable mode. A pending local
+  freeze already guards the owner's edits. Unknown modes fail closed; an old
+  HTTP server cannot silently claim to support a universal freeze. All peers
+  must use this updated build (mixed folder writers are not supported).
+
 ### Presence
 
 - Explicitly leaving a shared-folder room now publishes a session-specific

@@ -392,6 +392,19 @@ class LiveCollaborationError(RuntimeError):
     """A user-facing live-room transport or validation error."""
 
 
+def _lock_blocks_user(state, user):
+    """Missing mode keeps legacy owner-editable behavior; unknown modes fail closed."""
+    return bool(state.get("locked")) and (
+        state.get("lock_mode", "others") != "others" or state.get("owner") != user
+    )
+
+
+def _validate_lock_mode(mode):
+    if mode not in {"others", "all"}:
+        raise LiveCollaborationError("Unsupported label lock mode")
+    return mode
+
+
 def normalize_server_url(value):
     """Return a normalized HTTP(S) server root or raise a clear error."""
     value = str(value or "").strip().rstrip("/")
@@ -1459,13 +1472,17 @@ class LiveRoomClient:
     def segment_locks(self, room_id):
         return self._request("GET", f"/api/live/rooms/{room_id}/locks")
 
-    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0):
+    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0, lock_mode="others"):
         encoded_segment_id = urllib.parse.quote(str(segment_id), safe="")
-        return self._request(
+        lock_mode = _validate_lock_mode(lock_mode)
+        result = self._request(
             "PUT",
             f"/api/live/rooms/{room_id}/locks/{encoded_segment_id}",
-            {"locked": bool(locked), "expires_minutes": int(expires_minutes or 0)},
+            {"locked": bool(locked), "expires_minutes": int(expires_minutes or 0), "lock_mode": lock_mode},
         )
+        if locked and lock_mode == "all" and result.get("lock_mode") != "all":
+            raise LiveCollaborationError("Server does not support universal freezes; upgrade the server. The label may only be locked for others.")
+        return result
 
     def room_history(self, room_id, limit=500):
         operations = []
@@ -2502,7 +2519,7 @@ class SharedFolderRoomClient:
                 active_lock = bool(lock_state.get("locked")) and not (
                     expires_epoch and time.time() >= expires_epoch
                 )
-                if active_lock and lock_state.get("owner") != self.user_name:
+                if active_lock and _lock_blocks_user(lock_state, self.user_name):
                     raise LiveCollaborationError(
                         f"Label is locked by {lock_state.get('owner') or 'another user'}"
                     )
@@ -3447,6 +3464,7 @@ class SharedFolderRoomClient:
                 "segment_id": segment_id,
                 "owner": str(lock_data.get("owner") or owner),
                 "locked": locked,
+                **({"lock_mode": lock_data["lock_mode"]} if "lock_mode" in lock_data else {}),
                 "updated_at": lock_data.get("updated_at"),
                 **(
                     {"updated_by": lock_data.get("updated_by")}
@@ -3482,7 +3500,7 @@ class SharedFolderRoomClient:
         now = time.time()
         return sorted({
             str(record["segment_id"]) for record in records
-            if record.get("locked") and record.get("owner") != self.user_name
+            if _lock_blocks_user(record, self.user_name)
             and not (float(record.get("expires_epoch") or 0)
                      and now >= float(record["expires_epoch"]))
         })
@@ -3495,11 +3513,12 @@ class SharedFolderRoomClient:
             (room_path / "lock-protection-index.json").unlink(missing_ok=True)
             yield room_path
 
-    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0):
+    def set_segment_lock(self, room_id, segment_id, locked, expires_minutes=0, lock_mode="others"):
+        lock_mode = _validate_lock_mode(lock_mode)
         with self._lock_mutation(room_id) as room_path:
-            return self._set_segment_lock(room_path, segment_id, locked, expires_minutes)
+            return self._set_segment_lock(room_path, segment_id, locked, expires_minutes, lock_mode)
 
-    def _set_segment_lock(self, room_path, segment_id, locked, expires_minutes):
+    def _set_segment_lock(self, room_path, segment_id, locked, expires_minutes, lock_mode="others"):
         segment_id = str(segment_id or "").strip()
         if not segment_id:
             raise LiveCollaborationError("Select a label first")
@@ -3528,6 +3547,7 @@ class SharedFolderRoomClient:
             "segment_id": segment_id,
             "owner": owner,
             "locked": bool(locked),
+            "lock_mode": lock_mode,
             "updated_by": self.user_name,
             "updated_at": _utc_iso(),
             "expires_epoch": expires_epoch,
@@ -3546,6 +3566,7 @@ class SharedFolderRoomClient:
             {
                 "segment_id": segment_id,
                 "locked": bool(locked),
+                "lock_mode": lock_mode,
                 "expires_at": state.get("expires_at"),
             },
         )
@@ -5310,6 +5331,11 @@ class LiveCollaborationController:
         self.lock_button = qt.QPushButton("Lock selected label")
         self.lock_button.enabled = False
         self.lock_button.clicked.connect(self.toggle_selected_segment_lock)
+        self.lock_mode_combo = qt.QComboBox()
+        self.lock_mode_combo.addItem("Only I can edit", "others")
+        self.lock_mode_combo.addItem("Freeze for everyone (including me)", "all")
+        self.lock_mode_combo.setToolTip("Choose before locking. Only the label owner or room admin can unlock. Everyone must use the same updated build.")
+        layout.addWidget(self.lock_mode_combo)
         layout.addWidget(self.lock_button)
         lock_actions = qt.QGridLayout()
         self.lock_expiry_spin = qt.QSpinBox()
@@ -6639,6 +6665,7 @@ class LiveCollaborationController:
         self.pending_lock_changes[segment_id] = {
             "locked": not current,
             "expires_minutes": int(expiry),
+            "lock_mode": str(self._combo_current_data(self.lock_mode_combo) or "others"),
         }
         self._update_lock_controls()
         self._force_realtime_refresh = True
@@ -8868,7 +8895,10 @@ class LiveCollaborationController:
 
     def _locked_by_other(self, segment_id):
         state = self.segment_locks_state.get(segment_id) or {}
-        return bool(state.get("locked")) and state.get("owner") != self.user_name
+        pending = self.pending_lock_changes.get(segment_id)
+        if isinstance(pending, dict) and pending.get("locked") and pending.get("lock_mode") == "all":
+            return True
+        return _lock_blocks_user(state, self.user_name)
 
     def _current_role(self):
         return str(self.room_roles_state.get(self.user_name) or "editor")
@@ -8886,6 +8916,7 @@ class LiveCollaborationController:
                 "LiveSegmentation.LockedBy",
                 str(owner) if state.get("locked") else "",
             )
+            segment.SetTag("LiveSegmentation.LockMode", str(state.get("lock_mode", "others")) if state.get("locked") else "")
         except Exception:
             pass
 
@@ -9859,12 +9890,13 @@ class LiveCollaborationController:
                         int(change.get("expires_minutes", 0))
                         if isinstance(change, dict)
                         else 0,
+                        str(change.get("lock_mode", "others")) if isinstance(change, dict) else "others",
                     )
                     completed.append(segment_id)
                 except Exception as exc:
                     message = str(exc)
                     if not any(
-                        marker in message for marker in ("Only ", "must synchronize once")
+                        marker in message for marker in ("Only ", "must synchronize once", "lock mode", "upgrade the server")
                     ):
                         raise
                     completed.append(segment_id)
@@ -11424,7 +11456,8 @@ class LiveCollaborationController:
         if locked:
             expiry = state.get("expires_at")
             suffix = f" until {str(expiry)[:16]}" if expiry else ""
-            self.lock_status_label.setText(f"{segment_name}: locked by {owner}{suffix}")
+            protection = "frozen for everyone" if state.get("lock_mode") == "all" else f"only {owner} can edit"
+            self.lock_status_label.setText(f"{segment_name}: {protection}{suffix}")
         else:
             self.lock_status_label.setText(f"{segment_name}: unlocked · created by {owner}")
         pending_requests = [
@@ -11444,6 +11477,10 @@ class LiveCollaborationController:
             )
         role = self._current_role()
         can_manage = owner == self.user_name or role == "admin"
+        if hasattr(self, "lock_mode_combo"):
+            self.lock_mode_combo.enabled = can_manage and not locked
+            if locked:
+                self.lock_mode_combo.setCurrentIndex(1 if state.get("lock_mode") == "all" else 0)
         self.lock_button.enabled = can_manage
         self.request_access_button.enabled = locked and owner != self.user_name
         self.transfer_owner_button.enabled = can_manage and bool(self.presence_by_user)

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS live_segment_locks (
     segment_id TEXT NOT NULL,
     owner TEXT NOT NULL,
     locked INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0, 1)),
+    lock_mode TEXT NOT NULL DEFAULT 'others',
     expires_at TEXT,
     expires_epoch REAL NOT NULL DEFAULT 0,
     updated_by TEXT NOT NULL,
@@ -192,6 +193,7 @@ class Database:
             self._ensure_column(connection, "live_chat_messages", "anchor", "TEXT")
             self._ensure_column(connection, "live_segment_locks", "expires_at", "TEXT")
             self._ensure_column(connection, "live_segment_locks", "expires_epoch", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "live_segment_locks", "lock_mode", "TEXT NOT NULL DEFAULT 'others'")
 
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:

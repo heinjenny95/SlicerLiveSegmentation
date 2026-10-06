@@ -116,6 +116,7 @@ class LiveChatMessageCreate(BaseModel):
 class LiveSegmentLockUpdate(BaseModel):
     locked: bool
     expires_minutes: int = Field(default=0, ge=0, le=1440)
+    lock_mode: Literal["others", "all"] = "others"
 
 
 class LiveRoleUpdate(BaseModel):

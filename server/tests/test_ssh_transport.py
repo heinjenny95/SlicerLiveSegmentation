@@ -253,6 +253,12 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
         assert alice.push_operation(room["id"], operation)["sequence"] == pushed["sequence"]
         alice.send_chat(room["id"], "hello over SSH", "chat-1")
         assert bob.chat_messages(room["id"], 0)[-1]["text"] == "hello over SSH"
+        frozen = alice.set_segment_lock(room["id"], "LiveSeg-test", True, 0, "all")
+        assert frozen["lock_mode"] == "all"
+        with pytest.raises(LiveCollaborationError, match="locked"):
+            alice.push_operation(room["id"], dict(operation, client_operation_id="frozen-owner-edit"))
+        assert bob.segment_locks(room["id"])[0]["lock_mode"] == "all"
+        alice.set_segment_lock(room["id"], "LiveSeg-test", False)
         alice.presence(room["id"], {"active_segment": "LiveSeg-test"})
         assert any(item["user"] == "alice" for item in bob.presence(room["id"], {}))
         assert bob.room_history(room["id"])
