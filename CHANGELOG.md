@@ -32,6 +32,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   HTTP server cannot silently claim to support a universal freeze. All peers
   must use this updated build (mixed folder writers are not supported).
 
+- Track the lock holder separately from label ownership: an owner-editable
+  lock grants editing to the person who set it, even when a room admin locks
+  somebody else's label. Explicit ownership transfer hands over this edit
+  privilege; old locks without a holder retain their original owner semantics.
+
 ### Interface
 
 - Group the everyday workflow into Data, Room and Label protection. Keep the

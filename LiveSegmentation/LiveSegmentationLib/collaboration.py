@@ -395,7 +395,8 @@ class LiveCollaborationError(RuntimeError):
 def _lock_blocks_user(state, user):
     """Missing mode keeps legacy owner-editable behavior; unknown modes fail closed."""
     return bool(state.get("locked")) and (
-        state.get("lock_mode", "others") != "others" or state.get("owner") != user
+        state.get("lock_mode", "others") != "others"
+        or (state.get("lock_holder") or state.get("owner")) != user
     )
 
 
@@ -2521,7 +2522,7 @@ class SharedFolderRoomClient:
                 )
                 if active_lock and _lock_blocks_user(lock_state, self.user_name):
                     raise LiveCollaborationError(
-                        f"Label is locked by {lock_state.get('owner') or 'another user'}"
+                        f"Label is locked by {lock_state.get('lock_holder') or lock_state.get('owner') or 'another user'}"
                     )
             base_sequence = int(operation.get("base_sequence", 0) or 0)
             try:
@@ -3465,6 +3466,7 @@ class SharedFolderRoomClient:
                 "owner": str(lock_data.get("owner") or owner),
                 "locked": locked,
                 **({"lock_mode": lock_data["lock_mode"]} if "lock_mode" in lock_data else {}),
+                **({"lock_holder": lock_data["lock_holder"]} if "lock_holder" in lock_data else {}),
                 "updated_at": lock_data.get("updated_at"),
                 **(
                     {"updated_by": lock_data.get("updated_by")}
@@ -3548,6 +3550,7 @@ class SharedFolderRoomClient:
             "owner": owner,
             "locked": bool(locked),
             "lock_mode": lock_mode,
+            "lock_holder": self.user_name if locked else "",
             "updated_by": self.user_name,
             "updated_at": _utc_iso(),
             "expires_epoch": expires_epoch,
@@ -3778,6 +3781,7 @@ class SharedFolderRoomClient:
                 "segment_id": str(segment_id),
                 "owner": target_user,
                 "locked": bool(state.get("locked", False)),
+                "lock_holder": target_user if state.get("locked") else "",
                 "updated_by": self.user_name,
                 "updated_at": _utc_iso(),
             }
@@ -8943,7 +8947,7 @@ class LiveCollaborationController:
             segment.SetTag("LiveSegmentation.Owner", str(owner))
             segment.SetTag(
                 "LiveSegmentation.LockedBy",
-                str(owner) if state.get("locked") else "",
+                str(state.get("lock_holder") or owner) if state.get("locked") else "",
             )
             segment.SetTag("LiveSegmentation.LockMode", str(state.get("lock_mode", "others")) if state.get("locked") else "")
         except Exception:
@@ -11491,7 +11495,8 @@ class LiveCollaborationController:
         if locked:
             expiry = state.get("expires_at")
             suffix = f" until {str(expiry)[:16]}" if expiry else ""
-            protection = "frozen for everyone" if state.get("lock_mode") == "all" else f"only {owner} can edit"
+            holder = state.get("lock_holder") or owner
+            protection = "frozen for everyone" if state.get("lock_mode") == "all" else f"only {holder} can edit"
             self.lock_status_label.setText(f"{segment_name}: {protection}{suffix}")
         else:
             self.lock_status_label.setText(f"{segment_name}: unlocked · created by {owner}")

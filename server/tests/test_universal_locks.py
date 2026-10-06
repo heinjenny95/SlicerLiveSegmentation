@@ -111,3 +111,33 @@ def test_database_migrates_existing_locks_without_changing_them(tmp_path):
     with database.connect() as connection:
         state = dict(connection.execute("SELECT * FROM live_segment_locks").fetchone())
     assert (state["owner"], state["locked"], state["lock_mode"]) == ("alice", 1, "others")
+
+
+def test_admin_owner_editable_lock_belongs_to_the_person_who_locked(tmp_path):
+    admin, creator = [c.SharedFolderRoomClient(tmp_path, name) for name in ("admin", "creator")]
+    room = admin.join("holder", "a" * 64)["id"]
+    creator.join("holder", "a" * 64)
+    creator.push_operation(room, operation("A", "seed"))
+    creator._artifact_queue.join()
+    state = admin.set_segment_lock(room, "A", True, lock_mode="others")
+    assert not c._lock_blocks_user(state, "admin")
+    assert c._lock_blocks_user(state, "creator")
+    admin.push_operation(room, operation("A", "holder-edit"))
+    with pytest.raises(c.LiveCollaborationError, match="locked"):
+        creator.push_operation(room, operation("A", "not-holder"))
+    admin.transfer_segment_owner(room, "A", "creator")
+    creator.push_operation(room, operation("A", "transferred"))
+
+
+def test_http_owner_editable_lock_uses_locker_not_label_creator(client, headers):
+    room = client.post("/api/live/rooms/join", headers=headers,
+                       json={"room_name": "holder", "volume_signature": "a" * 64}).json()["id"]
+    creator = {"X-LiveSeg-User": "creator"}
+    client.post("/api/live/rooms/join", headers=creator,
+                json={"room_name": "holder", "volume_signature": "a" * 64})
+    base = f"/api/live/rooms/{room}"
+    client.post(base + "/operations", headers=creator, json=operation("A", "seed"))
+    state = client.put(base + "/locks/A", headers=headers, json={"locked": True}).json()
+    assert state["lock_holder"] == "alice"
+    assert client.post(base + "/operations", headers=headers, json=operation("A", "holder")).status_code == 201
+    assert client.post(base + "/operations", headers=creator, json=operation("A", "not-holder")).status_code == 423

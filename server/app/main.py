@@ -519,7 +519,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 lock_state = connection.execute(
                     """
-                    SELECT owner, locked, lock_mode, expires_epoch FROM live_segment_locks
+                    SELECT owner, locked, lock_mode, lock_holder, expires_epoch FROM live_segment_locks
                     WHERE room_id = ? AND segment_id = ?
                     """,
                     (room_id, payload.segment_id),
@@ -533,14 +533,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         >= float(lock_state["expires_epoch"])
                     )
                 )
-                if active_lock and (lock_state["lock_mode"] != "others" or lock_state["owner"] != user):
+                if active_lock and (lock_state["lock_mode"] != "others" or (lock_state["lock_holder"] or lock_state["owner"]) != user):
                     raise HTTPException(
                         status_code=423,
-                        detail=f"Label is locked by {lock_state['owner']}",
+                        detail=f"Label is locked by {lock_state['lock_holder'] or lock_state['owner']}",
                     )
                 protected_segment_ids = [row["segment_id"] for row in connection.execute(
                     "SELECT segment_id FROM live_segment_locks "
-                    "WHERE room_id = ? AND locked = 1 AND (lock_mode != 'others' OR owner != ?) "
+                    "WHERE room_id = ? AND locked = 1 AND (lock_mode != 'others' OR COALESCE(NULLIF(lock_holder,''),owner) != ?) "
                     "AND (expires_epoch = 0 OR expires_epoch > ?) ORDER BY segment_id",
                     (room_id, user, time.time()),
                 )]
@@ -811,7 +811,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Live room not found")
             rows = connection.execute(
                 """
-                SELECT segment_id, owner, locked, lock_mode, expires_at, expires_epoch,
+                SELECT segment_id, owner, locked, lock_mode, lock_holder, expires_at, expires_epoch,
                        updated_by, updated_at
                 FROM live_segment_locks
                 WHERE room_id = ?
@@ -870,13 +870,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             connection.execute(
                 """
                 UPDATE live_segment_locks
-                SET locked = ?, lock_mode = ?, expires_at = ?, expires_epoch = ?,
+                SET locked = ?, lock_mode = ?, lock_holder = ?, expires_at = ?, expires_epoch = ?,
                     updated_by = ?, updated_at = ?
                 WHERE room_id = ? AND segment_id = ?
                 """,
                 (
                     int(payload.locked),
                     payload.lock_mode,
+                    user if payload.locked else "",
                     expires_at,
                     expires_epoch,
                     user,
@@ -887,7 +888,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             updated = connection.execute(
                 """
-                SELECT segment_id, owner, locked, lock_mode, expires_at, expires_epoch,
+                SELECT segment_id, owner, locked, lock_mode, lock_holder, expires_at, expires_epoch,
                        updated_by, updated_at
                 FROM live_segment_locks
                 WHERE room_id = ? AND segment_id = ?
@@ -1092,10 +1093,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=403, detail="Owner or administrator required")
             connection.execute(
                 """
-                UPDATE live_segment_locks SET owner = ?, updated_by = ?, updated_at = ?
+                UPDATE live_segment_locks SET owner = ?, lock_holder = ?, updated_by = ?, updated_at = ?
                 WHERE room_id = ? AND segment_id = ?
                 """,
-                (payload.target_user, user, iso_now(), room_id, segment_id),
+                (payload.target_user, payload.target_user if lock["locked"] else "", user, iso_now(), room_id, segment_id),
             )
             connection.execute(
                 """
