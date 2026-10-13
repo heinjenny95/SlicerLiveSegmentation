@@ -5241,6 +5241,7 @@ class LiveCollaborationController:
         root_layout.addWidget(self.connection_group)
 
         identity_layout = qt.QFormLayout()
+        identity_layout.setLabelAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
         self.user_edit = qt.QLineEdit(default_user)
         self.user_edit.setPlaceholderText("Your name")
         self.room_edit = qt.QLineEdit(default_room)
@@ -5366,6 +5367,7 @@ class LiveCollaborationController:
         root_layout.addWidget(self.labels_group)
 
         label_management_layout = qt.QFormLayout()
+        label_management_layout.setLabelAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
         self.label_combo = qt.QComboBox()
         self.label_combo.enabled = False
         self.label_combo.setToolTip(

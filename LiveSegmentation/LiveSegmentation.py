@@ -63,10 +63,18 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         super().setup()
         import ctk
 
+        # Match Slicer's field/content inset instead of placing introductory
+        # and group text directly against the module panel's left edge.
+        outer_layout = self.layout
+        self.content_widget = qt.QWidget(self.parent)
+        self.layout = qt.QVBoxLayout(self.content_widget)
+        self.layout.setContentsMargins(12, 6, 12, 6)
+        outer_layout.addWidget(self.content_widget)
         data_group = ctk.ctkCollapsibleButton()
         data_group.text = "1 · Data"
         data_group.collapsed = False
         data_form = qt.QFormLayout(data_group)
+        data_form.setLabelAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
 
         self.source_volume_selector = slicer.qMRMLNodeComboBox()
         self.source_volume_selector.nodeTypes = ["vtkMRMLScalarVolumeNode"]

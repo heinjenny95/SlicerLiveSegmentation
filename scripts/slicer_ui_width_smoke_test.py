@@ -28,6 +28,7 @@ def run():
         scripted_widget = representation.self()
         controller = scripted_widget.live_collaboration
         compact = {
+            "consistent_panel_padding": int(_value(scripted_widget.layout.contentsMargins(), "left")) >= 10,
             "advanced_collapsed": bool(controller.advanced_group.collapsed),
             "follow_controls_collapsed": bool(controller.collaborators_group.collapsed),
             "permissions_collapsed": bool(controller.permissions_group.collapsed),
@@ -56,6 +57,9 @@ def run():
         modes = []
         for index in range(4):
             controller.transport_combo.setCurrentIndex(index)
+            slicer.app.processEvents()
+            scripted_widget.layout.activate()
+            root.layout().activate()
             slicer.app.processEvents()
             modes.append({
                 "mode": controller._transport_mode(),

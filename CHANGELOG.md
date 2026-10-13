@@ -10,6 +10,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Local workflow
 
+- Give the module a consistent 12-pixel content inset and left-align form
+  captions, keeping the compact side-by-side fields while avoiding text
+  pressed against the panel edge. Native width/layout QA checks the inset.
+
 - Keep successful SSH/NAS locations in a separate local preference file, so
   the recent-location dropdown survives safe/test starters using disabled
   Slicer settings. Startup remains disconnected with an empty active path.
