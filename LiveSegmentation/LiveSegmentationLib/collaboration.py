@@ -398,7 +398,9 @@ def location_history_settings(root=None):
     import qt
 
     if root is None:
-        root = qt.QStandardPaths.writableLocation(qt.QStandardPaths.AppLocalDataLocation)
+        # --disable-settings changes Slicer's application name to Slicer-tmp.
+        # A generic user-data root is stable across safe and normal starters.
+        root = Path(str(qt.QStandardPaths.writableLocation(qt.QStandardPaths.GenericDataLocation))) / "SlicerLiveSegmentation"
     return qt.QSettings(str(Path(str(root)) / "LiveSegmentation" / "locations.ini"), qt.QSettings.IniFormat)
 
 

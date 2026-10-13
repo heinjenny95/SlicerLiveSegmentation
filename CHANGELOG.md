@@ -24,6 +24,8 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   Slicer settings. Startup remains disconnected with an empty active path.
   Migrate old history, strip URL credentials/query parameters, and clear both
   stores when requested. A two-process native regression covers restart recall.
+  Use the generic local user-data root rather than Slicer's application-specific
+  Slicer-tmp directory, so normal and safe starters see the same history.
 
 ### Connection
 

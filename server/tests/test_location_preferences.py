@@ -21,3 +21,16 @@ def test_history_never_persists_url_credentials_or_tokens():
         "https://user:secret@example.org/?token=bad",
         r"\\nas\shared",
     ]) == ["ssh://specimen.example.org/mnt/data", "https://example.org/", r"\\nas\shared"]
+
+
+def test_default_history_does_not_depend_on_slicer_application_name(monkeypatch, tmp_path):
+    import sys
+    calls = []
+    def settings(*args):
+        calls.append(args)
+    settings.IniFormat = 1
+    paths = SimpleNamespace(GenericDataLocation=1, AppLocalDataLocation=2,
+                            writableLocation=lambda kind: str(tmp_path if kind == 1 else tmp_path / "Slicer-tmp"))
+    monkeypatch.setitem(sys.modules, "qt", SimpleNamespace(QSettings=settings, QStandardPaths=paths))
+    c.location_history_settings()
+    assert calls[0][0] == str(tmp_path / "SlicerLiveSegmentation" / "LiveSegmentation" / "locations.ini")
