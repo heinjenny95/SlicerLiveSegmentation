@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Local workflow
+
+- Keep successful SSH/NAS locations in a separate local preference file, so
+  the recent-location dropdown survives safe/test starters using disabled
+  Slicer settings. Startup remains disconnected with an empty active path.
+  Migrate old history, strip URL credentials/query parameters, and clear both
+  stores when requested. A two-process native regression covers restart recall.
+
 ### Connection
 
 - Allow 30 seconds (instead of 15) to join shared-folder, LAN and HTTPS rooms.

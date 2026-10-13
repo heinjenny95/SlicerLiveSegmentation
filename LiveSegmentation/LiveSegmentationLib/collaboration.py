@@ -388,6 +388,37 @@ def update_recent_shared_folders(existing, selected, limit=RECENT_SHARED_FOLDER_
     )
 
 
+def location_history_settings(root=None):
+    """A tiny local preference file, independent of --disable-settings profiles.
+
+    Only successful locations are stored here, never an active connection,
+    password or session. Reading this file does not probe the listed paths.
+    The optional root is a dependency-injection seam for native tests.
+    """
+    import qt
+
+    if root is None:
+        root = qt.QStandardPaths.writableLocation(qt.QStandardPaths.AppLocalDataLocation)
+    return qt.QSettings(str(Path(str(root)) / "LiveSegmentation" / "locations.ini"), qt.QSettings.IniFormat)
+
+
+def safe_location_history(value):
+    result = []
+    for location in decode_recent_shared_folders(value):
+        if "://" in location:
+            try:
+                parsed = urllib.parse.urlsplit(location)
+            except ValueError:
+                continue
+            if parsed.scheme not in {"ssh", "http", "https"} or not parsed.hostname:
+                continue
+            # A pasted URL must never make credentials or token parameters
+            # persistent. Actual successful SSH clients already omit logins.
+            location = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+        result.append(location)
+    return decode_recent_shared_folders(result)
+
+
 class LiveCollaborationError(RuntimeError):
     """A user-facing live-room transport or validation error."""
 
@@ -5192,9 +5223,13 @@ class LiveCollaborationController:
         default_transport = "shared-folder"
         default_shared_folder = ""
         default_server = ""
-        recent_shared_folders = decode_recent_shared_folders(
-            settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]")
-        )
+        self._history_settings = location_history_settings()
+        self._history_settings.sync()
+        if not self._history_settings.contains("recentLocations"):
+            legacy = safe_location_history(settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]"))
+            self._history_settings.setValue("recentLocations", json.dumps(legacy))
+            self._history_settings.sync()
+        recent_shared_folders = safe_location_history(self._history_settings.value("recentLocations", "[]"))
 
         self.group = qt.QGroupBox("Live collaboration")
         root_layout = qt.QVBoxLayout(self.group)
@@ -6109,17 +6144,20 @@ class LiveCollaborationController:
         settings = qt.QSettings()
         settings.remove(self.SETTINGS_PREFIX + "recentSharedFolders")
         settings.sync()
+        history = location_history_settings()
+        history.setValue("recentLocations", "[]")
+        history.sync()
 
     def _remember_recent_shared_folder(self, path):
-        import qt
-
-        settings = qt.QSettings()
+        settings = location_history_settings()
+        settings.sync()
         recent = update_recent_shared_folders(
-            settings.value(self.SETTINGS_PREFIX + "recentSharedFolders", "[]"),
+            safe_location_history(settings.value("recentLocations", "[]")),
             path,
         )
+        recent = safe_location_history(recent)
         settings.setValue(
-            self.SETTINGS_PREFIX + "recentSharedFolders",
+            "recentLocations",
             json.dumps(recent, ensure_ascii=False),
         )
         settings.sync()
