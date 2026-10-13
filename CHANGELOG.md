@@ -10,6 +10,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Local workflow
 
+- Add a main-window Live Segmentation button, Ctrl+Alt+L return action, and
+  Chat action that remain available in other modules. Navigation does not
+  reconnect, reload data or alter selected labels. Setup is idempotent and
+  cleanup removes the toolbar and shortcut; a native regression checks it.
+
 - Give the module a consistent 12-pixel content inset and left-align form
   captions, keeping the compact side-by-side fields while avoiding text
   pressed against the panel edge. Native width/layout QA checks the inset.

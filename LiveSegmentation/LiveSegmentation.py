@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import qt
 import slicer
@@ -58,6 +60,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._previous_segment_editor_undo_limit = None
         self._recovery_editor = None
         self._previous_editor_read_only = None
+        self.navigation_toolbar = None
+        self.navigation_action = None
 
     def setup(self):
         super().setup()
@@ -127,6 +131,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
         self.live_collaboration = LiveCollaborationController(self)
         self.live_collaboration.setup()
+        self._setup_navigation_toolbar()
         self.layout.addStretch(1)
 
         self._select_scene_defaults()
@@ -136,6 +141,12 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
+        if self.navigation_toolbar is not None:
+            slicer.util.mainWindow().removeToolBar(self.navigation_toolbar)
+            self.navigation_toolbar.setObjectName("")
+            self.navigation_toolbar.deleteLater()
+            self.navigation_toolbar = None
+            self.navigation_action = None
         if self.live_collaboration is not None:
             self.live_collaboration.cleanup()
         if self._recovery_editor is not None:
@@ -159,6 +170,32 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def enter(self):
         self._refresh_recovery_notice()
+
+    def _setup_navigation_toolbar(self):
+        """Return to collaboration without changing sessions or editor targets."""
+        if self.navigation_toolbar is not None:
+            return
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        toolbar = qt.QToolBar("Live Segmentation", main_window)
+        toolbar.setObjectName("LiveSegmentationNavigation")
+        toolbar.setToolButtonStyle(qt.Qt.ToolButtonTextBesideIcon)
+        action = qt.QAction(qt.QIcon(str(Path(__file__).parent / "Resources" / "Icons" / "LiveSegmentation.svg")),
+                            "Live Segmentation", toolbar)
+        action.setObjectName("LiveSegmentationReturnAction")
+        action.setToolTip("Return to Live Segmentation (Ctrl+Alt+L); the room stays connected")
+        action.setShortcut(qt.QKeySequence("Ctrl+Alt+L"))
+        action.setShortcutContext(qt.Qt.WindowShortcut)
+        action.setAutoRepeat(False)
+        action.triggered.connect(lambda checked=False: slicer.util.selectModule("LiveSegmentation"))
+        toolbar.addAction(action)
+        chat = toolbar.addAction("Chat")
+        chat.triggered.connect(lambda checked=False: self.live_collaboration.show_chat_dock())
+        chat.setToolTip("Open the persistent collaboration chat without switching modules")
+        main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
+        self.navigation_toolbar = toolbar
+        self.navigation_action = action
 
     def _save_offline_recovery(self):
         slicer.util.openSaveDataDialog()
