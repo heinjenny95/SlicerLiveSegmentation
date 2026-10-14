@@ -62,6 +62,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._previous_editor_read_only = None
         self.navigation_toolbar = None
         self.navigation_action = None
+        self.ir_navigation_action = None
 
     def setup(self):
         super().setup()
@@ -147,6 +148,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             self.navigation_toolbar.deleteLater()
             self.navigation_toolbar = None
             self.navigation_action = None
+            self.ir_navigation_action = None
         if self.live_collaboration is not None:
             self.live_collaboration.cleanup()
         if self._recovery_editor is not None:
@@ -170,10 +172,12 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def enter(self):
         self._refresh_recovery_notice()
+        self._refresh_optional_navigation()
 
     def _setup_navigation_toolbar(self):
         """Return to collaboration without changing sessions or editor targets."""
         if self.navigation_toolbar is not None:
+            self._refresh_optional_navigation()
             return
         main_window = slicer.util.mainWindow()
         if main_window is None:
@@ -190,12 +194,37 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         action.setAutoRepeat(False)
         action.triggered.connect(lambda checked=False: slicer.util.selectModule("LiveSegmentation"))
         toolbar.addAction(action)
+        ir_action = qt.QAction(qt.QIcon(str(Path(__file__).parent / "Resources" / "Icons" / "nnInteractiveIR.svg")),
+                               "nnInteractive IR", toolbar)
+        ir_action.setObjectName("LiveSegmentationIRAction")
+        ir_action.setToolTip("Open nnInteractive IR (Ctrl+Alt+I); the room stays connected")
+        ir_action.setShortcut(qt.QKeySequence("Ctrl+Alt+I"))
+        ir_action.setShortcutContext(qt.Qt.WindowShortcut)
+        ir_action.setAutoRepeat(False)
+        ir_action.triggered.connect(lambda checked=False: self._open_nninteractive_ir())
+        toolbar.addAction(ir_action)
         chat = toolbar.addAction("Chat")
         chat.triggered.connect(lambda checked=False: self.live_collaboration.show_chat_dock())
         chat.setToolTip("Open the persistent collaboration chat without switching modules")
         main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
         self.navigation_toolbar = toolbar
         self.navigation_action = action
+        self.ir_navigation_action = ir_action
+        self._refresh_optional_navigation()
+
+    def _refresh_optional_navigation(self):
+        if self.ir_navigation_action is None:
+            return
+        available = getattr(slicer.modules, "slicernninteractiveir", None) is not None
+        self.ir_navigation_action.setVisible(available)
+        self.ir_navigation_action.setEnabled(available)
+
+    def _open_nninteractive_ir(self):
+        """Navigate only; never initialize inference or replace editor targets."""
+        if getattr(slicer.modules, "slicernninteractiveir", None) is None:
+            self._refresh_optional_navigation()
+            return
+        slicer.util.selectModule("SlicerNNInteractiveIR")
 
     def _save_offline_recovery(self):
         slicer.util.openSaveDataDialog()

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <title>nnInteractive IR navigation</title>
+  <rect x="2" y="2" width="28" height="28" rx="7" fill="#344955"/>
+  <path d="M9 5H5v4M23 5h4v4M5 23v4h4M27 23v4h-4" fill="none" stroke="#70d4c3" stroke-width="2"/>
+  <text x="16" y="22" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="white">IR</text>
+</svg>

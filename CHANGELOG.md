@@ -10,6 +10,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ### Local workflow
 
+- Add an optional nnInteractive IR toolbar button and Ctrl+Alt+I shortcut next
+  to Live Segmentation. Both navigation actions stay available across modules;
+  switching does not reconnect or initialize inference. The IR action is hidden
+  if the separately installed module is absent, preserving the standalone
+  collaboration extension. Include its icon in the module resources.
+
 - Add a main-window Live Segmentation button, Ctrl+Alt+L return action, and
   Chat action that remain available in other modules. Navigation does not
   reconnect, reload data or alter selected labels. Setup is idempotent and
