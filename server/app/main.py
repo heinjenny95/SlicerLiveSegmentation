@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from .config import Settings
 from .db import Database
@@ -32,6 +33,7 @@ from .schemas import (
     LiveRoomJoin,
     LiveSegmentLockUpdate,
 )
+from .study_log import RoomWorkLog, operation_details
 
 SERVER_VERSION = "0.15.1"
 COLLABORATION_PROTOCOL_VERSION = 3
@@ -142,6 +144,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     presence_registry = LivePresenceRegistry()
     preflight_registry: dict[str, dict[str, dict[str, Any]]] = {}
     preflight_lock = threading.Lock()
+    work_logs = {}
+    work_log_guard = threading.Lock()
+    work_sessions = {}
+
+    def work_log(room_id):
+        with work_log_guard:
+            if room_id not in work_logs:
+                work_logs[room_id] = RoomWorkLog(
+                    resolved_settings.database_path.parent / "rooms" / room_id,
+                    report_lock=threading.Lock(), create_room=True,
+                )
+            return work_logs[room_id]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -149,7 +163,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = resolved_settings
         app.state.database = database
         app.state.presence_registry = presence_registry
+        app.state.work_logs = work_logs
         yield
+        # Filesystem waits stay off the event loop during graceful shutdown.
+        import asyncio
+
+        await asyncio.gather(*(asyncio.to_thread(log.flush, 3.0) for log in work_logs.values()))
 
     app = FastAPI(
         title="Live Segmentation Server",
@@ -230,20 +249,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: str,
         details: dict[str, Any] | None = None,
     ) -> None:
+        record_id = str(uuid.uuid4())
+        created_at = iso_now()
         connection.execute(
             """
             INSERT INTO live_audit(id, room_id, event, user, details, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid.uuid4()),
+                record_id,
                 room_id,
                 event,
                 user,
                 json.dumps(details or {}, separators=(",", ":")),
-                iso_now(),
+                created_at,
             ),
         )
+        session_id = str((details or {}).get("presence_session_id")
+                         or work_sessions.get((room_id, user), ""))
+        if not (event == "segmentation.operation" and (details or {}).get("system_snapshot")):
+            database.after_commit(connection, lambda: work_log(room_id).submit(
+                event, user, session_id, details, event_id=record_id,
+                epoch=datetime.fromisoformat(created_at).timestamp(),
+            ))
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -342,6 +370,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: LiveRoomJoin, user: str = Depends(require_user)
     ) -> dict[str, Any]:
         created = False
+        session_id = payload.presence_session_id or uuid.uuid4().hex
         with database.transaction(immediate=True) as connection:
             room = connection.execute(
                 "SELECT * FROM live_rooms WHERE name = ? COLLATE NOCASE",
@@ -412,14 +441,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 room["id"],
                 "room.join",
                 user,
-                {"created": created},
+                {"created": created, "presence_session_id": session_id},
             )
+        work_sessions[(room["id"], user)] = session_id
         presence = await presence_registry.mark_presence(room["id"], user)
         return {
             **dict(room),
             "created": created,
             "latest_sequence": int(latest_sequence),
             "presence": presence,
+            "work_log_file": str(work_log(room["id"]).room_path / "work-log.txt"),
         }
 
     @app.get("/api/live/rooms/{room_id}/operations")
@@ -666,6 +697,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "segmentation.operation",
                     user,
                     {
+                        **operation_details(payload.model_dump()),
                         "sequence": int(operation["sequence"]),
                         "segment_id": payload.segment_id,
                         "changed_voxels": changed_voxels,
@@ -692,6 +724,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Live room not found")
             details = payload.model_dump(exclude_none=True)
             details["role"] = role_for(connection, room_id, user)
+        session_id = payload.presence_session_id or work_sessions.get((room_id, user), "")
+        if session_id:
+            work_sessions[(room_id, user)] = session_id
+            work_log(room_id).heartbeat(user, session_id)
         return await presence_registry.mark_presence(
             room_id, user, details=details
         )
@@ -708,11 +744,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ).fetchone()
             if room is None:
                 raise HTTPException(status_code=404, detail="Live room not found")
-            append_audit(connection, room_id, "room.leave", user)
+            append_audit(connection, room_id, "room.leave", user,
+                         {"presence_session_id": presence_session_id or work_sessions.get((room_id, user), "")})
         await presence_registry.remove_presence(
             room_id, user, presence_session_id=presence_session_id
         )
         return {"left": True}
+
+    @app.get("/api/live/rooms/{room_id}/work-log", response_class=PlainTextResponse)
+    def read_work_log(room_id: str, user: str = Depends(require_room_member)):
+        del user
+        path = work_log(room_id).room_path / "work-log.txt"
+        if not path.is_file():
+            raise HTTPException(status_code=503, detail="Study log is still being written")
+        return PlainTextResponse(path.read_text(encoding="utf-8"),
+                                 headers={"Content-Disposition": 'attachment; filename="work-log.txt"'})
 
     @app.get("/api/live/rooms/{room_id}/messages")
     def list_chat_messages(

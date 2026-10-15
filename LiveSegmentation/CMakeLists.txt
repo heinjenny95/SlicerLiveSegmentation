@@ -5,6 +5,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/__init__.py
   LiveSegmentationLib/collaboration.py
   LiveSegmentationLib/features.py
+  LiveSegmentationLib/work_log.py
   LiveSegmentationLib/version.py
   LiveSegmentationLib/ssh_transport.py
 )

@@ -145,6 +145,40 @@ includes the current user's acknowledged changes. Direct LAN and Remote HTTPS
 address controls appear directly below the connection selector, with the LAN
 host creating its private local room store, URL, and session code automatically.
 
+### Permanent timing log for studies
+
+Current development builds automatically write `work-log.txt` in each room's
+data folder (`LiveSegmentation/rooms/<room-key>/` for Shared Folder, SSH and LAN).
+The SSH path is on the remote host, not on the Windows client. The optional HTTP
+server writes `rooms/<room-id>/work-log.txt` next to its database and exposes a
+room-member-only `GET /api/live/rooms/<room-id>/work-log` text download. The
+activity dock displays the path after joining. No timer needs to be started.
+
+The TXT contains UTC attendance sessions and confirmed activities, including
+label names/IDs and metadata changes, editing operations, locks and chat events
+(not message bodies). It is updated automatically, with healthy-storage targets
+of 5 seconds for durable journals, 15 seconds for heartbeat samples and 30 seconds
+for the TXT, plus updates on join/leave. Logging runs independently of live sync.
+Keep the adjacent `work-log-data/` journals: they can rebuild the TXT after a
+failed write and are not deleted when voxel history is compacted. Display names,
+label names and timestamps are research/user data; apply your own retention and
+consent policy before sharing them.
+
+For publication, report the metric explicitly: per-person attendance, summed
+person-time, parallel team room-time (interval union), or calendar span. **None
+is exact active editing time.** Breaks, inspection and waiting are included in
+attendance. One brush action may produce multiple network operations, whose
+timestamps are backend acceptance times, not brush start/end times. Choose the
+study start and completion cutoff explicitly; the plugin cannot infer when a
+specimen is scientifically finished. Use one distinct, consistent display name
+per person, synchronize Shared Folder PC clocks, and inspect warnings. Abruptly
+ended sessions are bounded by the last saved observation, with an unknown end;
+observation gaps longer than 60 seconds are excluded and flagged. No historical
+work before this feature was enabled is invented. Save failures remain visible
+in the application log (and activity dock via Shared Folder/SSH/LAN presence).
+Use this build on all participants. A RAM-backed `/dev/shm` location is not
+durable across server restarts: use persistent storage for publication logs.
+
 Version 0.14.1 fixes a native Slicer crash that could occur when a collaborator
 created a label and opened Segment Editor. Segment notifications are now
 coalesced and processed on the next Qt event-loop turn, after Slicer's native

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -152,6 +154,8 @@ CREATE TABLE IF NOT EXISTS live_audit (
 class Database:
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._callbacks_guard = threading.Lock()
+        self._commit_callbacks = {}
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,12 +217,28 @@ class Database:
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
+        with self._callbacks_guard:
+            self._commit_callbacks[id(connection)] = []
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield connection
             connection.commit()
+            with self._callbacks_guard:
+                callbacks = self._commit_callbacks.pop(id(connection), [])
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    logging.exception("A committed action could not be queued for the study log")
         except Exception:
             connection.rollback()
             raise
         finally:
+            with self._callbacks_guard:
+                self._commit_callbacks.pop(id(connection), None)
             connection.close()
+
+    def after_commit(self, connection, callback):
+        """Submit observational work only after its transaction is confirmed."""
+        with self._callbacks_guard:
+            self._commit_callbacks[id(connection)].append(callback)

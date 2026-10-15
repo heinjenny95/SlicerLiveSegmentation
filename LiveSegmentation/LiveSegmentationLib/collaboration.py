@@ -40,6 +40,11 @@ from pathlib import Path
 import numpy as np
 
 try:
+    from .work_log import RoomWorkLog, operation_details, operation_event_id
+except ImportError:
+    from work_log import RoomWorkLog, operation_details, operation_event_id
+
+try:
     from .features import (
         REVIEW_STATES,
         ROOM_ROLES,
@@ -1426,10 +1431,12 @@ class LiveRoomClient:
         return json.loads(content.decode("utf-8")) if content else None
 
     def join(self, room_name, signature):
+        self.presence_session_id = uuid.uuid4().hex
         return self._request(
             "POST",
             "/api/live/rooms/join",
-            {"room_name": room_name, "volume_signature": signature},
+            {"room_name": room_name, "volume_signature": signature,
+             "presence_session_id": self.presence_session_id},
         )
 
     def preflight(
@@ -1810,6 +1817,7 @@ class SharedFolderRoomClient:
         self._last_presence_directory_scan = 0.0
         self._last_operation_recovery_scan = 0.0
         self._last_chat_recovery_scan = 0.0
+        self.work_log = None
 
     @staticmethod
     def _room_key(room_name):
@@ -2291,7 +2299,7 @@ class SharedFolderRoomClient:
             }
         )
 
-    def join(self, room_name, signature):
+    def join(self, room_name, signature, presence_session_id=None):
         room_key = self._room_key(room_name)
         room_path = self.rooms_root / room_key
         try:
@@ -2400,7 +2408,11 @@ class SharedFolderRoomClient:
         }
         self._presence_paths_cache = {}
         self._presence_records_cache = {}
-        self.presence_session_id = uuid.uuid4().hex
+        self.presence_session_id = str(presence_session_id or uuid.uuid4().hex)
+        self.work_log = RoomWorkLog(
+            room_path,
+            report_lock=lambda: self._named_lock(room_path, "work-log-report", timeout_seconds=1.0),
+        )
         self._last_presence_directory_scan = 0.0
         self._last_operation_recovery_scan = 0.0
         self._last_chat_recovery_scan = 0.0
@@ -2413,6 +2425,7 @@ class SharedFolderRoomClient:
             "created_by": metadata.get("created_by"),
             "latest_sequence": latest_sequence,
             "presence": self._read_presence(room_path),
+            "work_log_file": str(room_path / "work-log.txt"),
         }
 
     def _analyze_operation_conflicts(
@@ -2694,6 +2707,12 @@ class SharedFolderRoomClient:
         # owner metadata are derived in one background lane; the compact state
         # file remains only a replaceable polling accelerator.
         self._queue_operation_artifacts(room_path, stored)
+        if self.work_log and not stored.get("system_snapshot"):
+            self.work_log.submit(
+                "segmentation.operation", self.user_name, self.presence_session_id,
+                operation_details(stored), event_id=operation_event_id(sequence),
+                epoch=datetime.fromisoformat(stored["created_at"]).timestamp(),
+            )
         if defer_conflicts:
             def analyze_later():
                 time.sleep(0.75)
@@ -3095,7 +3114,12 @@ class SharedFolderRoomClient:
             **(details or {}),
         }
         _write_presence_json(self._presence_path(room_path), data)
-        return self._read_presence_report(room_path)
+        if self.work_log:
+            self.work_log.heartbeat(self.user_name, data["presence_session_id"])
+        report = self._read_presence_report(room_path)
+        if self.work_log:
+            report["work_log"] = self.work_log.status()
+        return report
 
     def health_check(self, room_id=None):
         room_path = self._require_room(room_id or self._room_id)
@@ -3127,7 +3151,7 @@ class SharedFolderRoomClient:
             durable=False,
         )
         try:
-            self._append_audit(room_path, "room.leave")
+            self._append_audit(room_path, "room.leave", {"presence_session_id": expected_session})
         except Exception:
             pass
         if presence_session_id is None:
@@ -3608,7 +3632,7 @@ class SharedFolderRoomClient:
         )
         return state
 
-    def _append_audit(self, room_path, event, details=None):
+    def _append_audit(self, room_path, event, details=None, log_activity=True):
         stamp = time.time_ns()
         record = {
             "id": str(uuid.uuid4()),
@@ -3617,6 +3641,13 @@ class SharedFolderRoomClient:
             "created_at": _utc_iso(),
             "details": details or {},
         }
+        if log_activity and self.work_log and event != "segmentation.operation":
+            self.work_log.submit(
+                event, self.user_name,
+                str((details or {}).get("presence_session_id") or self.presence_session_id),
+                details, event_id=record["id"],
+                epoch=datetime.fromisoformat(record["created_at"]).timestamp(),
+            )
         try:
             _write_json_atomic(
                 room_path / "audit" / f"{stamp:020d}--{record['id'][:12]}.json",
@@ -3631,10 +3662,15 @@ class SharedFolderRoomClient:
 
     def _append_audit_async(self, room_path, event, details=None):
         """Keep non-critical audit I/O out of latency-sensitive live actions."""
+        # Bind the activity to the current room/session BEFORE a delayed thread
+        # can overlap leave/rejoin. Audit timing must not be worker-start timing.
+        details = dict(details or {})
+        if self.work_log and event != "segmentation.operation":
+            self.work_log.submit(event, self.user_name, self.presence_session_id, details)
 
         def write_record():
             try:
-                self._append_audit(room_path, event, details)
+                self._append_audit(room_path, event, details, log_activity=False)
             except Exception:
                 pass
 
@@ -4557,7 +4593,13 @@ class LanRoomClient:
 
     def join(self, *args, **kwargs):
         self.presence_session_id = uuid.uuid4().hex
-        return self._rpc("join", *args, **kwargs)
+        try:
+            return self._rpc("join", *args, **kwargs, presence_session_id=self.presence_session_id)
+        except LiveCollaborationError as exc:
+            if "unexpected keyword argument 'presence_session_id'" not in str(exc):
+                raise
+            # Older relays remain usable, but do not record the new study log.
+            return self._rpc("join", *args, **kwargs)
 
     def presence(self, room_id, details):
         return self._rpc(
@@ -7652,6 +7694,9 @@ class LiveCollaborationController:
             try:
                 if room_id:
                     client.leave(room_id)
+                    log = getattr(client, "work_log", None)
+                    if log is not None:
+                        log.flush(3.0)
             except Exception:
                 pass
             finally:
@@ -8005,6 +8050,9 @@ class LiveCollaborationController:
             self._append_activity(
                 f"Joined room {self.room_name} via {context['transport_mode']}"
             )
+            self._work_log_error = ""
+            if room.get("work_log_file"):
+                self._append_activity(f"Study log (automatic): {room['work_log_file']}")
             self.show_activity_dock()
             self.timer.start()
         except Exception as exc:
@@ -9938,6 +9986,7 @@ class LiveCollaborationController:
                     "session_token": session_token,
                     "users": report["users"],
                     "departed_sessions": report.get("departed_sessions") or [],
+                    "work_log": report.get("work_log") or {},
                     "duration": time.monotonic() - started,
                 }
             )
@@ -10724,6 +10773,11 @@ class LiveCollaborationController:
                 self._update_presence(
                     result["users"], result.get("departed_sessions") or []
                 )
+            if result.get("work_log") is not None:
+                log_error = str(result["work_log"].get("error") or "")
+                if log_error != getattr(self, "_work_log_error", ""):
+                    self._work_log_error = log_error
+                    self._append_activity(log_error or "Study log saving recovered.")
             if result.get("messages") is not None:
                 self._append_chat_messages(result["messages"])
             if result.get("locks") is not None:

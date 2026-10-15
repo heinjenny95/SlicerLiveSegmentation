@@ -8,6 +8,7 @@ WORKDIR /opt/liveseg
 COPY server/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server/app ./app
+COPY LiveSegmentation/LiveSegmentationLib/work_log.py ./LiveSegmentation/LiveSegmentationLib/work_log.py
 
 VOLUME ["/data"]
 EXPOSE 8000

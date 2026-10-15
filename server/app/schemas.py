@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 class LiveRoomJoin(BaseModel):
     room_name: str = Field(min_length=1, max_length=120)
     volume_signature: str = Field(min_length=16, max_length=160)
+    presence_session_id: str | None = Field(default=None, min_length=1, max_length=64)
 
     @field_validator("room_name", "volume_signature")
     @classmethod

@@ -135,7 +135,7 @@ def trust_host_key(path, details):
 
 def helper_bundle():
     root = Path(__file__).parent
-    sources = {name: root.joinpath(name + ".py").read_text(encoding="utf-8-sig") for name in ("features", "version", "collaboration")}
+    sources = {name: root.joinpath(name + ".py").read_text(encoding="utf-8-sig") for name in ("features", "version", "work_log", "collaboration")}
     return base64.b64encode(zlib.compress(json.dumps(sources).encode(), 6)).decode()
 
 
@@ -166,7 +166,7 @@ try:
         raise RuntimeError('SSH setup is too large')
     setup = json.loads(setup_line)
     sources = json.loads(zlib.decompress(base64.b64decode(setup['bundle'])))
-    for name in ('features', 'version', 'collaboration'):
+    for name in ('features', 'version', 'work_log', 'collaboration'):
         module = types.ModuleType(name)
         module.__file__ = '<LiveSegmentation SSH helper>/' + name + '.py'
         sys.modules[name] = module
@@ -209,6 +209,8 @@ try:
 finally:
     pool.shutdown(wait=True)
     client._artifact_queue.join()
+    if client.work_log:
+        client.work_log.flush(3.0)
 '''
 
 

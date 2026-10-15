@@ -8,6 +8,22 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Study timing and permanent activity log
+
+- Automatically maintain `work-log.txt` in the room data directory, with UTC
+  joins/leaves and acknowledged label, lock, chat and review actions per person.
+  Count transport retries once; keep journals across restarts and compaction.
+- Separate per-person attendance, summed person-seconds, parallel team room-time
+  and calendar span. Never present attendance as exact active segmentation time;
+  flag unknown ends, damaged records and observation gaps longer than 60 seconds.
+- Flush small append-only journals on an independent background lane (5-second
+  target), sample heartbeats at 15 seconds, and refresh the atomic TXT report at
+  30 seconds and on join/leave. Logging does not hold the voxel sequence lock.
+  Failed TXT replacement keeps both the previous TXT and recoverable journals.
+- Include the logger in Slicer, encrypted SSH helpers and the optional HTTP
+  server. Server activity is queued only after its database transaction commits;
+  the authenticated room-member TXT download excludes chat bodies and secrets.
+
 ### Local workflow
 
 - Add an optional nnInteractive IR toolbar button and Ctrl+Alt+I shortcut next
