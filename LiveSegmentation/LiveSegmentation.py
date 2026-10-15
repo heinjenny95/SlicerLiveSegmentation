@@ -210,6 +210,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.navigation_toolbar = toolbar
         self.navigation_action = action
         self.ir_navigation_action = ir_action
+        from LiveSegmentationLib.active_work import WorkTimeUI
+
+        self.live_collaboration.work_time = WorkTimeUI(self.live_collaboration, toolbar)
         self._refresh_optional_navigation()
 
     def _refresh_optional_navigation(self):

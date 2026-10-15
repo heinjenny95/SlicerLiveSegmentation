@@ -145,6 +145,47 @@ includes the current user's acknowledged changes. Direct LAN and Remote HTTPS
 address controls appear directly below the connection selector, with the LAN
 host creating its private local room store, URL, and session code automatically.
 
+### Active work time and visual review
+
+The global collaboration toolbar now shows a local **Work** clock, **Pause /
+Resume** and a checkable **Review** action, also while using Segment Editor or
+the separately installed nnInteractive IR. Timing starts when joining a room.
+Pause before a break. Review explicitly counts silent visual inspection beyond
+the inactivity threshold; turn it off or Pause when you stop inspecting. A
+foreground Slicer view/editor interaction resumes automatic timing after idle;
+incoming edits, chat and bare mouse motion never renew that activity window.
+
+The clock menu configures auto-pause (default 60 seconds, range 15–900), offers a
+manual technical-wait switch, and opens the local timing backup. The display is
+this person's current session; the permanent room TXT aggregates recorded
+sessions and people. Different projects selected in Segment Editor/IR are not
+charged to the current shared project. Other modules are excluded unless Review
+is explicitly enabled. Loss of application focus is classified as away, not work.
+
+Measurement method v1 uses a monotonic clock and anchored local UTC, 250-ms
+context polling and five-second interval checkpoints. Estimated work includes
+the configurable grace window after meaningful input or a newly returned
+result. While IR is computing, only two-second purposeful-interaction windows or
+explicit Review count as concurrent work; the rest of the detected wait is not
+active time. IR background heartbeats are not compute waits, and ordinary
+background synchronization is not deducted from ongoing work. GUI observation
+gaps longer than ten seconds are unknown and excluded, not invented as work.
+Uninstrumented tools may require the manual wait control. This is **a declared
+measurement protocol, not infallible detection of human attention**.
+
+Small validated samples are transferred in an independent lane and acknowledged
+only after journal durability. Transfer retries cannot double-count them.
+Every local session also retains a timing backup under the application's generic
+data folder (`LiveSegmentation/work-time-recovery/`, accessible from the clock
+menu). Journal durability targets remain five seconds after a sample is emitted;
+with checkpointing the last few seconds can be unconfirmed after a crash. On
+storage/connection failure, preserve the local backup and inspect coverage before
+publication. Final markers record the expected sample count; missing samples,
+unknown ends and older attendance-only sessions are explicitly flagged. Select
+Leave before closing Slicer to finalize and transfer the current timing samples.
+No keystrokes, mouse positions, screenshots, image arrays or credentials are
+collected by the timing observer. Display names and timing data remain user data.
+
 ### Permanent timing log for studies
 
 Current development builds automatically write `work-log.txt` in each room's

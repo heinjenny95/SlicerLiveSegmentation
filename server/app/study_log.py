@@ -15,3 +15,6 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 RoomWorkLog = _module.RoomWorkLog
 operation_details = _module.operation_details
+validate_work_samples = _module.validate_work_samples
+work_sample_event_id = _module.work_sample_event_id
+read_work_report = _module.read_work_report

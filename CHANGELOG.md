@@ -8,6 +8,22 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Active local work time, including visual review
+
+- Add compact global Work/Review/Pause/Resume controls. Purposeful local view
+  and editor input resumes estimated work; chat, bare pointer motion, remote
+  paint and optional IR background heartbeats do not. Default auto-pause is
+  60 seconds (configurable 15–900); explicit Review counts silent inspection.
+- Measure monotonic local intervals, not network arrival delays. Separate work,
+  confirmed review, manual pause, idle, away/other context, communication,
+  detected technical waits and unobserved GUI gaps. Inspect an already-created
+  nnInteractive IR worker flag without loading, initializing or retargeting it.
+  Concurrent review/editing is not deducted as AI waiting.
+- Transfer validated, bounded, idempotent samples on an independent lane to the
+  permanent TXT/journals, with a local timing backup and final sample-count
+  markers. Missing coverage and uninstrumented older sessions are explicit.
+  Timing/storage failures never disconnect the voxel collaboration session.
+
 ### Study timing and permanent activity log
 
 - Automatically maintain `work-log.txt` in the room data directory, with UTC

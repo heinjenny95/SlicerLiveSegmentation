@@ -262,6 +262,12 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
         alice.presence(room["id"], {"active_segment": "LiveSeg-test"})
         assert any(item["user"] == "alice" for item in bob.presence(room["id"], {}))
         assert bob.room_history(room["id"])
+        work_sample = {"sample_id": "ssh-timing-sample-1", "session_id": alice.presence_session_id,
+                       "measurement_version": 1, "category": "review", "start_epoch": 100,
+                       "end_epoch": 105, "duration_seconds": 5, "idle_threshold_seconds": 60,
+                       "nninteractive_busy": True}
+        assert alice.record_work_intervals(room["id"], [work_sample])["accepted_ids"] == [work_sample["sample_id"]]
+        alice.record_work_intervals(room["id"], [work_sample])
         assert alice.password == bob.password == ""
         assert alice.preflight("encrypted-room", "a" * 64)["transport"] == "ssh-folder"
         assert "Loading local SSH libraries" in stages
@@ -287,14 +293,17 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
     # Graceful helper shutdown flushes the same persistent study log used by
     # Shared Folder. This is encrypted loopback SSH, not a mocked RPC response.
     report_path = tmp_path / "LiveSegmentation" / "rooms" / room["id"] / "work-log.txt"
+    from work_log import read_work_report
+
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        text = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
+        text = read_work_report(report_path) if report_path.is_file() else ""
         if "chat.message" in text and "Mandibles" in text and "room.leave" in text:
             break
         time.sleep(0.05)
     assert "chat.message" in text and "Mandibles" in text and "room.leave" in text
     assert text.count("segmentation.operation") == 1
+    assert "Active work including visual review: 5.000" in text
 
 
 @pytest.mark.parametrize("isolated", [False, True])

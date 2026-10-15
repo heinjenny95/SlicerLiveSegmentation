@@ -40,9 +40,21 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from .work_log import RoomWorkLog, operation_details, operation_event_id
+    from .work_log import (
+        RoomWorkLog,
+        operation_details,
+        operation_event_id,
+        validate_work_samples,
+        work_sample_event_id,
+    )
 except ImportError:
-    from work_log import RoomWorkLog, operation_details, operation_event_id
+    from work_log import (
+        RoomWorkLog,
+        operation_details,
+        operation_event_id,
+        validate_work_samples,
+        work_sample_event_id,
+    )
 
 try:
     from .features import (
@@ -1495,6 +1507,9 @@ class LiveRoomClient:
         return self._request(
             "DELETE", f"/api/live/rooms/{room_id}/presence?{query}"
         )
+
+    def record_work_intervals(self, room_id, samples):
+        return self._request("POST", f"/api/live/rooms/{room_id}/work-intervals", {"samples": samples})
 
     def send_chat(self, room_id, text, client_message_id, anchor=None):
         payload = {"text": text, "client_message_id": client_message_id}
@@ -3101,6 +3116,16 @@ class SharedFolderRoomClient:
     def presence(self, room_id, details):
         return self.presence_report(room_id, details)["users"]
 
+    def record_work_intervals(self, room_id, samples):
+        self._require_room(room_id)
+        items = validate_work_samples(samples)
+        for item in items:
+            self.work_log.submit("work.interval", self.user_name, item["session_id"], item,
+                                 event_id=work_sample_event_id(self.user_name, item["sample_id"]))
+        if not self.work_log.flush(3.0, report=False):
+            raise LiveCollaborationError("Work-time intervals not yet durable; retry from local journal")
+        return {"accepted_ids": [item["sample_id"] for item in items]}
+
     def presence_report(self, room_id, details):
         room_path = self._require_room(room_id)
         data = {
@@ -4423,6 +4448,7 @@ class SharedFolderRoomClient:
 
 
 LAN_RELAY_METHODS = {
+    "record_work_intervals",
     "preflight",
     "join",
     "push_operation",
@@ -4731,6 +4757,7 @@ class HybridRoomClient:
     """Prefer direct LAN requests and fall back to the identical shared store."""
 
     MIRRORED_METHODS = {
+        "record_work_intervals",
         "push_operation",
         "send_chat",
         "set_segment_lock",
@@ -5103,6 +5130,9 @@ class LiveCollaborationController:
         self.initial_sync_complete = False
         self._joined_at_epoch = 0.0
         self._last_edit_activity_epoch = 0.0
+        self.work_time = None
+        self._work_time_worker = None
+        self._last_work_time_send = 0.0
         self.segmentation_node_id = None
         self.volume_shape = None
         self.source_volume_signature = None
@@ -7686,13 +7716,25 @@ class LiveCollaborationController:
         self.preflight_button.enabled = enabled and not self._preflight_running
 
     @staticmethod
-    def _leave_client_in_background(client, room_id):
-        if client is None:
+    def _leave_client_in_background(client, room_id, work_time=None, notify_remote=True):
+        if client is None and not work_time:
             return
 
         def leave_client():
+            if work_time:
+                local_log, samples = work_time
+                try:
+                    local_log.flush(3.0, report=False)
+                    deadline = time.monotonic() + 3.0
+                    for start in range(0, len(samples), 128):
+                        if not notify_remote or time.monotonic() >= deadline:
+                            break
+                        client.record_work_intervals(room_id, samples[start:start + 128])
+                    local_log.flush(3.0)
+                except Exception:
+                    logging.warning("Work timing kept in local backup: %s", local_log.room_path)
             try:
-                if room_id:
+                if room_id and notify_remote:
                     client.leave(room_id)
                     log = getattr(client, "work_log", None)
                     if log is not None:
@@ -8053,6 +8095,9 @@ class LiveCollaborationController:
             self._work_log_error = ""
             if room.get("work_log_file"):
                 self._append_activity(f"Study log (automatic): {room['work_log_file']}")
+            if self.work_time is not None:
+                self.work_time.start()
+                self._last_work_time_send = 0.0
             self.show_activity_dock()
             self.timer.start()
         except Exception as exc:
@@ -8092,6 +8137,7 @@ class LiveCollaborationController:
         self._connecting_client = None
         self._leave_client_in_background(connecting_client, None)
         room_id = self.room_id
+        work_time = self.work_time.finish() if self.work_time is not None else None
         segmentation_node_id = self.segmentation_node_id
         preserve_recovery = bool(segmentation_node_id and self._has_unsettled_local_work())
         # Explicit Leave is not consent to discard edits. Already encoded work
@@ -8118,9 +8164,13 @@ class LiveCollaborationController:
             # An unreachable SMB share may keep a filesystem call blocked for
             # minutes.  Local teardown must always finish immediately; the
             # courtesy presence/audit cleanup is best-effort on a daemon lane.
-            self._leave_client_in_background(client, room_id)
+            self._leave_client_in_background(client, room_id, work_time, notify_remote=notify_remote)
         elif getattr(client, "transport_kind", None) == "ssh-folder":
-            self._leave_client_in_background(client, None)
+            self._leave_client_in_background(client, room_id, work_time, notify_remote=False)
+        elif work_time:
+            # Connection loss still preserves and attempts to transfer timing
+            # in a separate lane; this never delays local teardown.
+            self._leave_client_in_background(client, room_id, work_time, notify_remote=False)
         self.client = None
         self.room_id = None
         self.room_name = None
@@ -8134,6 +8184,7 @@ class LiveCollaborationController:
         self._joined_at_epoch = 0.0
         self._last_edit_activity_epoch = 0.0
         self.baselines.clear()
+        self._work_time_worker = None
         self._incoming_operations.clear()
         self._incoming_iterator = None
         self._incoming_piece = None
@@ -8317,6 +8368,9 @@ class LiveCollaborationController:
         # Preserve unacknowledged edits if Slicer exits or the module is
         # destroyed unexpectedly. Explicit Leave preserves pending edits too.
         self.leave(notify_remote=False)
+        if self.work_time is not None:
+            self.work_time.cleanup()
+            self.work_time = None
         try:
             import qt
 
@@ -9666,6 +9720,17 @@ class LiveCollaborationController:
             self._lock_pull_worker.start()
 
         presence_idle = self._presence_worker is None or not self._presence_worker.is_alive()
+        if (self.work_time is not None and self.work_time.pending
+                and (self._work_time_worker is None or not self._work_time_worker.is_alive())
+                and now - self._last_work_time_send >= 5.0):
+            self._last_work_time_send = now
+            self._work_time_worker = threading.Thread(
+                target=self._work_time_lane,
+                args=(self._session_token, self.client, self.room_id,
+                      list(self.work_time.pending[:128]), self.work_time.local_log),
+                name="LiveSegmentation-work-time-transfer", daemon=True,
+            )
+            self._work_time_worker.start()
         if presence_idle and (force_realtime or now - self._last_presence_send >= 0.75):
             self._last_presence_send = now
             self._presence_worker_started_at = time.monotonic()
@@ -9970,6 +10035,16 @@ class LiveCollaborationController:
                     "duration": time.monotonic() - started,
                 }
             )
+
+    def _work_time_lane(self, session_token, client, room_id, samples, local_log):
+        result = {"lane": "work-time", "session_token": session_token}
+        try:
+            if not local_log.flush(3.0, report=False):
+                raise LiveCollaborationError("Local work-time backup could not be confirmed")
+            result.update(client.record_work_intervals(room_id, samples))
+        except Exception as exc:
+            result["error"] = str(exc)
+        self._worker_results.put(result)
 
     def _presence_lane(self, session_token, client, room_id, details):
         started = time.monotonic()
@@ -10525,6 +10600,17 @@ class LiveCollaborationController:
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
             lane = str(result.get("lane") or "sync")
+            if lane == "work-time":
+                if self.work_time is not None:
+                    self.work_time.acknowledge(result.get("accepted_ids") or [])
+                    error = str(result.get("error") or "")
+                    if error != self.work_time.error:
+                        self.work_time.error = error
+                        self._append_activity(
+                            f"Work-time transfer delayed; local backup retained: {error}"
+                            if error else "Work-time transfer recovered.")
+                    self.work_time.refresh()
+                continue  # A timing failure must NOT disconnect voxel collaboration.
             if lane == "project-backup":
                 if result.get("error"):
                     self.backup_status_label.setText(f"Backup failed: {result['error']}")

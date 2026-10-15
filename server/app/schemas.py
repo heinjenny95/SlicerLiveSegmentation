@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LiveRoomJoin(BaseModel):
@@ -98,6 +98,25 @@ class LivePresenceUpdate(BaseModel):
     protocol_version: int | None = Field(default=None, ge=1, le=1000)
     volume_signature_hash: str | None = Field(default=None, max_length=64)
     transport: str | None = Field(default=None, max_length=80)
+
+
+class LiveWorkSample(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sample_id: str = Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    session_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    measurement_version: Literal[1]
+    category: Literal["work", "review", "manual_pause", "idle", "technical_wait", "away",
+                      "other_context", "communication", "unknown", "session_end"]
+    start_epoch: float = Field(ge=0, allow_inf_nan=False)
+    end_epoch: float = Field(ge=0, allow_inf_nan=False)
+    duration_seconds: float = Field(ge=0, le=604800, allow_inf_nan=False)
+    idle_threshold_seconds: float = Field(ge=15, le=900, allow_inf_nan=False)
+    nninteractive_busy: bool
+    expected_samples: int | None = Field(default=None, ge=0, le=10000000)
+
+
+class LiveWorkIntervals(BaseModel):
+    samples: list[LiveWorkSample] = Field(min_length=1, max_length=128)
 
 
 class LiveChatMessageCreate(BaseModel):

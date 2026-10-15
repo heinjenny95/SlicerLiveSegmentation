@@ -32,8 +32,15 @@ from .schemas import (
     LiveRoleUpdate,
     LiveRoomJoin,
     LiveSegmentLockUpdate,
+    LiveWorkIntervals,
 )
-from .study_log import RoomWorkLog, operation_details
+from .study_log import (
+    RoomWorkLog,
+    operation_details,
+    read_work_report,
+    validate_work_samples,
+    work_sample_event_id,
+)
 
 SERVER_VERSION = "0.15.1"
 COLLABORATION_PROTOCOL_VERSION = 3
@@ -757,8 +764,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         path = work_log(room_id).room_path / "work-log.txt"
         if not path.is_file():
             raise HTTPException(status_code=503, detail="Study log is still being written")
-        return PlainTextResponse(path.read_text(encoding="utf-8"),
-                                 headers={"Content-Disposition": 'attachment; filename="work-log.txt"'})
+        try:
+            text = read_work_report(path)
+        except (PermissionError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=503, detail="Study log is being updated; retry shortly") from exc
+        return PlainTextResponse(text, headers={"Content-Disposition": 'attachment; filename="work-log.txt"'})
+
+    @app.post("/api/live/rooms/{room_id}/work-intervals")
+    def record_work_intervals(room_id: str, payload: LiveWorkIntervals,
+                              user: str = Depends(require_room_member)):
+        try:
+            items = validate_work_samples([item.model_dump(exclude_none=True) for item in payload.samples])
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        log = work_log(room_id)
+        for item in items:
+            log.submit("work.interval", user, item["session_id"], item,
+                       event_id=work_sample_event_id(user, item["sample_id"]))
+        if not log.flush(3.0, report=False):
+            raise HTTPException(status_code=503, detail="Work-time journal not yet durable; retry")
+        return {"accepted_ids": [item["sample_id"] for item in items]}
 
     @app.get("/api/live/rooms/{room_id}/messages")
     def list_chat_messages(

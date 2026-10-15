@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -28,11 +30,144 @@ DETAIL_KEYS = frozenset({
     "metadata_update", "segment_deleted", "system_snapshot", "undo_of_sequence", "color_hex",
     "conflict_count", "locked", "lock_mode", "lock_holder", "owner", "state",
     "target_user", "role", "resolution", "has_anchor", "created", "name",
+    "sample_id", "session_id", "measurement_version", "category", "start_epoch",
+    "end_epoch", "duration_seconds", "idle_threshold_seconds", "nninteractive_busy", "expected_samples",
 })
+WORK_CATEGORIES = {"work", "review", "manual_pause", "idle", "technical_wait",
+                   "away", "other_context", "communication", "unknown"}
+
+
+def validate_work_samples(samples):
+    if not isinstance(samples, list) or not 1 <= len(samples) <= 128:
+        raise ValueError("Submit 1 to 128 work intervals")
+    result = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("Invalid work interval")
+        item = {key: sample.get(key) for key in ("sample_id", "session_id", "measurement_version",
+                "category", "start_epoch", "end_epoch", "duration_seconds",
+                "idle_threshold_seconds", "nninteractive_busy")}
+        if (not isinstance(item["sample_id"], str) or not isinstance(item["session_id"], str)
+                or not isinstance(item["category"], str) or type(item["measurement_version"]) is not int
+                or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", str(item["sample_id"]))
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(item["session_id"]))
+                or item["measurement_version"] != 1 or item["category"] not in WORK_CATEGORIES | {"session_end"}
+                or not isinstance(item["nninteractive_busy"], bool)):
+            raise ValueError("Unsupported work interval identity or method")
+        for field in ("start_epoch", "end_epoch", "duration_seconds", "idle_threshold_seconds"):
+            value = item[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("Work interval numbers must be finite")
+        duration = item["end_epoch"] - item["start_epoch"]
+        if item["category"] == "session_end":
+            count = sample.get("expected_samples")
+            if duration != 0 or item["duration_seconds"] != 0 or type(count) is not int or not 0 <= count <= 10000000:
+                raise ValueError("Invalid final work-time marker")
+            item["expected_samples"] = count
+        maximum = 604800 if item["category"] == "unknown" else 10.001
+        if ((item["category"] != "session_end" and not 0 < duration <= maximum)
+                or abs(duration - item["duration_seconds"]) > 0.001
+                or not 15 <= item["idle_threshold_seconds"] <= 900):
+            raise ValueError("Invalid work interval duration or idle threshold")
+        utc_stamp(item["start_epoch"])
+        utc_stamp(item["end_epoch"])
+        result.append(item)
+    return result
+
+
+def work_sample_event_id(user, sample_id):
+    return "work-" + hashlib.sha256(f"{user}\0{sample_id}".encode()).hexdigest()
+
+
+def active_work_report(records):
+    intervals = defaultdict(lambda: defaultdict(list))
+    thresholds = set()
+    unknown = 0.0
+    run_samples = defaultdict(set)
+    expected = {}
+    invalid = 0
+    attended = {(r.get("user"), r.get("session_id")) for r in records if r.get("event") == "room.join"}
+    measured = set()
+    for record in records:
+        if record.get("event") != "work.interval":
+            continue
+        try:
+            item = validate_work_samples([record["details"]])[0]
+        except (ValueError, TypeError, KeyError):
+            invalid += 1
+            continue
+        run_id = item["sample_id"].rsplit("-", 1)[0]
+        measured.add((record["user"], item["session_id"]))
+        run_key = (record["user"], item["session_id"], run_id)
+        if item["category"] == "session_end":
+            expected[run_key] = item["expected_samples"]
+            continue
+        run_samples[run_key].add(item["sample_id"])
+        intervals[record["user"]][item["category"]].append((item["start_epoch"], item["end_epoch"]))
+        thresholds.add(item["idle_threshold_seconds"])
+        if item["category"] == "unknown":
+            unknown += item["duration_seconds"]
+    lines = ["", "ACTIVE WORK (local measurement v1; seconds)",
+             "Work includes visual inspection. Automatic activity windows are ESTIMATES, not ground truth.",
+             "Manual Review explicitly counts silent inspection; pause it when taking a break.",
+             "Auto-resume requires purposeful local input, NOT chat, bare mouse movement or remote changes.",
+             "nnInteractive compute overlaps work/review: only non-working compute is technical waiting.",
+             "Automatic grace = configured idle threshold after input/returned result; while AI busy, input windows =2 s.",
+             "250 ms UI polling, 5 s interval checkpoints; observation gaps >10 s are unknown, not work.",
+             "Local monotonic durations with anchored client UTC; backend acceptance timestamps are separate.",
+             "Human names are self-reported; keep client clocks synchronized for cross-person interval unions.",
+             f"Configured idle thresholds (seconds): {', '.join(str(int(x)) for x in sorted(thresholds)) or 'no local samples yet'}"]
+    all_active = []
+    total_active = total_wait = total_pause = 0.0
+    for user, categories in sorted(intervals.items()):
+        active = categories["work"] + categories["review"]
+        seconds = merged_seconds(active)
+        wait = merged_seconds(categories["technical_wait"])
+        pause = merged_seconds(categories["manual_pause"])
+        total_active += seconds
+        total_wait += wait
+        total_pause += pause
+        all_active.extend(active)
+        lines.append(f"ACTIVE PERSON {json.dumps(user, ensure_ascii=False)} | work+review={seconds:.3f} | "
+                     + " | ".join(f"{key}={merged_seconds(categories[key]):.3f}" for key in sorted(WORK_CATEGORIES)))
+    measured_any = bool(intervals or expected)
+    def value(seconds):
+        return f"{seconds:.3f}" if measured_any else "UNAVAILABLE"
+    lines.extend([f"Active work including visual review: {value(total_active)}",
+                  f"Technical waiting: {value(total_wait)}", f"Manual pause: {value(total_pause)}",
+                  f"Active team time (interval union): {value(merged_seconds(all_active))}",
+                  f"Unknown observation time (not active): {value(unknown)}"])
+    if not measured_any:
+        lines.append("Active work is UNAVAILABLE for older attendance-only sessions; not reconstructed.")
+    if unknown:
+        lines.append("WARNING: Unobserved local time exists. Review coverage before publication.")
+    for run_key in run_samples.keys() | expected.keys():
+        if run_key not in expected:
+            lines.append(f"WARNING: Local timing end unconfirmed for {run_key[0]!r}; final coverage unknown.")
+        elif len(run_samples[run_key]) != expected[run_key]:
+            lines.append(f"WARNING: Missing local timing samples for {run_key[0]!r}: "
+                         f"saved={len(run_samples[run_key])}, expected={expected[run_key]}.")
+    if invalid:
+        lines.append(f"WARNING: {invalid} invalid work interval(s) excluded from active time.")
+    if attended - measured:
+        lines.append(f"WARNING: {len(attended - measured)} attendance session(s) have no local work measurement; "
+                     "older/uninstrumented work is NOT included in active totals.")
+    return lines
 
 
 def utc_stamp(epoch):
     return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat(timespec="milliseconds")
+
+
+def read_work_report(path):
+    """Bounded retry for Windows/SMB readers overlapping atomic TXT replace."""
+    for attempt in range(8):
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except (PermissionError, FileNotFoundError):
+            if attempt == 7:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def merged_seconds(intervals):
@@ -102,7 +237,7 @@ def render_report(records, issues=(), generated_at=None):
         "Live Segmentation - work and attendance log (schema 1)",
         f"Report generated: {utc_stamp(time.time() if generated_at is None else generated_at)} UTC",
         "Automatic since this feature was enabled; earlier work is NOT reconstructed.",
-        "All times are UTC, recorded at the collaboration backend on acceptance.",
+        "Activity/attendance timestamps are backend UTC on acceptance; work.interval contains local anchored UTC.",
         "Shared-folder PCs must have synchronized clocks. SSH uses the server clock.",
         "Attendance is NOT active editing time. Reading, waiting and breaks are included.",
         "Activity timestamps are sync operations, NOT exact brush-stroke durations.",
@@ -158,6 +293,7 @@ def render_report(records, issues=(), generated_at=None):
         lines.append(f"Last confirmed voxel edit: {utc_stamp(edits[-1]['epoch'])}")
         lines.append(f"Voxel-edit timestamp span (NOT active work): "
                      f"{edits[-1]['epoch'] - edits[0]['epoch']:.3f}")
+    lines.extend(active_work_report(records))
     lines.extend(["", "WARNINGS"])
     lines.extend(issues or ["None detected in saved journals; this does not prove no offline work occurred."])
     lines.extend(["", "ACTIVITY (UTC; confirmed backend actions)"])
@@ -185,6 +321,7 @@ class RoomWorkLog:
         self._busy = False
         self._completed_batches = 0
         self._urgent = False
+        self._force_report = False
         self._last_report = 0.0
         self._dirty_report = False
         self.error = ""
@@ -206,6 +343,7 @@ class RoomWorkLog:
         with self._guard:
             self._pending.append(record)
             self._urgent |= event in {"room.join", "room.leave"}
+            self._force_report |= event in {"room.join", "room.leave"}
             self._start_worker()
             self._guard.notify_all()
 
@@ -236,7 +374,9 @@ class RoomWorkLog:
                 self._pending = []
                 self._heartbeats = {}
                 urgent = self._urgent
+                force_report = self._force_report
                 self._urgent = False
+                self._force_report = False
                 if not records and not urgent:
                     if self._dirty_report:
                         report_due = self._last_report + REPORT_SECONDS
@@ -244,13 +384,14 @@ class RoomWorkLog:
                             deadline = min(time.monotonic() + FLUSH_SECONDS, report_due)
                             continue
                         urgent = True
+                        force_report = True
                     else:
                         self._worker = None
                         self._guard.notify_all()
                         return
                 self._busy = True
             try:
-                self._persist(records, force_report=urgent)
+                self._persist(records, force_report=force_report or bool(self.error))
                 self.error = ""
             except Exception as exc:
                 self.error = f"Study log not fully saved: {type(exc).__name__}: {exc}"
@@ -303,12 +444,13 @@ class RoomWorkLog:
         self._last_report = time.monotonic()
         self._dirty_report = False
 
-    def flush(self, timeout=5.0):
+    def flush(self, timeout=5.0, report=True):
         """Explicit shutdown/test barrier. NEVER call from the Slicer GUI thread."""
         deadline = time.monotonic() + timeout
         with self._guard:
             completed_before = self._completed_batches
             self._urgent = True
+            self._force_report |= bool(report)
             self._start_worker()
             self._guard.notify_all()
             while self._urgent or self._pending or self._heartbeats or self._busy:
