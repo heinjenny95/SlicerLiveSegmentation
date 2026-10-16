@@ -1009,6 +1009,89 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         segment.Modified()
 
     @classmethod
+    def stage_checkpoint_segment_steps(cls, node, segment_id, volume, baseline, previous, preserve_local):
+        """Build an independent native image without changing the visible one."""
+        from vtk.util import numpy_support
+
+        segment = node.GetSegmentation().GetSegment(segment_id)
+        binary = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        geometry = cls._label_reference_geometry(node, segment_id, volume)
+        old_image = segment.GetRepresentation(binary)
+        old_revision = None if geometry is None else (
+            old_image.GetMTime(), old_image.GetPointData().GetScalars().GetMTime(), int(segment.GetLabelValue()))
+        matrix = cls._reference_ijk_to_segmentation_ras_matrix(volume, node)
+        if matrix is None:
+            raise RuntimeError("Checkpoint requires linear relative geometry; local labels retained")
+        bounds = None
+        if geometry is not None:
+            bounds = reference_bounds(geometry[2], geometry[3], baseline.shape)
+        for coordinate, chunk in baseline.chunks.items():
+            origin = [value * baseline.chunk_size for value in coordinate]
+            found = [value for axis in range(3) for value in (origin[axis], origin[axis] + chunk.shape[axis])]
+            bounds = found if bounds is None else [
+                min(bounds[i], found[i]) if i % 2 == 0 else max(bounds[i], found[i]) for i in range(6)]
+            yield None
+        bounds = bounds or [0, 1, 0, 1, 0, 1]
+        z0, z1, y0, y1, x0, x1 = bounds
+        image = vtkSegmentationCore.vtkOrientedImageData()
+        image.SetExtent(x0, x1-1, y0, y1-1, z0, z1-1)
+        # VTK owns the staged scalar allocation. A NumPy-owned zero-copy
+        # buffer cannot rely on a temporary Python vtkDataArray wrapper staying
+        # alive after the image is retained only by native segmentation code.
+        image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+        target = numpy_support.vtk_to_numpy(image.GetPointData().GetScalars()).reshape((z1-z0, y1-y0, x1-x0))
+        depth = max(1, (1024 * 1024) // max(1, target.shape[1] * target.shape[2]))
+        local_changes = False
+        for start in range(0, target.shape[0], depth):
+            end = min(start + depth, target.shape[0])
+            region_bounds = [z0+start, z0+end, y0, y1, x0, x1]
+            server = baseline.region(region_bounds)
+            if preserve_local and geometry is not None:
+                _, internal, extent, mapping, label_value = geometry
+                current = sample_region(internal, extent, mapping, region_bounds, label_value)
+                before = previous.region(region_bounds) if previous is not None else np.zeros_like(server)
+                changed = current != before
+                if np.any(changed):
+                    local_changes = True
+                    server[changed] = current[changed]
+            target[start:end] = server
+            yield None
+        image.SetGeometryFromImageToWorldMatrix(matrix)
+        return {"segment_id": segment_id, "segment": segment, "old_image": old_image,
+                "old_revision": old_revision, "image": image, "matrix": matrix,
+                "volume": volume, "local_changes": local_changes}
+
+    @classmethod
+    def commit_checkpoint_segments(cls, node, stages):
+        """Verify all staged images before a short, render-blocked pointer swap."""
+        binary = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        segmentation = node.GetSegmentation()
+        for stage in stages:
+            segment = segmentation.GetSegment(stage["segment_id"])
+            if segment != stage["segment"] or segment.GetRepresentation(binary) != stage["old_image"]:
+                return False
+            old = stage["old_image"]
+            if stage["old_revision"] is not None and (
+                old.GetMTime(), old.GetPointData().GetScalars().GetMTime(), int(segment.GetLabelValue())
+            ) != stage["old_revision"]:
+                return False
+            current_matrix = cls._reference_ijk_to_segmentation_ras_matrix(stage["volume"], node)
+            if current_matrix is None or not cls._matrices_match(current_matrix, stage["matrix"]):
+                return False
+        with slicer.util.RenderBlocker():
+            modify = node.StartModify()
+            try:
+                for stage in stages:
+                    segment = stage["segment"]
+                    segment.AddRepresentation(binary, stage["image"])
+                    segment.SetLabelValue(1)
+                    segment.RemoveAllRepresentations(binary)
+                    segment.Modified()
+            finally:
+                node.EndModify(modify)
+        return True
+
+    @classmethod
     def update_segment_binary_labelmap_crop(
         cls,
         current_crop,

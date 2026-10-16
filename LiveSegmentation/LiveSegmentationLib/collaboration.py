@@ -5120,6 +5120,9 @@ class LiveCollaborationController:
 
     def __init__(self, module_widget):
         self.owner = module_widget
+        self._checkpoint_group = None
+        self._checkpoint_ingest_iterator = None
+        self._checkpoint_commit_iterator = None
         self.connected = False
         self.client = None
         self.room_id = None
@@ -8186,6 +8189,9 @@ class LiveCollaborationController:
         self.baselines.clear()
         self._work_time_worker = None
         self._incoming_operations.clear()
+        self._checkpoint_group = None
+        self._checkpoint_ingest_iterator = None
+        self._checkpoint_commit_iterator = None
         self._incoming_iterator = None
         self._incoming_piece = None
         self._incoming_received_sequence = 0
@@ -10986,8 +10992,32 @@ class LiveCollaborationController:
         deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
         started = time.perf_counter()
         try:
-            while self._incoming_operations and time.perf_counter() < deadline:
+            while (self._incoming_operations or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and time.perf_counter() < deadline:
+                if self._checkpoint_group is not None and self._checkpoint_group.complete:
+                    if self._checkpoint_commit_iterator is None:
+                        self._checkpoint_commit_iterator = self._commit_checkpoint_steps(self._checkpoint_group)
+                    try:
+                        next(self._checkpoint_commit_iterator)
+                    except StopIteration:
+                        self._checkpoint_group = None
+                        self._checkpoint_commit_iterator = None
+                    continue
                 operation = self._incoming_operations[0]
+                if self._checkpoint_group is not None or (operation.get("system_snapshot") and operation.get("snapshot_group_id")):
+                    if self._checkpoint_group is None:
+                        try:
+                            from .checkpoints import CheckpointGroup
+                        except ImportError:
+                            from checkpoints import CheckpointGroup
+                        self._checkpoint_group = CheckpointGroup(operation, self.volume_shape, ChunkedMaskBaseline, iter_operation_tiles)
+                    if self._checkpoint_ingest_iterator is None:
+                        self._checkpoint_ingest_iterator = self._checkpoint_group.ingest(operation)
+                    try:
+                        next(self._checkpoint_ingest_iterator)
+                    except StopIteration:
+                        self._checkpoint_ingest_iterator = None
+                        self._incoming_operations.popleft()
+                    continue
                 if operation.get("_undecodable") and self._incoming_iterator is None:
                     self._skip_damaged_operation(self._incoming_operations.popleft())
                     continue
@@ -11022,7 +11052,7 @@ class LiveCollaborationController:
             if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
                 self.initial_sync_complete = True
                 self._initialize_baselines_and_seed(seed=False)
-            if self._incoming_operations and not self._incoming_continuation_scheduled:
+            if (self._incoming_operations or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and not self._incoming_continuation_scheduled:
                 import qt
 
                 self._incoming_continuation_scheduled = True
@@ -11036,6 +11066,8 @@ class LiveCollaborationController:
 
                 qt.QTimer.singleShot(GUI_CONTINUATION_MILLISECONDS, continue_incoming)
         except Exception as exc:
+            self._checkpoint_ingest_iterator = None
+            self._checkpoint_commit_iterator = None
             if str(exc) == "Live label changed during extent preparation":
                 # A local edit won the race with a staged image allocation.
                 # Restart preparation using its new state; nothing was applied.
@@ -11049,6 +11081,74 @@ class LiveCollaborationController:
             self._show_error(f"Could not prepare incoming edit: {exc}")
         finally:
             self.session_metrics.record("gui-incoming", time.perf_counter() - started)
+
+    def _commit_checkpoint_steps(self, group):
+        """No visible mutation until a complete, privately staged group exists."""
+        try:
+            from .checkpoints import same_baseline_steps
+        except ImportError:
+            from checkpoints import same_baseline_steps
+        node = self._segmentation_node()
+        if node is None:
+            raise LiveCollaborationError("Checkpoint target disappeared; local labels retained")
+        while True:
+            staged = []
+            dirty = set()
+            for segment_id, baseline in group.baselines.items():
+                key = (node.GetID(), segment_id)
+                if self._segment_has_pending_deletion(node, segment_id):
+                    continue
+                same = yield from same_baseline_steps(self.baselines.get(key), baseline)
+                if same:
+                    continue
+                self._ensure_segment(node, group.metadata[segment_id])
+                prepare = getattr(self.owner, "stage_checkpoint_segment_steps", None)
+                if not callable(prepare):
+                    raise LiveCollaborationError("Atomic checkpoint preparation unavailable; local labels retained")
+                stage = yield from prepare(node, segment_id, self.owner.get_volume_node(),
+                                           baseline, self.baselines.get(key), self.initial_sync_complete)
+                staged.append(stage)
+                if stage.get("local_changes"):
+                    dirty.add(key)
+            commit = getattr(self.owner, "commit_checkpoint_segments", None)
+            if not staged or (callable(commit) and commit(node, staged)):
+                break
+            # A local stroke during staging invalidates the private copy, not
+            # the stroke. Rebuild cooperatively from the current MRML revision.
+            yield None
+        self._applying_remote = True
+        try:
+            for segment_id, baseline in group.baselines.items():
+                key = (node.GetID(), segment_id)
+                self.baselines[key] = baseline
+                bounds = None
+                for coordinate, chunk in baseline.chunks.items():
+                    origin = [value * baseline.chunk_size for value in coordinate]
+                    chunk_bounds = [value for axis in range(3) for value in (origin[axis], origin[axis] + chunk.shape[axis])]
+                    bounds = _bounds_union(bounds, chunk_bounds)
+                self.baseline_bounds[key] = bounds
+                if not self._segment_has_pending_deletion(node, segment_id):
+                    metadata = group.metadata[segment_id]
+                    if key in self.metadata_updates:
+                        metadata = {**metadata, **(self._current_segment_metadata(node, segment_id) or {})}
+                    self._ensure_segment(node, metadata)
+                    self._known_segment_ids.add(segment_id)
+                    self._remember_segment_revision(node, segment_id)
+            for operation in group.deletions.values():
+                if self._apply_operations([operation]) is False:
+                    raise LiveCollaborationError("Checkpoint deletion failed; inspect the persistent error log")
+            self.dirty_segments.update(dirty)
+            self.last_sequence = group.last_sequence
+            self._last_snapshot_sequence = max(self._last_snapshot_sequence, group.last_sequence)
+            for operation in group.records:
+                if operation.get("author") == self.user_name:
+                    self._acknowledge_local_operation(operation)
+            self._append_history_operations([group.records[0]])
+            self._refresh_label_combo()
+            self.session_metrics.increment("checkpoint_groups_applied")
+            self.session_metrics.increment("checkpoint_voxel_replacements", len(staged))
+        finally:
+            self._applying_remote = False
 
     def _skip_damaged_operation(self, operation):
         """Pass over an operation nobody can apply and say so."""
@@ -11874,7 +11974,22 @@ class LiveCollaborationController:
         created = segment is None
         if segment is None:
             segment = slicer.vtkSegment()
-            segmentation.AddSegment(segment, segment_id)
+            # Native editors may auto-select a just-added scene material.
+            # Receiving a remote label is not a local selection request.
+            editors = []
+            get_nodes = getattr(slicer.util, "getNodesByClass", None)
+            if callable(get_nodes):
+                editors = [(editor, editor.GetSelectedSegmentID()) for editor in get_nodes("vtkMRMLSegmentEditorNode")
+                           if editor.GetSegmentationNode() == node]
+            applying = self._applying_remote
+            self._applying_remote = True
+            try:
+                segmentation.AddSegment(segment, segment_id)
+            finally:
+                for editor, selected in editors:
+                    if selected is None or segmentation.GetSegment(selected) is not None:
+                        editor.SetSelectedSegmentID(selected)
+                self._applying_remote = applying
         # Voxel patches carry metadata only as context. Applying it on every
         # patch lets a delayed paint operation revert a newer rename or color
         # change. New segments need initial metadata; existing segments change

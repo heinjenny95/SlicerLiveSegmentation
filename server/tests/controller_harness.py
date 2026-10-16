@@ -119,6 +119,23 @@ class Owner:
     def refresh_segmentation_display(self, *args):
         pass
 
+    def stage_checkpoint_segment_steps(self, node, segment_id, volume, baseline, previous, preserve_local):
+        current = node.GetSegmentation().GetSegment(segment_id).mask
+        before = np.zeros_like(current) if previous is None else previous.to_dense()
+        target = baseline.to_dense()
+        local = current != before if preserve_local else np.zeros_like(current, dtype=bool)
+        target[local] = current[local]
+        yield None
+        return {"segment_id": segment_id, "target": target, "before": current.copy(),
+                "local_changes": bool(np.any(local))}
+
+    def commit_checkpoint_segments(self, node, stages):
+        if any(not np.array_equal(node.GetSegmentation().GetSegment(s["segment_id"]).mask, s["before"]) for s in stages):
+            return False
+        for stage in stages:
+            node.GetSegmentation().GetSegment(stage["segment_id"]).mask = stage["target"]
+        return True
+
     def show_remote_change_highlight_crop(self, *args):
         pass
 

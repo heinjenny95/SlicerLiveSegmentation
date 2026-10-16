@@ -4,6 +4,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
   LiveSegmentationLib/__init__.py
   LiveSegmentationLib/collaboration.py
+  LiveSegmentationLib/checkpoints.py
   LiveSegmentationLib/features.py
   LiveSegmentationLib/work_log.py
   LiveSegmentationLib/active_work.py

@@ -8,6 +8,17 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Consistent room checkpoints
+
+- Assemble complete system-checkpoint groups privately across feed pages before
+  touching visible materials. Compare sparse baseline chunks cooperatively and
+  skip unchanged masks entirely, avoiding repeated clear/repaint and native
+  labelmap work for routine history compaction. Keep pending local edits visible.
+- Changed masks are staged in bounded GUI slices, revision-checked and committed
+  together; malformed/incomplete groups retain the old replica and report an
+  error instead of displaying a partial checkpoint. Existing wire format stays
+  compatible. Tests check intermediate visibility, not just final convergence.
+
 ### Fast native integer source-range preparation
 
 - Avoid VTK 9.6.2's per-point image-range scan when opening the standard editor
