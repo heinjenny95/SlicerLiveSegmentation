@@ -8,6 +8,16 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Bounded ROI geometry in live synchronization
+
+- Read shifted ROI origins and affine label geometry in the requested reference
+  region instead of exporting, copying and scanning complete reference volumes
+  on the GUI thread. Capture only the label footprint and yield between slabs.
+- Keep packed label values separate, clip transformed footprints to the source,
+  verify geometry/revisions during capture and reject unsupported relative
+  non-linear transforms explicitly instead of silently starting a full export.
+- Add ROI-origin and affine sampling regressions plus a native large-data probe.
+
 ### Active local work time, including visual review
 
 - Add compact global Work/Review/Pause/Resume controls. Purposeful local view

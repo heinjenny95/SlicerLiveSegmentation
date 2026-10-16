@@ -9,6 +9,7 @@ import vtk
 import vtkSegmentationCorePython as vtkSegmentationCore
 from LiveSegmentationLib.collaboration import LiveCollaborationController
 from LiveSegmentationLib.features import stable_user_color, validate_material_template
+from LiveSegmentationLib.roi_geometry import reference_bounds, sample_region
 from LiveSegmentationLib.version import PLUGIN_VERSION
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
@@ -739,15 +740,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         )
 
     @classmethod
-    def segment_mask_crop_in_reference_geometry(
-        cls, segmentation_node, segment_id, reference_volume_node
-    ):
-        """Return ``(crop, zyx_bounds)`` directly from Slicer's internal labelmap.
-
-        This avoids the temporary full-size label volume created by
-        ``arrayFromSegmentBinaryLabelmap``. ``None`` means that geometry requires
-        the slower, general resampling path. An empty segment returns ``(None, None)``.
-        """
+    def _label_reference_geometry(cls, segmentation_node, segment_id, reference_volume_node):
+        """Native view and affine reference->label mapping; no full image export."""
         segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
         if segment is None:
             raise RuntimeError(f"Segment no longer exists: {segment_id}")
@@ -756,80 +750,95 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         )
         image = segment.GetRepresentation(binary_name)
         if image is None or image.GetPointData().GetScalars() is None:
-            return (None, None)
+            return None
         reference_matrix = cls._reference_ijk_to_segmentation_ras_matrix(
             reference_volume_node, segmentation_node
         )
         if reference_matrix is None:
-            return None
+            raise RuntimeError("Live collaboration requires linear relative transforms. "
+                               "Harden the non-linear transform before joining; no full-volume fallback was attempted.")
         image_matrix = vtk.vtkMatrix4x4()
         image.GetImageToWorldMatrix(image_matrix)
-        if not cls._matrices_match(image_matrix, reference_matrix):
-            return None
+        native = np.array([[image_matrix.GetElement(r, c) for c in range(4)] for r in range(4)])
+        reference = np.array([[reference_matrix.GetElement(r, c) for c in range(4)] for r in range(4)])
+        try:
+            mapping = np.linalg.solve(native, reference)
+        except np.linalg.LinAlgError as exc:
+            raise RuntimeError("Live label has non-invertible geometry") from exc
         extent = [int(value) for value in image.GetExtent()]
         if extent[0] > extent[1] or extent[2] > extent[3] or extent[4] > extent[5]:
-            return (None, None)
+            return None
         internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
             segmentation_node, segment_id
         )
-        label_value = int(segment.GetLabelValue())
-        crop = np.asarray(internal == label_value, dtype=np.uint8)
-        occupied_z = np.flatnonzero(np.any(crop, axis=(1, 2)))
-        if not occupied_z.size:
-            return (None, None)
-        occupied_y = np.flatnonzero(np.any(crop, axis=(0, 2)))
-        occupied_x = np.flatnonzero(np.any(crop, axis=(0, 1)))
-        local_bounds = [
-            int(occupied_z[0]), int(occupied_z[-1]) + 1,
-            int(occupied_y[0]), int(occupied_y[-1]) + 1,
-            int(occupied_x[0]), int(occupied_x[-1]) + 1,
-        ]
-        z0, z1, y0, y1, x0, x1 = local_bounds
-        crop = np.ascontiguousarray(crop[z0:z1, y0:y1, x0:x1])
-        bounds = [
-            extent[4] + z0,
-            extent[4] + z1,
-            extent[2] + y0,
-            extent[2] + y1,
-            extent[0] + x0,
-            extent[0] + x1,
-        ]
-        return crop, bounds
+        return image, internal, extent, mapping, int(segment.GetLabelValue())
+
+    @classmethod
+    def segment_mask_crop_in_reference_geometry(cls, segmentation_node, segment_id, reference_volume_node):
+        """Read only the native label's reference-space footprint, including ROI offsets."""
+        capture = cls.capture_segment_mask_steps(segmentation_node, segment_id, reference_volume_node)
+        while True:
+            try:
+                next(capture)
+            except StopIteration as stopped:
+                return stopped.value
 
     @classmethod
     def capture_segment_mask_steps(cls, segmentation_node, segment_id, reference_volume_node):
         """Copy a stable mask for background diffing, yielding between slabs."""
-        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
-        if segment is None:
-            raise RuntimeError("Live label changed during mask capture")
-        binary_name = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
-        image = segment.GetRepresentation(binary_name)
-        if image is None or image.GetPointData().GetScalars() is None:
+        geometry = cls._label_reference_geometry(segmentation_node, segment_id, reference_volume_node)
+        if geometry is None:
             return None, None
-        matrix = cls._reference_ijk_to_segmentation_ras_matrix(reference_volume_node, segmentation_node)
-        image_matrix = vtk.vtkMatrix4x4()
-        image.GetImageToWorldMatrix(image_matrix)
-        if matrix is None or not cls._matrices_match(image_matrix, matrix):
-            result = cls.segment_mask_crop_in_reference_geometry(segmentation_node, segment_id, reference_volume_node)
-            if result is None:
-                # Preserve Slicer's general resampling compatibility. This is
-                # the uncommon transformed-geometry fallback, not the bounded
-                # path used by standard Segment Editor and source-aligned ROIs.
-                shape = tuple(reversed(reference_volume_node.GetImageData().GetDimensions()))
-                mask = cls.segment_mask_in_reference_geometry(segmentation_node, segment_id, reference_volume_node, shape)
-                return mask, [0, shape[0], 0, shape[1], 0, shape[2]]
-            return result
+        image, internal, extent, mapping, label_value = geometry
         revision = (image.GetMTime(), image.GetPointData().GetScalars().GetMTime())
-        label_value = int(segment.GetLabelValue())
-        extent = [int(value) for value in image.GetExtent()]
-        internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
-        copy = np.empty(internal.shape, dtype=np.uint8)
-        depth = max(1, (1024 * 1024) // max(1, internal.shape[1] * internal.shape[2] * internal.itemsize))
+        binary_name = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+
+        def verify_capture():
+            current = segmentation_node.GetSegmentation().GetSegment(segment_id)
+            if current is None or current.GetRepresentation(binary_name) != image or int(current.GetLabelValue()) != label_value or (
+                image.GetMTime(), image.GetPointData().GetScalars().GetMTime()
+            ) != revision:
+                raise RuntimeError("Live label changed during mask capture")
+            latest = cls._label_reference_geometry(segmentation_node, segment_id, reference_volume_node)
+            if latest is None or not np.allclose(latest[3], mapping, rtol=0, atol=1e-10):
+                raise RuntimeError("Live label changed during mask capture")
+        # A packed layer can cover distant siblings. Find this label's footprint
+        # cooperatively before allocating its capture, not a copy of the layer.
+        native_bounds = None
+        scan_depth = max(1, (1024 * 1024) // max(1, internal.shape[1] * internal.shape[2]))
+        for start in range(0, internal.shape[0], scan_depth):
+            slab = internal[start:start+scan_depth] == label_value
+            z = np.flatnonzero(np.any(slab, axis=(1, 2)))
+            if z.size:
+                y = np.flatnonzero(np.any(slab, axis=(0, 2)))
+                x = np.flatnonzero(np.any(slab, axis=(0, 1)))
+                found = [start+int(z[0]), start+int(z[-1])+1, int(y[0]), int(y[-1])+1, int(x[0]), int(x[-1])+1]
+                if native_bounds is None:
+                    native_bounds = found
+                else:
+                    for axis in range(3):
+                        native_bounds[2*axis] = min(native_bounds[2*axis], found[2*axis])
+                        native_bounds[2*axis+1] = max(native_bounds[2*axis+1], found[2*axis+1])
+            yield None
+            verify_capture()
+        if native_bounds is None:
+            return None, None
+        nz0, nz1, ny0, ny1, nx0, nx1 = native_bounds
+        occupied_extent = [extent[0]+nx0, extent[0]+nx1-1, extent[2]+ny0, extent[2]+ny1-1,
+                           extent[4]+nz0, extent[4]+nz1-1]
+        shape = tuple(reversed(reference_volume_node.GetImageData().GetDimensions()))
+        region = reference_bounds(occupied_extent, mapping, shape)
+        if region is None:
+            return None, None
+        rz0, rz1, ry0, ry1, rx0, rx1 = region
+        copy = np.empty((rz1-rz0, ry1-ry0, rx1-rx0), dtype=np.uint8)
+        depth = max(1, (1024 * 1024) // max(1, copy.shape[1] * copy.shape[2]))
         bounds = None
-        for start in range(0, internal.shape[0], depth):
-            end = min(start + depth, internal.shape[0])
+        for start in range(0, copy.shape[0], depth):
+            end = min(start + depth, copy.shape[0])
             slab = copy[start:end]
-            np.equal(internal[start:end], label_value, out=slab)
+            slab[:] = sample_region(internal, extent, mapping,
+                                    [rz0+start, rz0+end, ry0, ry1, rx0, rx1], label_value)
             z = np.flatnonzero(np.any(slab, axis=(1, 2)))
             if z.size:
                 y = np.flatnonzero(np.any(slab, axis=(0, 2)))
@@ -842,76 +851,23 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                         bounds[2 * axis] = min(bounds[2 * axis], found[2 * axis])
                         bounds[2 * axis + 1] = max(bounds[2 * axis + 1], found[2 * axis + 1])
             yield None
-        current = segmentation_node.GetSegmentation().GetSegment(segment_id)
-        if current is None or current.GetRepresentation(binary_name) != image or int(current.GetLabelValue()) != label_value or (
-            image.GetMTime(), image.GetPointData().GetScalars().GetMTime()
-        ) != revision:
-            raise RuntimeError("Live label changed during mask capture")
+            verify_capture()
         if bounds is None:
             return None, None
         z0, z1, y0, y1, x0, x1 = bounds
-        return copy[z0:z1, y0:y1, x0:x1], [extent[4] + z0, extent[4] + z1, extent[2] + y0, extent[2] + y1, extent[0] + x0, extent[0] + x1]
+        return copy[z0:z1, y0:y1, x0:x1], [rz0 + z0, rz0 + z1, ry0 + y0, ry0 + y1, rx0 + x0, rx0 + x1]
 
     @classmethod
     def segment_mask_region_in_reference_geometry(
         cls, segmentation_node, segment_id, reference_volume_node, voxel_bbox
     ):
-        """Read only one reference-geometry region from an internal labelmap.
-
-        The returned region always has the requested size and is zero-padded
-        outside the segment's cropped internal extent. ``None`` requests the
-        caller's general resampling fallback.
-        """
-        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
-        if segment is None:
-            raise RuntimeError(f"Segment no longer exists: {segment_id}")
+        """Read only this region, also for shifted/scaled/rotated affine ROIs."""
         z0, z1, y0, y1, x0, x1 = [int(value) for value in voxel_bbox]
-        result = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
-        binary_name = (
-            vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
-        )
-        image = segment.GetRepresentation(binary_name)
-        if image is None or image.GetPointData().GetScalars() is None:
-            return result
-        reference_matrix = cls._reference_ijk_to_segmentation_ras_matrix(
-            reference_volume_node, segmentation_node
-        )
-        if reference_matrix is None:
-            return None
-        image_matrix = vtk.vtkMatrix4x4()
-        image.GetImageToWorldMatrix(image_matrix)
-        if not cls._matrices_match(image_matrix, reference_matrix):
-            return None
-        extent = [int(value) for value in image.GetExtent()]
-        ix0, ix1, iy0, iy1, iz0, iz1 = extent
-        overlap = [
-            max(z0, iz0),
-            min(z1, iz1 + 1),
-            max(y0, iy0),
-            min(y1, iy1 + 1),
-            max(x0, ix0),
-            min(x1, ix1 + 1),
-        ]
-        oz0, oz1, oy0, oy1, ox0, ox1 = overlap
-        if oz0 >= oz1 or oy0 >= oy1 or ox0 >= ox1:
-            return result
-        internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
-            segmentation_node, segment_id
-        )
-        label_value = int(segment.GetLabelValue())
-        result[
-            oz0 - z0 : oz1 - z0,
-            oy0 - y0 : oy1 - y0,
-            ox0 - x0 : ox1 - x0,
-        ] = (
-            internal[
-                oz0 - iz0 : oz1 - iz0,
-                oy0 - iy0 : oy1 - iy0,
-                ox0 - ix0 : ox1 - ix0,
-            ]
-            == label_value
-        )
-        return result
+        geometry = cls._label_reference_geometry(segmentation_node, segment_id, reference_volume_node)
+        if geometry is None:
+            return np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.uint8)
+        _, internal, extent, mapping, label_value = geometry
+        return sample_region(internal, extent, mapping, voxel_bbox, label_value)
 
     @classmethod
     def _oriented_image_from_reference_crop(

@@ -8994,6 +8994,7 @@ class LiveCollaborationController:
                     None if crop is None else np.asarray(crop, dtype=np.uint8),
                     None if bounds is None else [int(value) for value in bounds],
                 )
+            raise RuntimeError("Bounded live label geometry read is unavailable; no full-volume export was attempted")
         mask = self.owner.segment_mask_in_reference_geometry(
             node, segment_id, volume_node, self.volume_shape
         )
@@ -9024,6 +9025,7 @@ class LiveCollaborationController:
             region = region_reader(node, segment_id, volume_node, bounds)
             if region is not None:
                 return np.asarray(region, dtype=np.uint8)
+            raise RuntimeError("Bounded live label region read is unavailable; no full-volume export was attempted")
         mask = self._read_mask(node, segment_id)
         z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
         return np.ascontiguousarray(mask[z0:z1, y0:y1, x0:x1])

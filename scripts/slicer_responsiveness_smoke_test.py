@@ -16,6 +16,8 @@ import qt
 import slicer
 import vtk
 
+KEEP_ALIVE = []
+
 
 def pump_until(predicate, timeout=30.0):
     deadline = time.monotonic() + timeout
@@ -35,6 +37,7 @@ def run_probe():
     )
 
     widget = slicer.modules.livesegmentation.widgetRepresentation().self()
+    KEEP_ALIVE.append(widget)
     controller = widget.live_collaboration
     settings = qt.QSettings()
     prefix = controller.SETTINGS_PREFIX
@@ -230,4 +233,7 @@ def main():
     slicer.app.exit(0 if result["ok"] else 1)
 
 
-qt.QTimer.singleShot(1000, main)
+if os.environ.get("LIVE_PROBE_SYNCHRONOUS") == "1":
+    main()
+else:
+    qt.QTimer.singleShot(1000, main)
