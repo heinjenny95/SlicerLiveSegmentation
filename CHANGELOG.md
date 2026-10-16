@@ -8,6 +8,17 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Asynchronous approximate live 3D preview
+
+- Add a clearly labeled local 3D preview with bounded occupancy pooling and
+  private worker-owned mesh conversion. Authoritative labelmaps and label
+  exports stay at full resolution. Revisions reject stale worker results;
+  scene close, leave, visibility, colors and parent transforms are respected.
+- While in a live room, replace native editors' synchronous Show 3D entry with
+  the global preview action. Derived full-resolution surfaces are not retained
+  during preview, avoiding automatic reconversion during native ROI writes.
+  Preview models are excluded from scene saves and never synchronized.
+
 ### Persistent diagnostic history
 
 - Add process-owned asynchronous rotating JSONL logs for operation receipt/
