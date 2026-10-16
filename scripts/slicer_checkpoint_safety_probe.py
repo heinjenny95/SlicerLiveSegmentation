@@ -6,12 +6,15 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-import qt
 import slicer
+
+KEEP_ALIVE = []
+print("CHECKPOINT_PROBE_SCRIPT_LOADED", os.environ.get("LIVE_CHECKPOINT_PROBE_OUTPUT"), flush=True)
 
 
 def run():
     result = {"ok": False}
+    print("CHECKPOINT_PROBE_RUNNING", flush=True)
     try:
         from LiveSegmentationLib.collaboration import (
             ChunkedMaskBaseline,
@@ -19,9 +22,16 @@ def run():
             encode_chunked_mask_snapshot,
         )
 
-        widget = slicer.modules.livesegmentation.widgetRepresentation().self()
+        widget = slicer.app.moduleManager().module("LiveSegmentation").widgetRepresentation().self()
         controller = widget.live_collaboration
+        KEEP_ALIVE.extend([widget, controller])
         controller.timer.stop()
+        if widget.diagnostics_action is not None:
+            controller._record_diagnostic_error("Native probe: readable diagnostic history", lane="probe")
+            controller.show_diagnostic_history()
+            assert "readable diagnostic history" in controller._diagnostic_text.toPlainText()
+            assert "Errors (1)" == widget.diagnostics_action.text
+            result["global_diagnostic_history_readable"] = True
         shape = (128, 128, 128)
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Checkpoint source")
         slicer.util.updateVolumeFromArray(volume, np.zeros(shape, np.uint8))
@@ -51,8 +61,10 @@ def run():
         standard.setSegmentationNode(node)
         standard.setCurrentSegmentID("A")
         ir = None
-        if getattr(slicer.modules, "slicernninteractiveir", None) is not None:
-            ir = slicer.modules.slicernninteractiveir.widgetRepresentation().self()
+        ir_module = slicer.app.moduleManager().module("SlicerNNInteractiveIR")
+        if ir_module is not None and os.environ.get("LIVE_PROBE_SKIP_IR") != "1":
+            ir = ir_module.widgetRepresentation().self()
+            KEEP_ALIVE.append(ir)
             ir.set_editor_segmentation_node(node, "A")
             ir.store_segment_editor_target(node, "A", "native-probe")
         controller._ensure_segment(node, {"segment_id": "remote-B", "segment_name": "remote-B", "author": "remote", "color_hex": "#0000FF"})
@@ -91,6 +103,9 @@ def run():
             assert np.array_equal(slicer.util.arrayFromSegmentBinaryLabelmap(node, "A", volume), mask)
         assert node.GetSegmentation().GetSegment("A").GetRepresentation("Binary labelmap") == before_image
         result["unchanged_checkpoint_no_native_rewrite"] = True
+        if os.environ.get("LIVE_PROBE_SKIP_CHANGED") == "1":
+            result.update(ok=True, changed_checkpoint_skipped_for_control=True)
+            return
         changed = mask.copy()
         changed[1, 1, 1] = 0
         changed[2, 2, 2] = 1
@@ -111,6 +126,23 @@ def run():
     except Exception:
         result["error"] = traceback.format_exc()
     finally:
+        if "controller" in locals():
+            # This probe installs a replica directly, without a transport or a
+            # room join. Do not run joined-room teardown on that test fixture.
+            controller.connected = False
+            controller.segmentation_node_id = None
+            controller.client = None
+        if "ir" in locals() and ir is not None:
+            ir.cleanup()
+        if "widget" in locals():
+            widget.cleanup()
+        if "controller" in locals() and controller.diagnostic_log is not None:
+            log = controller.diagnostic_log
+            records = [json.loads(line) for path in log.directory.glob(log.path.name+"*")
+                       for line in path.read_text(encoding="utf-8").splitlines()]
+            assert any(r["event"] == "checkpoint.committed" for r in records)
+            result["persistent_diagnostic_records"] = len(records)
+        slicer.mrmlScene.Clear(0)
         output = Path(os.environ["LIVE_CHECKPOINT_PROBE_OUTPUT"])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
@@ -118,4 +150,4 @@ def run():
         slicer.app.exit(0 if result["ok"] else 1)
 
 
-qt.QTimer.singleShot(1000, run)
+run()

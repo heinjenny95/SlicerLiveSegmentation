@@ -8,6 +8,16 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Persistent diagnostic history
+
+- Add process-owned asynchronous rotating JSONL logs for operation receipt/
+  application, transport durations, checkpoint preparation/commit, slow GUI
+  callbacks and errors. Records carry UTC and monotonic times, IDs and counts,
+  not masks, raw credentials or chat content. Log-write failures are exposed.
+- Keep connection errors readable until acknowledged, independently of transport
+  recovery. A global Errors button exposes recent errors and the local log folder.
+  Recovery no longer automatically closes the error box or clears its text.
+
 ### Consistent room checkpoints
 
 - Assemble complete system-checkpoint groups privately across feed pages before

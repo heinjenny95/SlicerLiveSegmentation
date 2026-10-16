@@ -66,6 +66,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.navigation_toolbar = None
         self.navigation_action = None
         self.ir_navigation_action = None
+        self.diagnostics_action = None
 
     def setup(self):
         super().setup()
@@ -196,6 +197,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def _on_module_selected(self, module_name):
         """Bind only on actual Segment Editor navigation, never on live/IR entry."""
+        controller = getattr(self, "live_collaboration", None)
+        if controller is not None:
+            controller._diagnostic_event("gui.module_selected", module=str(module_name))
         if module_name != "SegmentEditor" or not self._live_session_active:
             return
         segmentation = self.get_segmentation_node()
@@ -236,6 +240,10 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         chat = toolbar.addAction("Chat")
         chat.triggered.connect(lambda checked=False: self.live_collaboration.show_chat_dock())
         chat.setToolTip("Open the persistent collaboration chat without switching modules")
+        diagnostics = toolbar.addAction("Errors (0)")
+        diagnostics.setToolTip("Persistent errors and local diagnostic logs; available in every module")
+        diagnostics.triggered.connect(self.live_collaboration.show_diagnostic_history)
+        self.diagnostics_action = diagnostics
         main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
         self.navigation_toolbar = toolbar
         self.navigation_action = action

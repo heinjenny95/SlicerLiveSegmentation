@@ -25,6 +25,7 @@ import socket
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -5119,6 +5120,10 @@ class LiveCollaborationController:
     SETTINGS_PREFIX = "LiveSegmentation/collaboration/"
 
     def __init__(self, module_widget):
+        try:
+            from .diagnostics import ResultQueue
+        except ImportError:
+            from diagnostics import ResultQueue
         self.owner = module_widget
         self._checkpoint_group = None
         self._checkpoint_ingest_iterator = None
@@ -5190,7 +5195,8 @@ class LiveCollaborationController:
         self._join_started_at = 0.0
         self._join_status_second = -1
         self._join_context = None
-        self._worker_results = queue.Queue()
+        self._worker_results = ResultQueue()
+        self._result_queue_type = ResultQueue
         self._incoming_operations = deque()
         self._incoming_iterator = None
         self._incoming_piece = None
@@ -5282,10 +5288,27 @@ class LiveCollaborationController:
         self._ssh_trust_dialog = None
         self._ssh_install_process = None
         self._cleaned_up = False
+        self.diagnostic_log = None
+        self.error_history = deque(maxlen=500)
+        self._diagnostic_dialog = None
+        self._diagnostic_text = None
+        self._diagnostic_lane = None
 
     def setup(self):
         import ctk
         import qt
+
+        try:
+            from .diagnostics import DiagnosticLog
+        except ImportError:
+            from diagnostics import DiagnosticLog
+        self.diagnostic_log = DiagnosticLog()
+        self._diagnostic_event("plugin.setup", plugin_version=PLUGIN_VERSION)
+        self._diagnostic_last_beat = time.monotonic()
+        self._diagnostic_timer = qt.QTimer()
+        self._diagnostic_timer.setInterval(100)
+        self._diagnostic_timer.timeout.connect(self._diagnostic_heartbeat)
+        self._diagnostic_timer.start()
 
         settings = qt.QSettings()
         default_user = str(settings.value(self.SETTINGS_PREFIX + "user", getpass.getuser()))
@@ -6491,6 +6514,7 @@ class LiveCollaborationController:
         import slicer
 
         self._last_error = str(message)
+        self._record_diagnostic_error(message)
         self.connection_healthy = False
         self.status_label.setText(f"● Connection problem: {message}")
         self.status_label.setStyleSheet("color: #b3261e;")
@@ -6518,6 +6542,70 @@ class LiveCollaborationController:
                 self._connection_error_dialog = dialog
             self._connection_error_dialog.setText(detail)
             self._connection_error_dialog.show()
+
+    def _diagnostic_event(self, event, **details):
+        log = getattr(self, "diagnostic_log", None)
+        if log is not None:
+            log.event(event, room_id=self.room_id, last_sequence=self.last_sequence, **details)
+
+    def _record_diagnostic_error(self, message, lane=None):
+        try:
+            from .diagnostics import safe_text
+        except ImportError:
+            from diagnostics import safe_text
+        message = safe_text(message)
+        lane = lane or getattr(self, "_diagnostic_lane", None) or "controller"
+        self.error_history.append({"at_utc": _utc_iso(), "lane": str(lane), "message": message})
+        self._diagnostic_event("error", lane=str(lane), message=message)
+        logging.error("Live Segmentation [%s]: %s", lane, message)
+        action = getattr(self.owner, "diagnostics_action", None)
+        if action is not None:
+            action.setText(f"Errors ({len(self.error_history)})")
+        if self._diagnostic_text is not None:
+            self._diagnostic_text.appendPlainText(f"{_utc_iso()} [{lane}] {message}")
+
+    def _diagnostic_heartbeat(self):
+        now = time.monotonic()
+        elapsed = now - self._diagnostic_last_beat
+        self._diagnostic_last_beat = now
+        log = getattr(self, "diagnostic_log", None)
+        if log is not None and log.error and not getattr(self, "_diagnostic_writer_error_reported", False):
+            self._diagnostic_writer_error_reported = True
+            self._record_diagnostic_error(f"Local diagnostic writing failed: {log.error}", lane="diagnostics")
+        if elapsed >= 0.25:
+            import slicer
+            try:
+                module = str(slicer.util.selectedModule())
+            except RuntimeError:
+                module = "no-main-window"
+            self._diagnostic_event("gui.heartbeat_gap", duration_s=elapsed,
+                                   module=module)
+
+    def show_diagnostic_history(self, checked=False):
+        del checked
+        import qt
+        import slicer
+
+        if self._diagnostic_dialog is None:
+            dialog = qt.QDialog(slicer.util.mainWindow())
+            dialog.setWindowTitle("Live Segmentation – persistent diagnostics")
+            layout = qt.QVBoxLayout(dialog)
+            self._diagnostic_text = qt.QPlainTextEdit()
+            self._diagnostic_text.setReadOnly(True)
+            layout.addWidget(self._diagnostic_text)
+            button = qt.QPushButton("Open diagnostic log folder")
+            button.clicked.connect(lambda: qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(str(self.diagnostic_log.directory))))
+            layout.addWidget(button)
+            dialog.resize(760, 420)
+            self._diagnostic_dialog = dialog
+        log = self.diagnostic_log
+        lines = [f"Local diagnostic log: {log.path}" if log else "Diagnostic logger is not initialized."]
+        if log is not None and log.error:
+            lines.append(f"WARNING: diagnostic writing failed: {log.error}")
+        lines.extend(f"{entry['at_utc']} [{entry['lane']}] {entry['message']}" for entry in self.error_history)
+        self._diagnostic_text.setPlainText("\n".join(lines))
+        self._diagnostic_dialog.show()
+        self._diagnostic_dialog.raise_()
 
     def refresh_now(self, checked=False):
         del checked
@@ -7847,9 +7935,12 @@ class LiveCollaborationController:
             }
             self._joining = True
             self._join_started_at = time.monotonic()
+            self._diagnostic_event("room.join.begin", room_name=room_name, user_name=user_name,
+                                   transport=str(transport_mode), volume_shape=list(volume_array.shape),
+                                   volume_signature=signature)
             self._join_status_second = -1
             self.connection_healthy = False
-            self._worker_results = queue.Queue()
+            self._worker_results = self._result_queue_type()
             self._set_connection_inputs_enabled(False)
             self.owner.set_live_inputs_enabled(False)
             self.join_button.setText("Cancel connection")
@@ -7996,6 +8087,8 @@ class LiveCollaborationController:
             self._transport_stall_status_second = -1
             self.connection_healthy = True
             self.connected = True
+            self._diagnostic_event("room.join.online", user_name=self.user_name,
+                                   initial_sequence=self.initial_sequence)
             self._observe_segmentation(segmentation_node)
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
             for segment_id in self._known_segment_ids:
@@ -8134,6 +8227,9 @@ class LiveCollaborationController:
         )
 
     def leave(self, notify_remote=True):
+        self._diagnostic_event("room.leave", user_name=self.user_name,
+                               pending_operations=len(self.outgoing), pending_echoes=len(self.awaiting_echo),
+                               pending_segments=len(self.dirty_segments))
         self._cancel_backup_restore()
         client = self.client
         connecting_client = self._connecting_client
@@ -8248,7 +8344,7 @@ class LiveCollaborationController:
         self._snapshot_requested = False
         self._snapshot_label = ""
         self._restoring_sequence = None
-        self._worker_results = queue.Queue()
+        self._worker_results = self._result_queue_type()
         self._force_sync_refresh = False
         self._force_realtime_refresh = False
         self._force_health_check = False
@@ -8368,6 +8464,16 @@ class LiveCollaborationController:
 
     def cleanup(self):
         self._cleaned_up = True
+        if hasattr(self, "_diagnostic_timer"):
+            self._diagnostic_timer.stop()
+        if self.diagnostic_log is not None:
+            self._diagnostic_event("plugin.cleanup")
+            self.diagnostic_log.close(timeout=1.0)
+        if self._diagnostic_dialog is not None:
+            self._diagnostic_dialog.close()
+            self._diagnostic_dialog.deleteLater()
+            self._diagnostic_dialog = None
+            self._diagnostic_text = None
         self.ssh_password_edit.clear()
         if self._ssh_trust_dialog is not None:
             self._ssh_trust_dialog.reject()
@@ -10548,6 +10654,20 @@ class LiveCollaborationController:
                 result = self._worker_results.get_nowait()
             except queue.Empty:
                 return
+            self._diagnostic_lane = str(result.get("lane") or "sync")
+            if result.get("_traceback"):
+                self._diagnostic_event("error.traceback", lane=self._diagnostic_lane, message=result["_traceback"])
+            duration = float(result.get("duration") or 0.0)
+            completed = result.get("_worker_finished_monotonic")
+            if completed is not None and time.monotonic() - float(completed) >= .025:
+                self._diagnostic_event("gui.result_queue_delay", lane=self._diagnostic_lane,
+                                       duration_s=time.monotonic()-float(completed))
+            for operation_id in result.get("outgoing_ids") or []:
+                self._diagnostic_event("operation.sent", operation_id=str(operation_id), lane=self._diagnostic_lane)
+            if duration >= 0.25 or result.get("error") or result.get("command_errors") or result.get("operations") or result.get("outgoing_ids"):
+                self._diagnostic_event("transport.result", lane=self._diagnostic_lane, duration_s=duration,
+                                       incoming_count=len(result.get("operations") or []), sent_count=len(result.get("outgoing_ids") or []),
+                                       error=bool(result.get("error")))
             if result.get("lane") == "join":
                 if (
                     result.get("session_token") != self._session_token
@@ -10665,6 +10785,8 @@ class LiveCollaborationController:
                     continue
                 for operation in result.get("encoded_operations") or []:
                     self.outgoing.append(operation)
+                    self._diagnostic_event("operation.queued", operation_id=str(operation.get("client_operation_id") or ""),
+                                           segment_id=str(operation.get("segment_id") or ""), voxel_bbox=list(operation.get("voxel_bbox") or []))
                     self.outgoing_keys.add(key)
                     self.session_metrics.operation_queued(operation["client_operation_id"])
                     self.session_metrics.increment("edits_queued")
@@ -10727,6 +10849,7 @@ class LiveCollaborationController:
                 ):
                     import slicer
 
+                    self._record_diagnostic_error(result["error"], lane="maintenance")
                     slicer.util.showStatusMessage(
                         f"Live collaboration maintenance warning: {result['error']}", 6000
                     )
@@ -10746,6 +10869,7 @@ class LiveCollaborationController:
                         "lane": str(result.get("lane") or "unknown"),
                         "observed_at": _utc_iso(),
                     }
+                    self._record_diagnostic_error(result["error"], lane=self._diagnostic_lane)
                     if not self._connection_validation_pending:
                         self._connection_validation_started_at = time.monotonic()
                     self._connection_validation_pending = True
@@ -10769,15 +10893,9 @@ class LiveCollaborationController:
                 self._connection_validation_started_at = 0.0
                 self.connection_healthy = True
                 self._connection_error_popup_shown = False
-                if self._connection_error_dialog is not None:
-                    self._connection_error_dialog.close()
-                    self._connection_error_dialog = None
             elif not self._connection_validation_pending:
                 self.connection_healthy = True
                 self._connection_error_popup_shown = False
-                if self._connection_error_dialog is not None:
-                    self._connection_error_dialog.close()
-                    self._connection_error_dialog = None
             if result.get("lane") in {
                 "sync",
                 "realtime",
@@ -10852,6 +10970,10 @@ class LiveCollaborationController:
                 ]
             operations = result.get("operations") or []
             for operation in operations:
+                self._diagnostic_event("operation.received", sequence=int(operation.get("sequence", 0)),
+                                       operation_id=str(operation.get("client_operation_id") or ""),
+                                       segment_id=str(operation.get("segment_id") or ""), author=str(operation.get("author") or ""),
+                                       kind=str(operation.get("operation_kind") or ""), checkpoint=bool(operation.get("system_snapshot")))
                 sequence = int(operation.get("sequence", 0))
                 if operation.get("system_snapshot"):
                     # Everybody counts from the newest snapshot in the room, not
@@ -10919,6 +11041,7 @@ class LiveCollaborationController:
                 import slicer
 
                 message = "; ".join(result["command_errors"])
+                self._record_diagnostic_error(message, lane=self._diagnostic_lane)
                 slicer.util.showStatusMessage(f"Live collaboration: {message}", 5000)
             if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
                 self.initial_sync_complete = True
@@ -10945,7 +11068,8 @@ class LiveCollaborationController:
                     self.status_label.setStyleSheet(
                         "color: #188038; font-weight: bold;"
                     )
-                self._last_error = None
+                # A recovered transport changes the online status, not the
+                # unread error history or the user's error acknowledgement.
             self._update_lock_controls()
             if time.monotonic() - self._last_metrics_display >= 0.5:
                 self._last_metrics_display = time.monotonic()
@@ -11078,9 +11202,13 @@ class LiveCollaborationController:
             self._incoming_iterator = None
             self._incoming_piece = None
             self._incoming_retry_at = time.monotonic() + 1.0
+            self._diagnostic_event("error.traceback", lane="incoming", message=traceback.format_exc())
             self._show_error(f"Could not prepare incoming edit: {exc}")
         finally:
-            self.session_metrics.record("gui-incoming", time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            self.session_metrics.record("gui-incoming", elapsed)
+            if elapsed >= 0.025:
+                self._diagnostic_event("gui.slow_incoming", duration_s=elapsed, pending=len(self._incoming_operations))
 
     def _commit_checkpoint_steps(self, group):
         """No visible mutation until a complete, privately staged group exists."""
@@ -11089,6 +11217,8 @@ class LiveCollaborationController:
         except ImportError:
             from checkpoints import same_baseline_steps
         node = self._segmentation_node()
+        checkpoint_started = time.monotonic()
+        self._diagnostic_event("checkpoint.prepare", group_id=group.group_id, operation_count=group.count)
         if node is None:
             raise LiveCollaborationError("Checkpoint target disappeared; local labels retained")
         while True:
@@ -11147,6 +11277,8 @@ class LiveCollaborationController:
             self._refresh_label_combo()
             self.session_metrics.increment("checkpoint_groups_applied")
             self.session_metrics.increment("checkpoint_voxel_replacements", len(staged))
+            self._diagnostic_event("checkpoint.committed", group_id=group.group_id, operation_count=group.count,
+                                   native_replacements=len(staged), duration_s=time.monotonic()-checkpoint_started)
         finally:
             self._applying_remote = False
 
@@ -12537,7 +12669,10 @@ class LiveCollaborationController:
                     self._schedule_segment_verification(key, duration=0.8)
                 self.last_sequence = sequence
                 applied_count += 1
+                self._diagnostic_event("operation.applied", sequence=sequence, segment_id=str(segment_id),
+                                       operation_id=str(operation.get("client_operation_id") or ""))
             except Exception as exc:
+                self._diagnostic_event("error.traceback", lane="apply", sequence=sequence, message=traceback.format_exc())
                 self._show_error(f"Could not apply live edit {sequence}: {exc}")
                 return False
             finally:
