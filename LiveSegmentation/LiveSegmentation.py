@@ -61,6 +61,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._previous_segment_editor_undo_limit = None
         self._recovery_editor = None
         self._editor_preprocessing = None
+        self._source_range_preprocessing = None
         self._previous_editor_read_only = None
         self.navigation_toolbar = None
         self.navigation_action = None
@@ -145,10 +146,16 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             from LiveSegmentationLib.editor_preprocessing import EditorPreprocessingGuard
 
             self._editor_preprocessing = EditorPreprocessingGuard(self._recovery_editor)
+            from LiveSegmentationLib.native_range import SourceRangeGuard
+
+            self._source_range_preprocessing = SourceRangeGuard(self._recovery_editor)
             self._recovery_editor.connect("segmentationNodeChanged(vtkMRMLSegmentationNode*)", self._guard_recovery_editing)
             self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
+        if self._source_range_preprocessing is not None:
+            self._source_range_preprocessing.cleanup()
+            self._source_range_preprocessing = None
         if self._editor_preprocessing is not None:
             self._editor_preprocessing.cleanup()
             self._editor_preprocessing = None
@@ -616,6 +623,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             return None
 
     def _configure_standard_segment_editor(self, editor, segmentation_node, volume_node):
+        guard = getattr(self, "_source_range_preprocessing", None)
+        if guard is not None:
+            guard.prepare(volume_node)
         if editor.segmentationNode() != segmentation_node:
             editor.setSegmentationNode(segmentation_node)
         current_source = (editor.sourceVolumeNode() if hasattr(editor, "sourceVolumeNode")

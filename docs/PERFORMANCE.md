@@ -1,5 +1,55 @@
 # Responsiveness validation
 
+## Standard editor first-open source preparation (unreleased)
+
+The earlier lazy-Threshold fix removes preparation of an unused effect, but the
+source intensity range is also requested by the native editor's masking UI.
+VTK 9.6.2's image override visits every voxel individually even when an ordinary
+source has no blanking/ghost information. This caused a measured 47.25-second
+GUI gap on a decoded 9.46-GB uint8 test volume.
+
+`LiveSegmentationLib/native_range.py` primes the same VTK image cache by calling
+the exported `vtkDataSet::ComputeScalarRange` base implementation explicitly.
+It uses VTK's optimized array reduction and normal cache invalidation. It does
+not alter voxel values, image/node identity, extent, orientation, spacing,
+display settings, pipeline connections, label IDs, or the active segmentation.
+All calls occur on the GUI thread, before native source callbacks; no full
+source copy, worker-side MRML access, process-memory patching or DLL replacement
+is involved. Array and image revision checks avoid redundant work.
+
+This method is **protected C++ API**, not a supported public Python interface.
+The bridge is deliberately gated to the tested **Windows x64 / Slicer 5.12.3
+revision 34627 / VTK 9.6.2** ABI, the installed application's own VTK library,
+an exact typed function signature and a mandatory tiny-image equivalence and
+revision-invalidation self-test. No guessed field offsets or arbitrary shared
+libraries are used. An unsupported profile fails closed to ordinary Slicer.
+
+Only standard-memory-layout, nonempty, single-component integer `vtkImageData`
+with matching point counts, no cell scalars and no point/cell ghost arrays is
+accelerated. Float/NaN/Inf, vector, subclass and ghost/blanking cases retain the
+native path; they are not silently approximated. A large-source fallback emits
+a single diagnostic rather than changing the image or disconnecting the room.
+For a public cross-platform release, validate additional ABIs explicitly or
+integrate the fast path upstream in VTK instead of broadening the gate by guess.
+
+Run `scripts/slicer_editor_open_probe.py` with `LIVE_EDITOR_OUTPUT` and optionally
+`LIVE_EDITOR_DATASET` (using the separately installed BigTIFF reader). Set
+`LIVE_EDITOR_ASSERT_FAST=1` to require a maximum first-open GUI gap below one
+second. Loading/decompressing the file is measured separately. Native checks
+also cover exact Threshold, actual Paint/Erase, image/revision preservation,
+manual source selection, parameter replacement, eight integer types with
+nonzero extents, safe rejection of unsupported inputs, repeat binding and cleanup.
+Recorded local native results (one run each; loading excluded):
+
+| Source | Old first-open GUI gap | New editor binding | New maximum GUI gap |
+| --- | ---: | ---: | ---: |
+| 1 GiB synthetic uint8 | 4.609 s | 0.063 s | 0.188 s |
+| 9.464 GB decoded uint8 BigTIFF, 3697 x 1600 x 1600 | 47.250 s | 0.562 s | 0.578 s |
+
+The real file took 263.266 s to load/decode separately; this change does not
+accelerate TIFF decoding. These are measured local tests, not a promise about
+all hardware, datasets, native effects or AI initialization.
+
 ## What version 0.14.7 changes
 
 Network/disk waits are not performed on Slicer's GUI thread. Receiving a result

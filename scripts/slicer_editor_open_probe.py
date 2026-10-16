@@ -10,8 +10,60 @@ from pathlib import Path
 import numpy as np
 import qt
 import slicer
+import vtk
+from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 KEEP_ALIVE = []
+
+
+def check_native_range_equivalence(guard):
+    if guard.backend is None:
+        return {"skipped": guard.reason}
+    checked = []
+    for dtype in (np.uint8, np.int8, np.uint16, np.int16, np.uint32, np.int32, np.uint64, np.int64):
+        limits = np.iinfo(dtype)
+        values = np.array([limits.min, 0, 1, limits.max] * 16, dtype=dtype)
+        image = vtk.vtkImageData()
+        image.SetExtent(5, 8, -2, 1, 11, 14)
+        image.GetPointData().SetScalars(numpy_to_vtk(values, deep=True))
+        scalars = image.GetPointData().GetScalars()
+        reference = vtk.vtkImageData()
+        reference.DeepCopy(image)
+        expected, revision = reference.GetScalarRange(), image.GetMTime()
+        assert guard.backend.prime(image)
+        assert image.GetScalarRange() == expected, (dtype, image.GetScalarRange(), expected)
+        assert image.GetMTime() == revision and image.GetPointData().GetScalars() == scalars
+        assert image.GetExtent() == (5, 8, -2, 1, 11, 14)
+        assert np.array_equal(vtk_to_numpy(scalars), values)
+        scalars.SetValue(3, 0)
+        scalars.Modified()
+        reference.DeepCopy(image)
+        assert guard.backend.prime(image) and image.GetScalarRange() == reference.GetScalarRange()
+        checked.append(np.dtype(dtype).name)
+    # Real VTK unsupported inputs must not enter the protected native method.
+    for kind in ("float_nan", "vector", "point_ghost", "cell_ghost", "cell_scalars"):
+        image = vtk.vtkImageData()
+        image.SetDimensions(4, 4, 4)
+        image.AllocateScalars(vtk.VTK_FLOAT if kind == "float_nan" else vtk.VTK_UNSIGNED_CHAR,
+                              2 if kind == "vector" else 1)
+        image.GetPointData().GetScalars().FillComponent(0, float("nan") if kind == "float_nan" else 7)
+        if kind.endswith("ghost"):
+            ghost = vtk.vtkUnsignedCharArray()
+            ghost.SetName("vtkGhostType")
+            attributes = image.GetPointData() if kind == "point_ghost" else image.GetCellData()
+            ghost.SetNumberOfTuples(image.GetNumberOfPoints() if kind == "point_ghost" else image.GetNumberOfCells())
+            ghost.Fill(0)
+            attributes.AddArray(ghost)
+        if kind == "cell_scalars":
+            cells = vtk.vtkUnsignedCharArray()
+            cells.SetNumberOfTuples(image.GetNumberOfCells())
+            cells.Fill(5)
+            image.GetCellData().SetScalars(cells)
+        before, revision = guard.backend.calls, image.GetMTime()
+        assert not guard.backend.prime(image), kind
+        assert guard.backend.calls == before and image.GetMTime() == revision
+    return {"integer_types": checked, "nonzero_extent_and_revision": True,
+            "unsupported_native_inputs_declined": True}
 
 
 def run():
@@ -77,7 +129,14 @@ def run():
               "open_and_paint_seconds": time.monotonic()-start,
               "maximum_gui_gap_seconds": float(np.diff([start, *beats, time.monotonic()]).max()),
               "threshold_requests": list(calls)}
+    range_guard = getattr(widget, "_source_range_preprocessing", None)
+    if range_guard is not None:
+        result["source_range_backend"] = range_guard.reason
+        result["source_range_calls"] = range_guard.backend.calls if range_guard.backend else 0
+        result["source_range_seconds"] = range_guard.backend.seconds if range_guard.backend else None
     timer.stop()
+    if os.environ.get("LIVE_EDITOR_ASSERT_FAST", "0") == "1":
+        assert result["maximum_gui_gap_seconds"] < 1.0, result
     assert calls and all(not c["active"] and not c["returned_image"] for c in calls), calls
     assert editor.sourceVolumeNode() == volume and editor.segmentationNode() == segmentation
     assert volume.GetImageData() == source_image and source_image.GetMTime() == source_time
@@ -132,11 +191,57 @@ def run():
     erased = slicer.util.arrayFromSegmentBinaryLabelmap(small_seg, paint_sid, small)
     assert np.count_nonzero(erased) == 0, "Native eraser did not remove its brush stroke"
     result["native_paint_erase"] = True
+    # Bypass Live's explicit configure helper: native source selection and later
+    # source image updates must also be primed by high-priority observers.
+    manual = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Manual source QA")
+    manual_values = np.zeros((256, 256, 256), np.uint16)
+    manual_values[0, 0, 0], manual_values[-1, -1, -1] = 7, 60000
+    slicer.util.updateVolumeFromArray(manual, manual_values)
+    before = time.monotonic()
+    editor.setSourceVolumeNode(manual)
+    result["manual_source_seconds"] = time.monotonic()-before
+    assert manual.GetImageData().GetScalarRange() == (0., 60000.)
+    view_array = slicer.util.arrayFromVolume(manual)
+    view_array[0, 0, 0] = 65535
+    before = time.monotonic()
+    slicer.util.arrayFromVolumeModified(manual)
+    result["source_revision_seconds"] = time.monotonic()-before
+    assert manual.GetImageData().GetScalarRange() == (0., 65535.)
+    assert result["manual_source_seconds"] < 1. and result["source_revision_seconds"] < 1.
+    result["manual_source_and_revision_correct"] = True
+    backend_calls = range_guard.backend.calls if range_guard.backend else None
+    editor.setSourceVolumeNode(None)
+    view_array[0, 0, 0] = 65000
+    slicer.util.arrayFromVolumeModified(manual)
+    assert range_guard.backend is None or range_guard.backend.calls == backend_calls, "Detached source still observed"
+    result["old_source_detached"] = True
+    result["native_range_equivalence"] = check_native_range_equivalence(range_guard)
+    old_parameter = editor.mrmlSegmentEditorNode()
+    editor.setMRMLSegmentEditorNode(None)
+    slicer.mrmlScene.RemoveNode(old_parameter)
+    new_parameter = slicer.vtkMRMLSegmentEditorNode()
+    new_parameter.SetSingletonTag("SegmentEditor")
+    new_parameter = slicer.mrmlScene.AddNode(new_parameter)
+    editor.setMRMLSegmentEditorNode(new_parameter)
+    editor.setSegmentationNode(small_seg)
+    editor.setSourceVolumeNode(manual)
+    assert range_guard.parameter == new_parameter and range_guard.source == manual, {
+        "guard_parameter": range_guard.parameter.GetID() if range_guard.parameter else None,
+        "new_parameter": new_parameter.GetID(), "singleton": new_parameter.GetSingletonTag(),
+        "guard_source": range_guard.source.GetID() if range_guard.source else None,
+        "editor_source": editor.sourceVolumeNode().GetID() if editor.sourceVolumeNode() else None,
+        "parameter_source": new_parameter.GetSourceVolumeNode().GetID() if new_parameter.GetSourceVolumeNode() else None}
+    assert manual.GetImageData().GetScalarRange() == (0., 65000.)
+    result["native_parameter_replacement"] = True
     result["threshold_requests_all"] = calls
     threshold.scriptedEffect = original
     widget._editor_preprocessing.cleanup()
     assert threshold.scriptedEffect is original.original
     result["adapter_restored"] = True
+    range_guard.cleanup()
+    range_guard.cleanup()
+    assert not range_guard.prepare(manual)
+    result["source_range_cleanup"] = True
     KEEP_ALIVE.extend([volume, segmentation, editor, small, small_seg])
     return result
 

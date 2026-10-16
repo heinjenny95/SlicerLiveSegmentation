@@ -8,6 +8,22 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Fast native integer source-range preparation
+
+- Avoid VTK 9.6.2's per-point image-range scan when opening the standard editor
+  with ordinary integer, single-component images without cell scalars/ghosts.
+  Prime the same image-owned cache using VTK's exported optimized base-class
+  implementation; no pixel copies/substitutions, geometry changes, DLL patches,
+  private-field writes or background MRML/VTK access.
+- Explicit source binding, manual module/volume selection and subsequent image
+  revisions are guarded before native editor callbacks. Unchanged source tokens
+  do not rescan; scene-reset parameter nodes are re-observed; cleanup removes only
+  owned observers. The earlier inactive-Threshold optimization remains separate.
+- The protected C++ ABI bridge is restricted to Windows x64, Slicer 5.12.3 r34627,
+  VTK 9.6.2, an application-local library and a mandatory range/revision self-test.
+  Unknown profiles and unsupported image layouts retain native behavior, with a
+  one-time diagnostic for large sources. This is not a universal VTK ABI promise.
+
 ### Lazy standard-editor Threshold preparation
 
 - Do not align/copy the complete source merely to notify inactive built-in
