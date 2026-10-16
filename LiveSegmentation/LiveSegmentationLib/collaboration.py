@@ -5128,6 +5128,7 @@ class LiveCollaborationController:
         self._checkpoint_group = None
         self._checkpoint_ingest_iterator = None
         self._checkpoint_commit_iterator = None
+        self._activity_voxel_effects = {}
         self.connected = False
         self.client = None
         self.room_id = None
@@ -8285,6 +8286,7 @@ class LiveCollaborationController:
         self.baselines.clear()
         self._work_time_worker = None
         self._incoming_operations.clear()
+        self._activity_voxel_effects = {}
         self._checkpoint_group = None
         self._checkpoint_ingest_iterator = None
         self._checkpoint_commit_iterator = None
@@ -11692,7 +11694,7 @@ class LiveCollaborationController:
             segment_name = str(record.get("segment_name") or segment_id or "label")
             author = str(record.get("author") or "Unknown")
             if record.get("system_snapshot"):
-                action = f"{author} created a project checkpoint"
+                action = "Automatic room checkpoint received (not a manual edit)"
                 activity_type = "checkpoint"
                 if record.get("snapshot_label"):
                     action += f" “{record.get('snapshot_label')}”"
@@ -11709,8 +11711,11 @@ class LiveCollaborationController:
                 action = f"{author} created label “{segment_name}”"
                 activity_type = "label created"
             elif record.get("metadata_update"):
-                action = f"{author} updated label properties for “{segment_name}”"
+                action = f"Label metadata synchronized from {author}: “{segment_name}”"
                 activity_type = "label metadata"
+            elif record.get("operation_kind") == "snapshot":
+                action = f"Label state synchronized from {author}: “{segment_name}”"
+                activity_type = "state synchronization"
             else:
                 action = f"{author} edited label “{segment_name}”"
                 activity_type = str(record.get("operation_kind") or "patch")
@@ -12514,6 +12519,10 @@ class LiveCollaborationController:
                     ]
                     baseline_operation_crop[changed] = values[changed]
                 server_after_region = _baseline_region(baseline, affected_bounds)
+                effects = getattr(self, "_activity_voxel_effects", None)
+                if effects is None:
+                    effects = self._activity_voxel_effects = {}
+                effects[sequence] = effects.get(sequence, False) or not np.array_equal(server_before_region, server_after_region)
                 visible_region = server_after_region.copy()
                 visible_region[local_changes] = current_region[local_changes]
 
@@ -12594,6 +12603,11 @@ class LiveCollaborationController:
                     if operation.get("author") == self.user_name
                     else operation.get("author") or "Collaborator"
                 )
+                voxel_effect = self._activity_voxel_effects.pop(sequence, False)
+                metadata_effect = metadata_before != metadata_after
+                own_metadata_confirmation = bool(operation.get("metadata_update") and operation.get("author") == self.user_name
+                    and any(item.get("client_operation_id") == operation.get("client_operation_id")
+                            for item in [*self.outgoing, *self.awaiting_echo]))
                 if operation.get("metadata_update"):
                     if metadata_before is None:
                         activity = (
@@ -12627,7 +12641,13 @@ class LiveCollaborationController:
                         f"{actor} updated label "
                         f"{operation.get('segment_name') or segment_id} · sequence {sequence}"
                     )
-                self._append_activity(activity)
+                if voxel_effect or metadata_effect:
+                    self._append_activity(activity)
+                elif own_metadata_confirmation:
+                    self._append_activity(f"Your label metadata synchronization confirmed · sequence {sequence}")
+                else:
+                    self._diagnostic_event("operation.no_visible_effect", sequence=sequence,
+                                           segment_id=str(segment_id), metadata=bool(operation.get("metadata_update")))
                 if operation.get("author") != self.user_name:
                     highlight_changed = changed
                     if (

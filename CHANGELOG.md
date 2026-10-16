@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Activity describes effects, not maintenance traffic
+
+- Do not call unchanged state snapshots or metadata echoes a manual label edit.
+  Accumulate real baseline changes across rendering tiles; confirmations,
+  automatic checkpoints and state synchronization have distinct descriptions.
+  Raw ordered operation/study journals remain unchanged for auditability.
+
 ### Asynchronous approximate live 3D preview
 
 - Add a clearly labeled local 3D preview with bounded occupancy pooling and
