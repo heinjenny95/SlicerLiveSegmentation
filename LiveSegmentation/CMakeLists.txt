@@ -8,6 +8,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/work_log.py
   LiveSegmentationLib/active_work.py
   LiveSegmentationLib/roi_geometry.py
+  LiveSegmentationLib/editor_preprocessing.py
   LiveSegmentationLib/version.py
   LiveSegmentationLib/ssh_transport.py
 )

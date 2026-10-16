@@ -60,6 +60,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._previous_segment_editor_overwrite_mode = None
         self._previous_segment_editor_undo_limit = None
         self._recovery_editor = None
+        self._editor_preprocessing = None
         self._previous_editor_read_only = None
         self.navigation_toolbar = None
         self.navigation_action = None
@@ -141,10 +142,16 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._module_selector.connect("moduleSelected(QString)", self._on_module_selected)
         self._recovery_editor = self._standard_segment_editor_widget()
         if self._recovery_editor is not None:
+            from LiveSegmentationLib.editor_preprocessing import EditorPreprocessingGuard
+
+            self._editor_preprocessing = EditorPreprocessingGuard(self._recovery_editor)
             self._recovery_editor.connect("segmentationNodeChanged(vtkMRMLSegmentationNode*)", self._guard_recovery_editing)
             self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
+        if self._editor_preprocessing is not None:
+            self._editor_preprocessing.cleanup()
+            self._editor_preprocessing = None
         if getattr(self, "_module_selector", None) is not None:
             self._module_selector.disconnect("moduleSelected(QString)", self._on_module_selected)
             self._module_selector = None

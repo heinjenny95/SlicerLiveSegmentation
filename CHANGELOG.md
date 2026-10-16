@@ -8,6 +8,18 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Lazy standard-editor Threshold preparation
+
+- Do not align/copy the complete source merely to notify inactive built-in
+  Threshold when the normal Segment Editor opens. A reversible accessor adapter
+  affects only that editor's built-in Threshold instance. Activating Threshold
+  uses the native aligned image, parameters, preview and application unchanged.
+- Keep original image buffers, geometry, nodes and intensity masks untouched.
+  Native probes check a 1-GiB volume, optional real BigTIFF input, repeated module
+  navigation, exact signed-intensity Threshold results and cleanup. This avoids
+  one full-volume pass, but Slicer's core source-range scan remains synchronous;
+  this change does not promise a freeze-free first open on arbitrary large data.
+
 ### Avoid hidden Segment Editor preprocessing
 
 - Defer source/segmentation binding until the standard editor is actually used.
