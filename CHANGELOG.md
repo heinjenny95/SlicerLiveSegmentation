@@ -8,6 +8,15 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### Avoid hidden Segment Editor preprocessing
+
+- Defer source/segmentation binding until the standard editor is actually used.
+  Joining from Live Segmentation or nnInteractive must not initialize Threshold's
+  full-volume source preprocessing in a hidden editor. Manual module navigation
+  and the explicit editor button still attach the authoritative room replica.
+- Skip redundant bindings when both target nodes already match. This does not
+  bypass Slicer's own first-use preprocessing when the user opens that editor.
+
 ### Bounded ROI geometry in live synchronization
 
 - Read shifted ROI origins and affine label geometry in the requested reference

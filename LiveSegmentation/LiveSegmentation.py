@@ -137,12 +137,17 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.layout.addStretch(1)
 
         self._select_scene_defaults()
+        self._module_selector = slicer.util.moduleSelector()
+        self._module_selector.connect("moduleSelected(QString)", self._on_module_selected)
         self._recovery_editor = self._standard_segment_editor_widget()
         if self._recovery_editor is not None:
             self._recovery_editor.connect("segmentationNodeChanged(vtkMRMLSegmentationNode*)", self._guard_recovery_editing)
             self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
+        if getattr(self, "_module_selector", None) is not None:
+            self._module_selector.disconnect("moduleSelected(QString)", self._on_module_selected)
+            self._module_selector = None
         if self.navigation_toolbar is not None:
             slicer.util.mainWindow().removeToolBar(self.navigation_toolbar)
             self.navigation_toolbar.setObjectName("")
@@ -174,6 +179,16 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
     def enter(self):
         self._refresh_recovery_notice()
         self._refresh_optional_navigation()
+
+    def _on_module_selected(self, module_name):
+        """Bind only on actual Segment Editor navigation, never on live/IR entry."""
+        if module_name != "SegmentEditor" or not self._live_session_active:
+            return
+        segmentation = self.get_segmentation_node()
+        volume = self.get_volume_node()
+        editor = self._standard_segment_editor_widget()
+        if segmentation is not None and volume is not None and editor is not None:
+            self._configure_standard_segment_editor(editor, segmentation, volume)
 
     def _setup_navigation_toolbar(self):
         """Return to collaboration without changing sessions or editor targets."""
@@ -400,11 +415,14 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.segmentation_selector.setCurrentNode(segmentation_node)
         self._set_reference_geometry_if_empty(segmentation_node)
 
-        editor = self._standard_segment_editor_widget()
-        if editor is not None:
-            self._configure_standard_segment_editor(
-                editor, segmentation_node, self.get_volume_node()
-            )
+        # Binding a hidden editor invokes every effect's source-volume callback,
+        # including full-source resampling in Threshold. IR does not need it.
+        if slicer.util.selectedModule() == "SegmentEditor":
+            editor = self._standard_segment_editor_widget()
+            if editor is not None:
+                self._configure_standard_segment_editor(
+                    editor, segmentation_node, self.get_volume_node()
+                )
         return segmentation_node
 
     def clear_live_segmentation(self, segmentation_node_id=None, preserve_recovery=False):
@@ -591,8 +609,13 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             return None
 
     def _configure_standard_segment_editor(self, editor, segmentation_node, volume_node):
-        editor.setSegmentationNode(segmentation_node)
-        if hasattr(editor, "setSourceVolumeNode"):
+        if editor.segmentationNode() != segmentation_node:
+            editor.setSegmentationNode(segmentation_node)
+        current_source = (editor.sourceVolumeNode() if hasattr(editor, "sourceVolumeNode")
+                          else editor.masterVolumeNode() if hasattr(editor, "masterVolumeNode") else None)
+        if current_source == volume_node:
+            pass
+        elif hasattr(editor, "setSourceVolumeNode"):
             editor.setSourceVolumeNode(volume_node)
         elif hasattr(editor, "setMasterVolumeNode"):
             editor.setMasterVolumeNode(volume_node)

@@ -51,8 +51,13 @@ def large_probe(widget):
     controller.shared_folder_edit.setEditText(folder)
     controller.room_edit.setText("roi-probe-"+uuid.uuid4().hex)
     controller.user_edit.setText("roi-observer")
+    join_start = time.monotonic()
     controller.join()
     pump_until(lambda: controller.connected and controller.initial_sync_complete)
+    result["join_seconds"] = time.monotonic()-join_start
+    editor = widget._standard_segment_editor_widget()
+    assert editor.sourceVolumeNode() != volume, "Joining eagerly bound a hidden standard editor"
+    result["hidden_editor_not_bound"] = True
     peer = SharedFolderRoomClient(folder, "roi-peer")
     joined = peer.join(controller.room_edit.text, controller.source_volume_signature)
     KEEP_ALIVE.extend([volume, controller, peer])
@@ -122,6 +127,17 @@ def large_probe(widget):
                        "maximum_gui_gap_seconds": float(gaps.max()),
                        "full_reference_export_calls": 0, "original_roi_preserved": True})
         assert result["maximum_gui_gap_seconds"] < 0.25, result
+        heartbeat.stop()
+        if not dataset:
+            # Manual navigation must still bind the authoritative replica, even
+            # when the hidden editor was intentionally left untouched on Join.
+            slicer.util.selectModule("SegmentEditor")
+            assert editor.segmentationNode() == node and editor.sourceVolumeNode() == volume
+            widget.open_segment_editor()
+            assert editor.segmentationNode() == node and editor.sourceVolumeNode() == volume
+            slicer.util.selectModule("LiveSegmentation")
+            assert editor.segmentationNode() == node
+            result["manual_and_button_navigation_correct"] = True
     finally:
         slicer.util.arrayFromSegmentBinaryLabelmap = original
         heartbeat.stop()
