@@ -105,14 +105,19 @@ def run():
         preview.tick()
         assert model.GetTransformNodeID() == transform.GetID()
         # The native scalar buffer stays authoritative; worker output is only a view.
+        revision_before_edit = preview.revision(segment)
+        update_started = time.monotonic()
         mask[60:65, 60:65, 60:65] = 1
-        if shape == (size,)*3:
-            slicer.util.updateSegmentBinaryLabelmapFromArray(mask, node, "A", volume)
-        else:
-            native.GetPointData().GetScalars().Modified()
-            native.Modified()
+        slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, "A")[60:65, 60:65, 60:65] = 1
+        native.GetPointData().GetScalars().Modified()
+        native.Modified()
+        preview.note_reference_region("A", [60, 65, 60, 65, 60, 65], volume, revision_before_edit)
         changed_hash = digest_off_thread(mask)
         pump_until(lambda: preview.revisions.get("A") == preview.revision(segment) and preview.job is None)
+        assert preview.pooled["A"]["incremental"]
+        assert preview.pooled["A"]["scanned_voxels"] < 200000
+        report["incremental_update_s"] = preview.pooled["A"]["ready_at"]-update_started
+        report["incremental_scanned_voxels"] = preview.pooled["A"]["scanned_voxels"]
         assert digest_off_thread(slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, "A")) == changed_hash
         assert not node.GetSegmentation().ContainsRepresentation("Closed surface")
         if shape == (size,)*3:

@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Incrementally repool live 3D previews for proven bounded in-place room writes.
+  Recompute entire affected pooling cells (including erasures) from unchanged
+  geometry and a continuous revision chain; unknown/native edits, geometry or
+  representation replacements retain the full background scan. Cache is local,
+  bounded and never changes labels; diagnostics report scanned voxels and mode.
+
 ### Activity describes effects, not maintenance traffic
 
 - Do not call unchanged state snapshots or metadata echoes a manual label edit.

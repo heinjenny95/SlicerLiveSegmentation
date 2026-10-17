@@ -21,6 +21,11 @@ def preview_mask(array, label_value, maximum_axis=128):
     if len(shape) != 3 or min(shape) <= 0:
         raise ValueError("Preview requires a non-empty 3D labelmap")
     factor = max(1, math.ceil(max(shape)/maximum_axis))
+    return _pool_at_factor(array, label_value, factor), factor
+
+
+def _pool_at_factor(array, label_value, factor):
+    shape = tuple(int(v) for v in array.shape)
     target_shape = tuple(math.ceil(v/factor) for v in shape)
     result = np.zeros(target_shape, np.uint8)
     # A slab may be wider than the scratch target; never copy the full source.
@@ -33,16 +38,37 @@ def preview_mask(array, label_value, maximum_axis=128):
         padded = np.zeros((target_shape[1]*factor, target_shape[2]*factor), bool)
         padded[:shape[1], :shape[2]] = planar
         result[z] = padded.reshape(target_shape[1], factor, target_shape[2], factor).any(axis=(1, 3))
-    return result, factor
+    return result
 
 
-def build_preview_mesh(array, label_value, extent, matrix):
+def update_preview_mask(array, label_value, previous, factor, dirty_bounds):
+    """Recompute whole pooling cells, including erasures; never mutate cache."""
+    result = previous.copy()
+    scanned = 0
+    for bounds in dirty_bounds:
+        cells = [(max(0, int(bounds[2*i])//factor),
+                  min(result.shape[i], math.ceil(int(bounds[2*i+1])/factor))) for i in range(3)]
+        if any(hi <= lo for lo, hi in cells):
+            continue
+        source_slices = tuple(slice(lo*factor, min(hi*factor, array.shape[i])) for i, (lo, hi) in enumerate(cells))
+        region = array[source_slices]
+        scanned += int(np.prod(region.shape))
+        result[tuple(slice(lo, hi) for lo, hi in cells)] = _pool_at_factor(region, label_value, factor)
+    return result, scanned
+
+
+def build_preview_mesh(array, label_value, extent, matrix, previous=None, dirty_bounds=None):
     """Only private VTK objects, never an MRML node or input image, in a worker."""
     import vtk
     from vtk.util.numpy_support import numpy_to_vtk
 
     started = time.monotonic()
-    mask, factor = preview_mask(array, label_value)
+    if previous is not None and dirty_bounds:
+        factor = previous["factor"]
+        mask, scanned = update_preview_mask(array, label_value, previous["mask"], factor, dirty_bounds)
+    else:
+        mask, factor = preview_mask(array, label_value)
+        scanned = int(np.prod(array.shape))
     # Padding closes surfaces at the boundary of a material's native extent.
     padded = np.pad(mask, 1)
     image = vtk.vtkImageData()
@@ -70,7 +96,8 @@ def build_preview_mesh(array, label_value, extent, matrix):
     mesh = vtk.vtkPolyData()
     mesh.DeepCopy(to_ras.GetOutput())
     return {"mesh": mesh, "factor": factor, "polygons": mesh.GetNumberOfPolys(),
-            "seconds": time.monotonic()-started}
+            "seconds": time.monotonic()-started, "mask": mask,
+            "scanned_voxels": scanned, "incremental": bool(previous is not None and dirty_bounds)}
 
 
 class SurfacePreview:
@@ -85,6 +112,8 @@ class SurfacePreview:
         self.generation = 0
         self.models = {}
         self.revisions = {}
+        self.pooled = {}
+        self.region_hints = {}
         self.wanted = {}
         self.editors = []
         self.buttons = []
@@ -114,6 +143,8 @@ class SurfacePreview:
         self.node = node
         self.wanted.clear()
         self.revisions.clear()
+        self.pooled.clear()
+        self.region_hints.clear()
         self.action.setEnabled(node is not None)
         self.action.setChecked(False)
         if node is None:
@@ -141,6 +172,8 @@ class SurfacePreview:
                     slicer.mrmlScene.RemoveNode(model)
             self.models.clear()
             self.revisions.clear()
+            self.pooled.clear()
+            self.region_hints.clear()
             if self.node is not None and self.node.GetDisplayNode() is not None:
                 self.node.GetDisplayNode().SetVisibility3D(self.visibility_3d)
             return
@@ -166,6 +199,38 @@ class SurfacePreview:
             return None
         return (str(image.GetAddressAsString("")), image.GetMTime(),
                 image.GetPointData().GetScalars().GetMTime(), segment.GetLabelValue(), tuple(image.GetExtent()))
+
+    def note_reference_region(self, sid, bounds, volume, before):
+        """Accept hints only across a proven revision chain and identical geometry."""
+        if not self.active or sid not in self.pooled or self.node is None:
+            return
+        import vtk
+
+        segment = self.node.GetSegmentation().GetSegment(sid)
+        after = self.revision(segment) if segment is not None else None
+        if before is None or after is None or (before[0], before[3:]) != (after[0], after[3:]):
+            self.region_hints.pop(sid, None)
+            return
+        geometry = self.owner._reference_ijk_to_segmentation_ras_matrix(volume, self.node)
+        native = vtk.vtkMatrix4x4()
+        segment.GetRepresentation("Binary labelmap").GetImageToWorldMatrix(native)
+        if geometry is None or not self.owner._matrices_match(native, geometry):
+            self.region_hints.pop(sid, None)
+            return
+        hint = self.region_hints.get(sid)
+        base = self.pooled[sid]["revision"]
+        if (hint["after"] if hint else base) != before:
+            self.region_hints.pop(sid, None)
+            return
+        extent = after[4]
+        native_bounds = [int(bounds[i])-extent[(2-i//2)*2] for i in range(6)]
+        if hint is None:
+            hint = self.region_hints[sid] = {"before": base, "after": after, "bounds": []}
+        hint["after"] = after
+        hint["bounds"].append(native_bounds)
+        # Many edits without a completed preview are safely bounded by one union.
+        if len(hint["bounds"]) > 64:
+            hint["bounds"] = [[(min if i % 2 == 0 else max)(box[i] for box in hint["bounds"]) for i in range(6)]]
 
     def scan_editors(self):
         import slicer
@@ -260,6 +325,8 @@ class SurfacePreview:
                 slicer.mrmlScene.RemoveNode(self.models.pop(sid))
                 self.revisions.pop(sid, None)
                 self.wanted.pop(sid, None)
+                self.pooled.pop(sid, None)
+                self.region_hints.pop(sid, None)
         now = time.monotonic()
         for sid in ids:
             segment = segmentation.GetSegment(sid)
@@ -269,6 +336,8 @@ class SurfacePreview:
                 # Never leave its previous surface looking like current data.
                 slicer.mrmlScene.RemoveNode(self.models.pop(sid))
                 self.revisions.pop(sid, None)
+                self.pooled.pop(sid, None)
+                self.region_hints.pop(sid, None)
             previous = self.wanted.get(sid)
             if previous is None or previous[0] != token:
                 self.wanted[sid] = (token, now)
@@ -293,12 +362,20 @@ class SurfacePreview:
         coefficients = [[matrix.GetElement(r, c) for c in range(4)] for r in range(4)]
         array = slicer.util.arrayFromSegmentInternalBinaryLabelmap(self.node, sid)
         job = {"generation": self.generation, "sid": sid, "revision": token}
+        previous = self.pooled.get(sid)
+        hint = self.region_hints.get(sid)
+        if (previous is None or hint is None or hint["before"] != previous["revision"]
+                or hint["after"] != token or previous["matrix"] != coefficients):
+            previous, bounds = None, None
+        else:
+            bounds = [list(box) for box in hint["bounds"]]
+        job["matrix"] = coefficients
         self.job = job
         self.log("preview.request", segment_id=sid, source_shape=list(array.shape))
         # pin survives room leave/scene close while a worker still reads its view.
         def worker(_pin=image, view=array, label=int(segment.GetLabelValue()), extent=tuple(image.GetExtent())):
             try:
-                result = build_preview_mesh(view, label, extent, coefficients)
+                result = build_preview_mesh(view, label, extent, coefficients, previous, bounds)
             except Exception as exc:
                 result = {"error": str(exc)}
             self.results.put((job, result))
@@ -332,9 +409,17 @@ class SurfacePreview:
                 self.models[sid] = model
             model.SetAndObservePolyData(result["mesh"])
             self.revisions[sid] = job["revision"]
+            self.pooled[sid] = {"revision": job["revision"], "matrix": job["matrix"],
+                                "factor": result["factor"], "mask": result["mask"],
+                                "scanned_voxels": result["scanned_voxels"], "incremental": result["incremental"],
+                                "ready_at": time.monotonic()}
+            hint = self.region_hints.get(sid)
+            if hint is not None and hint["after"] == job["revision"]:
+                self.region_hints.pop(sid, None)
             self._style(sid)
             self.log("preview.ready", segment_id=sid, pooling_factor=result["factor"],
-                     polygons=result["polygons"], duration_s=result["seconds"])
+                     polygons=result["polygons"], duration_s=result["seconds"],
+                     scanned_voxels=result["scanned_voxels"], incremental=result["incremental"])
 
     def _style(self, sid):
         model = self.models.get(sid)

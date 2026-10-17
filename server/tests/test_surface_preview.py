@@ -8,6 +8,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"LiveSegmentation"/"L
 from surface_preview import preview_mask  # noqa: E402
 
 
+def test_incremental_pooling_matches_full_pooling_after_additions_and_removals():
+    from surface_preview import update_preview_mask
+
+    mask = np.zeros((131, 133, 135), np.uint16)
+    mask[6:9, 6:9, 6:9] = 7
+    old, factor = preview_mask(mask, 7)
+    mask[6:9, 6:9, 6:9] = 0
+    mask[128:131, 130:133, 132:135] = 7
+    mask[30, 30, 30] = 8
+    coarse, scanned = update_preview_mask(mask, 7, old, factor,
+                                          [[6, 9, 6, 9, 6, 9], [128, 131, 130, 133, 132, 135]])
+    expected, _ = preview_mask(mask, 7)
+    np.testing.assert_array_equal(coarse, expected)
+    assert scanned < 1000
+    assert old[6//factor, 6//factor, 6//factor] == 1, "A worker mutated the published cache"
+
+
+def test_incremental_pooling_reads_only_whole_cells_touching_the_changed_region():
+    from surface_preview import update_preview_mask
+
+    class CountedArray:
+        shape = (1024, 1024, 1024)
+        touched = 0
+        def __getitem__(self, slices):
+            shape = tuple(s.stop-s.start for s in slices)
+            self.touched += int(np.prod(shape))
+            return np.zeros(shape, np.uint8)
+
+    array = CountedArray()
+    pooled = np.ones((128,)*3, np.uint8)
+    result, scanned = update_preview_mask(array, 1, pooled, 8, [[1, 2, 1, 2, 1, 2]])
+    assert array.touched == scanned == 512
+    assert result[0, 0, 0] == 0 and result[1, 1, 1] == 1
+
+
 def test_preview_occupancy_retains_thin_and_boundary_components():
     mask = np.zeros((257, 259, 261), np.uint8)
     mask[0, 0, 0] = mask[256, 258, 260] = mask[120, 120, 120] = 1

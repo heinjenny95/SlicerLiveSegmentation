@@ -12527,6 +12527,8 @@ class LiveCollaborationController:
                 visible_region[local_changes] = current_region[local_changes]
 
                 applied_incrementally = True
+                preview = getattr(self.owner, "surface_preview", None)
+                preview_before = preview.revision(node.GetSegmentation().GetSegment(segment_id)) if preview is not None else None
                 if np.any(current_region != visible_region):
                     crop_updater = getattr(
                         self.owner, "update_segment_binary_labelmap_crop", None
@@ -12561,6 +12563,8 @@ class LiveCollaborationController:
                 )
                 self.baselines[key] = baseline
                 self._ensure_independent_segment_labelmap(node, segment_id)
+                if preview is not None and applied_incrementally and preview.node == node:
+                    preview.note_reference_region(segment_id, affected_bounds, self.owner.get_volume_node(), preview_before)
                 try:
                     self.owner.refresh_segmentation_display(node, segment_id)
                 except Exception:
