@@ -8,6 +8,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"LiveSegmentation"/"L
 from surface_preview import preview_mask  # noqa: E402
 
 
+def test_allocated_zero_extent_label_does_not_schedule_a_preview_job():
+    from types import SimpleNamespace
+
+    from surface_preview import SurfacePreview
+
+    image = SimpleNamespace(GetPointData=lambda: SimpleNamespace(GetScalars=lambda: SimpleNamespace(GetMTime=lambda: 1)),
+                            GetExtent=lambda: (0, -1, 0, -1, 0, -1),
+                            GetAddressAsString=lambda unused: "empty", GetMTime=lambda: 1)
+    segment = SimpleNamespace(GetRepresentation=lambda unused: image, GetLabelValue=lambda: 1)
+    assert SurfacePreview.revision(segment) is None
+
+
 def test_incremental_pooling_matches_full_pooling_after_additions_and_removals():
     from surface_preview import update_preview_mask
 

@@ -49,6 +49,13 @@ def run():
         node.CreateDefaultDisplayNodes()
         node.SetReferenceImageGeometryParameterFromVolumeNode(volume)
         node.GetSegmentation().AddEmptySegment("A", "A", (1, 0, 0))
+        import vtkSegmentationCorePython as segmentation_core
+        from vtk.util.numpy_support import numpy_to_vtk
+
+        node.GetSegmentation().AddEmptySegment("0-empty", "Empty material")
+        empty_image = segmentation_core.vtkOrientedImageData()
+        empty_image.GetPointData().SetScalars(numpy_to_vtk(np.empty(0, np.uint8), deep=True))
+        node.GetSegmentation().GetSegment("0-empty").AddRepresentation("Binary labelmap", empty_image)
         shape = tuple(int(v) for v in os.environ.get("LIVE_PREVIEW_PROBE_LABEL_SHAPE", f"{size},{size},{size}").split(","))
         mask = np.zeros(shape, np.uint8)
         mask[20:40, 25:45, 30:50] = 1
@@ -79,6 +86,7 @@ def run():
         preview.bind(node)
         preview.scan_editors()
         assert slicer.util.findChild(editor, "Show3DButton").isHidden()
+        assert preview.proxies and not preview.proxies[0][1].isHidden()
         before = time.monotonic()
         beat.start()
         preview.action.setChecked(True)
@@ -90,6 +98,8 @@ def run():
         assert not node.GetSegmentation().ContainsRepresentation("Closed surface")
         model = preview.models["A"]
         assert model.GetPolyData().GetNumberOfPolys() > 0
+        assert "0-empty" not in preview.models and preview.active
+        report["empty_material_does_not_abort_other_meshes"] = True
         assert not model.GetSaveWithScene() and model.GetHideFromEditors()
         report["polygons"] = model.GetPolyData().GetNumberOfPolys()
         segment = node.GetSegmentation().GetSegment("A")

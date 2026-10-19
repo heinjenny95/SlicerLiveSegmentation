@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Skip empty native labelmaps that still own a zero-length scalar allocation in
+  the asynchronous 3D preview; they no longer abort all populated-label meshes.
+  Keep a local preview entry in the editor's 3D button row instead of leaving
+  that entry missing. Outside live rooms the original full-resolution button
+  is restored. Native regressions include empty and populated materials together.
+
 ### SSH checkpoint response deadline
 
 - Allow full-room checkpoint publication up to 120 seconds for its SSH response

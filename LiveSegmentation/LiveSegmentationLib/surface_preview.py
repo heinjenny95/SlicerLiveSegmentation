@@ -117,6 +117,7 @@ class SurfacePreview:
         self.wanted = {}
         self.editors = []
         self.buttons = []
+        self.proxies = []
         self.results = queue.SimpleQueue()
         self.job = None
         self.last_editor_scan = 0.0
@@ -197,8 +198,13 @@ class SurfacePreview:
         image = segment.GetRepresentation("Binary labelmap")
         if image is None or image.GetPointData().GetScalars() is None:
             return None
+        extent = tuple(image.GetExtent())
+        if any(extent[2*i+1] < extent[2*i] for i in range(3)):
+            # Native empty materials may retain a zero-tuple scalar allocation.
+            # They are not an error and must never disable every other mesh.
+            return None
         return (str(image.GetAddressAsString("")), image.GetMTime(),
-                image.GetPointData().GetScalars().GetMTime(), segment.GetLabelValue(), tuple(image.GetExtent()))
+                image.GetPointData().GetScalars().GetMTime(), segment.GetLabelValue(), extent)
 
     def note_reference_region(self, sid, bounds, volume, before):
         """Accept hints only across a proven revision chain and identical geometry."""
@@ -241,6 +247,7 @@ class SurfacePreview:
                 if editor.segmentationNode() == self.node:
                     continue
                 editor.setShow3DButtonVisible(visible)
+                self._remove_preview_button(slicer.util.findChild(editor, "Show3DButton"))
             except RuntimeError:
                 pass
             self.editors.remove((editor, visible))
@@ -249,6 +256,7 @@ class SurfacePreview:
                 if button.segmentationNode() == self.node:
                     continue
                 button.setVisible(visible)
+                self._remove_preview_button(button)
             except RuntimeError:
                 pass
             self.buttons.remove((button, visible))
@@ -271,15 +279,37 @@ class SurfacePreview:
             # the button's own state and can be restored after module changes.
             was_visible = not button.isHidden()
             self.editors.append((editor, was_visible))
+            self._add_preview_button(button)
             editor.setShow3DButtonVisible(False)
         for button in slicer.util.findChildren(className="qMRMLSegmentationShow3DButton"):
             if any(button == slicer.util.findChild(editor, "Show3DButton") for editor, _ in self.editors):
                 continue
             if button.segmentationNode() == self.node and not any(button == entry[0] for entry in self.buttons):
                 self.buttons.append((button, not button.isHidden()))
+                self._add_preview_button(button)
                 button.setVisible(False)
 
+    def _add_preview_button(self, original):
+        import qt
+
+        proxy = qt.QToolButton(original.parentWidget())
+        proxy.setObjectName("LiveSegmentationShow3DPreviewButton")
+        proxy.setDefaultAction(self.action)
+        proxy.setToolButtonStyle(qt.Qt.ToolButtonTextBesideIcon)
+        original.parentWidget().layout().addWidget(proxy)
+        proxy.show()
+        self.proxies.append((original, proxy))
+
+    def _remove_preview_button(self, original):
+        for source, proxy in list(self.proxies):
+            if source == original:
+                proxy.hide()
+                proxy.deleteLater()
+                self.proxies.remove((source, proxy))
+
     def _restore_editors(self):
+        for original, _ in list(self.proxies):
+            self._remove_preview_button(original)
         for button, visible in self.buttons:
             try:
                 button.setVisible(visible)
