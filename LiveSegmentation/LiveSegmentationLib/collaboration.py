@@ -1218,6 +1218,16 @@ def operation_defect(operation, volume_shape=None):
     it is read; otherwise every participant stops at its sequence number for
     good. Decompression is bounded by the size the bounds imply.
     """
+    order = operation.get("segment_order")
+    if order is not None:
+        if (not isinstance(order, list) or not 1 <= len(order) <= 10000
+                or any(not isinstance(sid, str) or not sid.strip() or len(sid) > 200 for sid in order)
+                or len(set(order)) != len(order)):
+            return "invalid segment order (expected unique label IDs)"
+        if (operation.get("segment_deleted") or operation.get("metadata_update")
+                or operation.get("operation_kind") != "patch"
+                or operation.get("voxel_bbox") != [0, 1, 0, 1, 0, 1]):
+            return "segment order must be a metadata-only patch"
     if operation.get("segment_deleted"):
         return None
     try:
@@ -1234,6 +1244,8 @@ def operation_defect(operation, volume_shape=None):
             if low < 0 or high <= low or high > shape[axis]:
                 return "bounds are empty or outside the volume"
         PackedOperationMask(operation)
+        if order is not None and np.any(decode_mask_delta(operation)[0]):
+            return "segment order cannot change voxels"
     except (KeyError, TypeError, ValueError, zlib.error) as exc:
         return f"payload cannot be decoded ({exc})"
     return None
@@ -2096,6 +2108,8 @@ class SharedFolderRoomClient:
                 {"sequence": int(operation["sequence"]), "file": destination.name},
                 durable=False,
             )
+        if operation.get("segment_order") is not None:
+            return operation_hash, destination
         self._remember_segment_owner(
             room_path, operation.get("segment_id"), operation.get("author")
         )
@@ -2576,7 +2590,7 @@ class SharedFolderRoomClient:
             if self._role_for(room_path, self.user_name) == "viewer":
                 raise LiveCollaborationError("Viewers cannot edit labels")
             lock_path = self._segment_lock_path(room_path, segment_id)
-            if lock_path.is_file():
+            if operation.get("segment_order") is None and lock_path.is_file():
                 lock_state = _read_json_file(lock_path)
                 expires_epoch = float(lock_state.get("expires_epoch", 0.0) or 0.0)
                 active_lock = bool(lock_state.get("locked")) and not (
@@ -2614,7 +2628,7 @@ class SharedFolderRoomClient:
                 room_path, state, latest_sequence
             )
             deletion_sequence = int(label_deletions.get(segment_id, 0))
-            if base_sequence < deletion_sequence:
+            if operation.get("segment_order") is None and base_sequence < deletion_sequence:
                 raise LiveCollaborationError(
                     f"Label was deleted at sequence {deletion_sequence}; "
                     "this edit predates that deletion. Sync before restoring the label."
@@ -3462,6 +3476,8 @@ class SharedFolderRoomClient:
             try:
                 hot_state = _read_json_file(hot_state_path)
                 for operation in hot_state.get("inline_operations") or []:
+                    if operation.get("segment_order") is not None:
+                        continue
                     segment_id = str(operation.get("segment_id") or "")
                     owner = str(operation.get("author") or "")
                     if segment_id and owner:
@@ -3514,6 +3530,8 @@ class SharedFolderRoomClient:
             lambda item: _read_json_file(item[1]), sorted(selected)
         )
         for operation in migration_records:
+            if operation.get("segment_order") is not None:
+                continue
             segment_id = str(operation.get("segment_id") or "")
             if segment_id and segment_id not in creators:
                 owner = str(operation.get("author") or "")
@@ -3976,7 +3994,8 @@ class SharedFolderRoomClient:
             except LiveCollaborationError:
                 continue
             segment_id = str(operation.get("segment_id") or "")
-            if segment_id and sequence >= latest_by_segment.get(segment_id, (0, None))[0]:
+            if (operation.get("segment_order") is None and segment_id
+                    and sequence >= latest_by_segment.get(segment_id, (0, None))[0]):
                 latest_by_segment[segment_id] = (sequence, operation)
         dropped_keys = {
             "sequence",
@@ -4109,12 +4128,13 @@ class SharedFolderRoomClient:
                     {"sequence": sequence, "file": destination.name},
                     durable=False,
                 )
-                self._remember_segment_owner(
-                    room_path, stored.get("segment_id"), stored.get("author")
-                )
-                self._update_compact_segment_owner(
-                    room_path, stored.get("segment_id"), stored.get("author")
-                )
+                if stored.get("segment_order") is None:
+                    self._remember_segment_owner(
+                        room_path, stored.get("segment_id"), stored.get("author")
+                    )
+                    self._update_compact_segment_owner(
+                        room_path, stored.get("segment_id"), stored.get("author")
+                    )
                 recent_operations.append(
                     {"sequence": sequence, "file": destination.name}
                 )
@@ -5156,6 +5176,9 @@ class LiveCollaborationController:
         self._applied_local_operation_ids = set()
         self._deferred_visibility_ids = set()
         self._known_segment_ids = set()
+        self._confirmed_segment_order = []
+        self._observed_segment_order = ()
+        self._has_shared_segment_order = False
         self._segment_metadata = {}
         self._preserve_added_segment_ids = False
         self.pending_segment_deletions = {}
@@ -8007,6 +8030,9 @@ class LiveCollaborationController:
             self._applied_local_operation_ids.clear()
             self._deferred_visibility_ids.clear()
             self._segment_metadata.clear()
+            self._confirmed_segment_order.clear()
+            self._observed_segment_order = ()
+            self._has_shared_segment_order = False
             self.pending_segment_deletions.clear()
             self._segment_revisions.clear()
             self._segment_verifications.clear()
@@ -8311,6 +8337,9 @@ class LiveCollaborationController:
         self._applied_local_operation_ids.clear()
         self._deferred_visibility_ids.clear()
         self._segment_metadata.clear()
+        self._confirmed_segment_order.clear()
+        self._observed_segment_order = ()
+        self._has_shared_segment_order = False
         self._preserve_added_segment_ids = False
         self.pending_segment_deletions.clear()
         self._segment_revisions.clear()
@@ -8525,6 +8554,13 @@ class LiveCollaborationController:
         self._unobserve_segmentation()
         self._observed_node = node
         self._observed_segmentation = node.GetSegmentation()
+        self._observed_segment_order = tuple(str(sid) for sid in node.GetSegmentation().GetSegmentIDs())
+        # Unlike SegmentModified this event carries no label ID. Queue the
+        # ordinary deferred callback; never mutate the native table on its stack.
+        self._observer_tags.append(self._observed_segmentation.AddObserver(
+            vtkSegmentationCore.vtkSegmentation.SegmentsOrderModified,
+            lambda caller, event: self._on_segmentation_modified(caller, event),
+        ))
         string_events = (
             vtkSegmentationCore.vtkSegmentation.SegmentAdded,
             vtkSegmentationCore.vtkSegmentation.SegmentRemoved,
@@ -8663,6 +8699,82 @@ class LiveCollaborationController:
             return
         key = (node.GetID(), str(segment_id))
         self._segment_revisions[key] = self._segment_revision(node, segment_id)
+
+    def _segment_order_operation(self, node, order):
+        # A real label supplies legacy wire context, not an editing target.
+        # Receivers of this metadata never create/update that label or its mask.
+        return {**self._current_segment_metadata(node, order[0]),
+                **encode_metadata_update(self.volume_shape),
+                "client_operation_id": str(uuid.uuid4()),
+                "base_sequence": int(self.last_sequence), "segment_order": list(order)}
+
+    def _queue_segment_order(self, node, order):
+        operation = self._segment_order_operation(node, order)
+        self.outgoing.append(operation)
+        self.session_metrics.operation_queued(operation["client_operation_id"])
+        self.session_metrics.increment("label_orders_queued")
+        self._force_sync_refresh = True
+        self._diagnostic_event("labels.order.queued", segment_order=list(order))
+        self._sync_operation_journal()
+
+    def _probe_segment_order(self, node):
+        if self._applying_remote or not self.initial_sync_complete:
+            return
+        current = tuple(str(sid) for sid in node.GetSegmentation().GetSegmentIDs())
+        previous = self._observed_segment_order
+        self._observed_segment_order = current
+        # Add/remove events do not request a reorder. Their room sequence fixes
+        # new-label positions, independent of which peer created them locally.
+        if current == previous or not previous or set(current) != set(previous):
+            return
+        if self._current_role() == "viewer":
+            self._apply_segment_order_to_node(node)
+            return
+        self._queue_segment_order(node, current)
+
+    def _apply_segment_order_to_node(self, node):
+        import slicer
+
+        segmentation = node.GetSegmentation()
+        current = list(segmentation.GetSegmentIDs())
+        present = set(current)
+        desired = [sid for sid in self._confirmed_segment_order if sid in present]
+        ordered = set(desired)
+        desired.extend(sid for sid in current if sid not in ordered)
+        if desired == current:
+            self._observed_segment_order = tuple(current)
+            return
+        get_nodes = getattr(slicer.util, "getNodesByClass", None)
+        editors = ([(editor, editor.GetSelectedSegmentID())
+                    for editor in get_nodes("vtkMRMLSegmentEditorNode")
+                    if editor.GetSegmentationNode() == node] if callable(get_nodes) else [])
+        applying = self._applying_remote
+        self._applying_remote = True
+        try:
+            # Move IDs, never copy labelmaps or choose a current row by index.
+            for index, sid in enumerate(desired):
+                if current[index] != sid:
+                    segmentation.SetSegmentIndex(sid, index)
+                    current.remove(sid)
+                    current.insert(index, sid)
+        finally:
+            for editor, selected in editors:
+                if selected is None or segmentation.GetSegment(selected) is not None:
+                    editor.SetSelectedSegmentID(selected)
+            self._observed_segment_order = tuple(segmentation.GetSegmentIDs())
+            self._applying_remote = applying
+
+    def _accept_segment_order(self, node, operation):
+        requested = list(operation["segment_order"])
+        requested_set = set(requested)
+        # Last room sequence wins for the stated IDs. Preserve labels the drag
+        # did not yet know. Missing/deleted IDs are never instantiated.
+        self._confirmed_segment_order = requested + [sid for sid in self._confirmed_segment_order
+                                                      if sid not in requested_set]
+        self._has_shared_segment_order = True
+        self._apply_segment_order_to_node(node)
+        self._diagnostic_event("labels.order.applied", sequence=int(operation.get("sequence", 0)),
+                               author=str(operation.get("author") or ""), segment_order=requested)
 
     def _current_segment_metadata(self, node, segment_id):
         """Read current display metadata without mutating the local baseline."""
@@ -8819,6 +8931,7 @@ class LiveCollaborationController:
         node = self._segmentation_node()
         if node is None:
             return
+        self._probe_segment_order(node)
         shared_representation_ids = self._shared_representation_ids(node)
         for segment_id in node.GetSegmentation().GetSegmentIDs():
             segment_id = str(segment_id)
@@ -9017,6 +9130,7 @@ class LiveCollaborationController:
             self._segment_revisions.pop(key, None)
             self._segment_verifications.pop(key, None)
         self._known_segment_ids = current_ids
+        self._probe_segment_order(node)
         event_segment_ids = {
             str(value) for value in (event_segment_ids or ()) if str(value or "")
         }
@@ -9071,6 +9185,9 @@ class LiveCollaborationController:
             str(segment_id)
             for segment_id in node.GetSegmentation().GetSegmentIDs()
         ]
+        self._observed_segment_order = tuple(segment_ids)
+        if seed and segment_ids:
+            self._queue_segment_order(node, segment_ids)
         for segment_id in segment_ids:
             self._ensure_independent_segment_labelmap(node, segment_id)
         for segment_id in segment_ids:
@@ -9565,6 +9682,13 @@ class LiveCollaborationController:
                         **encoded,
                     }
                 )
+        if self._has_shared_segment_order and result:
+            # Snapshot the confirmed order only. An unacknowledged local drag
+            # must not turn into canonical state through background compaction.
+            order = [sid for sid in self._confirmed_segment_order
+                     if node.GetSegmentation().GetSegment(sid) is not None]
+            if order:
+                result.append(self._segment_order_operation(node, order))
         return result
 
     def on_timer(self):
@@ -11085,6 +11209,9 @@ class LiveCollaborationController:
                 self._transport_stall_status_second = -1
 
     def _iter_incoming_operation(self, operation, node, baseline):
+        if operation.get("segment_order") is not None:
+            yield operation
+            return
         locally_deleted = self._segment_has_pending_deletion(node, operation["segment_id"])
         if not operation.get("segment_deleted") and not locally_deleted:
             self._ensure_segment(node, operation)
@@ -11115,6 +11242,9 @@ class LiveCollaborationController:
         """Apply a short slice of ordered voxel work, then return to Qt input."""
         if not self.connected or time.monotonic() < self._incoming_retry_at:
             return
+        node = self._segmentation_node()
+        if node is not None and self._incoming_operations:
+            self._probe_segment_order(node)
         deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
         started = time.perf_counter()
         try:
@@ -11269,6 +11399,13 @@ class LiveCollaborationController:
             for operation in group.deletions.values():
                 if self._apply_operations([operation]) is False:
                     raise LiveCollaborationError("Checkpoint deletion failed; inspect the persistent error log")
+            for sid in group.baselines:
+                if sid not in self._confirmed_segment_order:
+                    self._confirmed_segment_order.append(sid)
+            if group.order is not None:
+                self._accept_segment_order(node, group.order)
+            else:
+                self._apply_segment_order_to_node(node)
             self.dirty_segments.update(dirty)
             self.last_sequence = group.last_sequence
             self._last_snapshot_sequence = max(self._last_snapshot_sequence, group.last_sequence)
@@ -11312,7 +11449,7 @@ class LiveCollaborationController:
                 **operation,
                 "client_operation_id": str(uuid.uuid4()),
                 "operation_kind": operation.get("operation_kind") or "snapshot",
-                "metadata_update": True,
+                "metadata_update": operation.get("segment_order") is None,
                 "base_sequence": int(self.last_sequence),
             }
             self.outgoing.append(queued)
@@ -11343,7 +11480,7 @@ class LiveCollaborationController:
             if defect or not operation.get("segment_id"):
                 raise LiveCollaborationError(f"Invalid historical state: {defect or 'missing label ID'}")
         historical_ids = {str(operation["segment_id"]) for operation in operations
-                          if not operation.get("segment_deleted")}
+                          if not operation.get("segment_deleted") and operation.get("segment_order") is None}
         deletions = []
         for segment_id in sorted(set(node.GetSegmentation().GetSegmentIDs()) - historical_ids):
             metadata = self._current_segment_metadata(node, segment_id)
@@ -11370,7 +11507,7 @@ class LiveCollaborationController:
         masks = {}
         for operation in operations or []:
             segment_id = str(operation.get("segment_id") or "")
-            if not segment_id:
+            if not segment_id or operation.get("segment_order") is not None:
                 continue
             if operation.get("segment_deleted"):
                 masks.pop(segment_id, None)
@@ -11448,6 +11585,12 @@ class LiveCollaborationController:
 
     def _queue_collaborative_undo(self, value, sequence):
         target = dict((value or {}).get("target") or {})
+        if target.get("segment_order") is not None:
+            previous = [op for op in (value or {}).get("before") or [] if op.get("segment_order") is not None]
+            if not previous:
+                raise LiveCollaborationError("No earlier shared order recorded; drag the labels into the desired order")
+            self._queue_snapshot_operations([{**previous[-1], "undo_of_sequence": int(sequence)}])
+            return
         segment_id = str(target.get("segment_id") or "")
         if not segment_id:
             raise LiveCollaborationError("The edit selected for undo has no label")
@@ -11698,6 +11841,9 @@ class LiveCollaborationController:
                 activity_type = "checkpoint"
                 if record.get("snapshot_label"):
                     action += f" “{record.get('snapshot_label')}”"
+            elif record.get("segment_order") is not None:
+                action = f"{author} reordered labels for everyone"
+                activity_type = "label order"
             elif record.get("undo_of_sequence"):
                 action = (
                     f"{author} undid sequence {record.get('undo_of_sequence')} "
@@ -12342,6 +12488,19 @@ class LiveCollaborationController:
             if sequence <= self.last_sequence:
                 continue
             try:
+                if operation.get("segment_order") is not None:
+                    # Capture a just-finished native drag before applying a
+                    # remote order; its zero-delay notification may still wait.
+                    self._probe_segment_order(node)
+                    self._accept_segment_order(node, operation)
+                    if operation.get("author") == self.user_name:
+                        self._acknowledge_local_operation(operation)
+                    if not operation.get("system_snapshot"):
+                        actor = "You" if operation.get("author") == self.user_name else operation.get("author") or "Collaborator"
+                        self._append_activity(f"{actor} reordered labels for everyone · sequence {sequence}")
+                    self.last_sequence = sequence
+                    applied_count += 1
+                    continue
                 segment_id = operation["segment_id"]
                 key = (node.GetID(), segment_id)
                 metadata_before = (
@@ -12370,6 +12529,8 @@ class LiveCollaborationController:
                     self._segment_revisions.pop(key, None)
                     self._segment_verifications.pop(key, None)
                     self._known_segment_ids.discard(segment_id)
+                    self._confirmed_segment_order = [sid for sid in self._confirmed_segment_order if sid != segment_id]
+                    self._observed_segment_order = tuple(node.GetSegmentation().GetSegmentIDs())
                     self.pending_lock_changes.pop(segment_id, None)
                     self.segment_locks_state.pop(segment_id, None)
                     self.review_states_state.pop(segment_id, None)
@@ -12432,7 +12593,10 @@ class LiveCollaborationController:
                         applied_count += 1
                     continue
                 self._applying_remote = True
+                if segment_id not in self._confirmed_segment_order:
+                    self._confirmed_segment_order.append(segment_id)
                 self._ensure_segment(node, operation)
+                self._apply_segment_order_to_node(node)
                 self._ensure_independent_segment_labelmap(node, segment_id)
                 if (
                     key in self.metadata_updates

@@ -191,6 +191,7 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_column(connection, "live_operations", "undo_of_sequence", "INTEGER")
+            self._ensure_column(connection, "live_operations", "segment_order", "TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_label_deletions "
                 "ON live_operations(room_id, segment_id, sequence) WHERE segment_deleted = 1"

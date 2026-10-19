@@ -28,6 +28,7 @@ UNOBSERVED_GAP_SECONDS = 60.0
 DETAIL_KEYS = frozenset({
     "sequence", "segment_id", "segment_name", "changed_voxels", "operation_kind",
     "metadata_update", "segment_deleted", "system_snapshot", "undo_of_sequence", "color_hex",
+    "segment_order",
     "conflict_count", "locked", "lock_mode", "lock_holder", "owner", "state",
     "target_user", "role", "resolution", "has_anchor", "created", "name",
     "sample_id", "session_id", "measurement_version", "category", "start_epoch",
@@ -333,6 +334,12 @@ class RoomWorkLog:
                   "event": str(event), "user": str(user), "session_id": str(session_id),
                   "details": {key: value for key, value in (details or {}).items()
                               if key in DETAIL_KEYS and isinstance(value, (str, int, float, bool, type(None)))}}
+        # One explicitly typed, bounded ID list is needed to audit a room
+        # reorder. Never open the whitelist to arbitrary nested structures.
+        order = (details or {}).get("segment_order")
+        if (isinstance(order, list) and 1 <= len(order) <= 10000
+                and all(isinstance(sid, str) and sid.strip() and len(sid) <= 200 for sid in order)):
+            record["details"]["segment_order"] = list(order)
         # No masks, chat text, paths, credentials or arbitrary nested structures.
         record["details"] = {key: value[:1000] if isinstance(value, str) else value
                              for key, value in record["details"].items()}

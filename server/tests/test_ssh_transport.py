@@ -270,6 +270,14 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
         with pytest.raises(LiveCollaborationError, match="locked"):
             alice.push_operation(room["id"], dict(operation, client_operation_id="frozen-owner-edit"))
         assert bob.segment_locks(room["id"])[0]["lock_mode"] == "all"
+        # Reordering is not an edit to the anchor label, even if it is frozen.
+        from collaboration import encode_metadata_update
+        order = {"client_operation_id": "ssh-label-order", "segment_id": "LiveSeg-test",
+                 "segment_name": "Mandibles", "segment_order": ["LiveSeg-test", "future-label"],
+                 **encode_metadata_update(empty.shape)}
+        alice.push_operation(room["id"], order)
+        assert bob.operations(room["id"], pushed["sequence"])[-1]["segment_order"] == order["segment_order"]
+        assert bob.room_history(room["id"])[-1]["changed_voxels"] == 0
         alice.set_segment_lock(room["id"], "LiveSeg-test", False)
         alice.presence(room["id"], {"active_segment": "LiveSeg-test"})
         assert any(item["user"] == "alice" for item in bob.presence(room["id"], {}))
@@ -314,7 +322,8 @@ def test_two_encrypted_clients_share_voxels_chat_presence_and_history(ssh_server
             break
         time.sleep(0.05)
     assert "chat.message" in text and "Mandibles" in text and "room.leave" in text
-    assert text.count("segmentation.operation") == 1
+    assert text.count("segmentation.operation") == 2  # one voxel edit + one order-only change
+    assert '"segment_order"' in text
     assert "Active work including visual review: 5.000" in text
 
 

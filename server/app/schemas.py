@@ -52,7 +52,16 @@ class LiveOperationCreate(BaseModel):
     snapshot_label: str | None = Field(default=None, max_length=200)
     segment_deleted: bool = False
     metadata_update: bool = False
+    segment_order: list[str] | None = Field(default=None, min_length=1, max_length=10000)
     undo_of_sequence: int | None = Field(default=None, ge=1)
+
+    @field_validator("segment_order")
+    @classmethod
+    def validate_segment_order(cls, value):
+        if value is not None and (len(set(value)) != len(value)
+                or any(not sid.strip() or len(sid) > 200 for sid in value)):
+            raise ValueError("segment_order must contain unique nonblank label IDs")
+        return value
 
     @field_validator("color_hex")
     @classmethod

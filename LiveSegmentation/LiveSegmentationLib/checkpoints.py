@@ -15,6 +15,7 @@ class CheckpointGroup:
         self.baselines = {}
         self.metadata = {}
         self.deletions = {}
+        self.order = None
         self.records = []
         self.baseline_factory = baseline_factory
         self.tile_iterator = tile_iterator
@@ -33,7 +34,9 @@ class CheckpointGroup:
         segment_id = str(operation["segment_id"])
         if operation.get("_undecodable"):
             raise ValueError("Damaged checkpoint part; local labels retained")
-        if operation.get("segment_deleted"):
+        if operation.get("segment_order") is not None:
+            self.order = operation
+        elif operation.get("segment_deleted"):
             self.deletions[segment_id] = operation
             self.baselines.pop(segment_id, None)
         else:

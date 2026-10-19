@@ -237,6 +237,8 @@ def test_unspecified_segmentation_event_uses_changed_revision_not_selected_label
     node = FakeNode()
     controller = LiveCollaborationController.__new__(LiveCollaborationController)
     controller.owner = WrongSelectionOwner()
+    controller._applying_remote = False
+    controller._observed_segment_order = tuple(node.GetSegmentation().GetSegmentIDs())
     controller.user_name = "thomas"
     controller.initial_sync_complete = True
     controller._known_segment_ids = {"2.25.1", "2.25.4"}

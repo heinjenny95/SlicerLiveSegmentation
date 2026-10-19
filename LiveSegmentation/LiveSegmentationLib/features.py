@@ -358,6 +358,7 @@ def operation_summary(operation, decode_mask_delta=None):
         "system_snapshot": bool(operation.get("system_snapshot", False)),
         "segment_deleted": bool(operation.get("segment_deleted", False)),
         "metadata_update": bool(operation.get("metadata_update", False)),
+        "segment_order": operation.get("segment_order"),
         "client_operation_id": operation.get("client_operation_id"),
         "undo_of_sequence": operation.get("undo_of_sequence"),
     }
@@ -413,6 +414,7 @@ def reconstruct_snapshot_operations(
             ChunkedMaskBaseline,
             PackedOperationMask,
             encode_mask_crop_snapshot,
+            encode_metadata_update,
             iter_operation_tiles,
         )
     except ImportError:
@@ -420,16 +422,24 @@ def reconstruct_snapshot_operations(
             ChunkedMaskBaseline,
             PackedOperationMask,
             encode_mask_crop_snapshot,
+            encode_metadata_update,
             iter_operation_tiles,
         )
     del apply_mask_delta  # Kept in the public call signature for compatibility.
     ordered = sorted(operations, key=lambda item: int(item.get("sequence", 0)))
     metadata = {}
     masks = {}
+    segment_order = None
+    canonical_order = []
     target_sequence = int(target_sequence)
     for operation in ordered:
         if int(operation.get("sequence", 0)) > target_sequence:
             break
+        if operation.get("segment_order") is not None:
+            segment_order = operation
+            requested = list(operation["segment_order"])
+            canonical_order = requested + [sid for sid in canonical_order if sid not in set(requested)]
+            continue
         segment_id = str(operation.get("segment_id") or "")
         if not segment_id:
             continue
@@ -441,7 +451,10 @@ def reconstruct_snapshot_operations(
             }
         if operation.get("segment_deleted"):
             masks.pop(segment_id, None)
+            canonical_order = [sid for sid in canonical_order if sid != segment_id]
             continue
+        if segment_id not in canonical_order:
+            canonical_order.append(segment_id)
         shape = tuple(int(value) for value in operation["volume_shape"])
         current = masks.get(segment_id)
         if current is None or current.shape != shape:
@@ -464,7 +477,8 @@ def reconstruct_snapshot_operations(
                     if other_id != segment_id:
                         other.set_region(bounds, claimed, np.zeros_like(values))
     result = []
-    for segment_id in sorted(masks, key=str.casefold):
+    output_order = [sid for sid in canonical_order if sid in masks]
+    for segment_id in output_order if segment_order is not None else sorted(masks, key=str.casefold):
         baseline = masks[segment_id]
         label_operations = []
         for coordinate, chunk in sorted(baseline.chunks.items()):
@@ -480,6 +494,9 @@ def reconstruct_snapshot_operations(
         else:
             label_operations.insert(0, encode_mask_crop_snapshot(None, None, baseline.shape))
         result.extend({**metadata[segment_id], **encoded} for encoded in label_operations)
+    if segment_order is not None and result:
+        result.append({**metadata[output_order[0]], **encode_metadata_update(masks[output_order[0]].shape),
+                       "segment_order": output_order})
     return result
 
 

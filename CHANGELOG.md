@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Synchronize label ordering across room participants as an ordered metadata-only
+  operation. Native drag reordering preserves each editor's selected stable ID,
+  label names/colors and all voxel data. Concurrent requests resolve in room
+  sequence order; unmentioned new labels are retained and missing labels are
+  never recreated. Preserve order through checkpoints, compaction, historical
+  restore and rejoin. Validate/persist the optional order list in folder/SSH/LAN
+  and HTTP transports and record it in diagnostics, activity and work logs.
+
 - Skip empty native labelmaps that still own a zero-length scalar allocation in
   the asynchronous 3D preview; they no longer abort all populated-label meshes.
   Keep a local preview entry in the editor's 3D button row instead of leaving

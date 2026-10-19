@@ -59,6 +59,7 @@ def public_live_operation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data["system_snapshot"] = bool(data.get("system_snapshot", False))
     data["segment_deleted"] = bool(data.get("segment_deleted", False))
     data["metadata_update"] = bool(data.get("metadata_update", False))
+    data["segment_order"] = json.loads(data["segment_order"]) if data.get("segment_order") else None
     data["protected_segment_ids"] = json.loads(data.get("protected_segment_ids") or "[]")
     return data
 
@@ -516,6 +517,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 incoming,
                 max_raw_bytes=max(64 * 1024 * 1024, resolved_settings.max_upload_bytes * 4),
             )
+            if payload.segment_order is not None and (
+                    payload.segment_deleted or payload.metadata_update or payload.operation_kind != "patch"
+                    or payload.voxel_bbox != [0, 1, 0, 1, 0, 1] or any(incoming_changed)):
+                raise ValueError("segment_order must be a metadata-only patch without voxel changes")
         except (ValueError, zlib.error) as exc:
             raise HTTPException(
                 status_code=422, detail=f"Invalid live operation payload: {exc}"
@@ -548,7 +553,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     WHERE room_id = ? AND segment_id = ? AND segment_deleted = 1
                     """, (room_id, payload.segment_id),
                 ).fetchone()[0]
-                if payload.base_sequence < deletion_sequence:
+                if payload.segment_order is None and payload.base_sequence < deletion_sequence:
                     raise HTTPException(
                         status_code=409,
                         detail=(f"Label was deleted at sequence {deletion_sequence}; "
@@ -571,7 +576,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         >= float(lock_state["expires_epoch"])
                     )
                 )
-                if active_lock and (lock_state["lock_mode"] != "others" or (lock_state["lock_holder"] or lock_state["owner"]) != user):
+                if payload.segment_order is None and active_lock and (lock_state["lock_mode"] != "others" or (lock_state["lock_holder"] or lock_state["owner"]) != user):
                     raise HTTPException(
                         status_code=423,
                         detail=f"Label is locked by {lock_state['lock_holder'] or lock_state['owner']}",
@@ -627,9 +632,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         snapshot_group_id, snapshot_group_index,
                         snapshot_group_count, system_snapshot, snapshot_label,
                         segment_deleted, metadata_update, undo_of_sequence,
-                        changed_voxels, protected_segment_ids,
+                        changed_voxels, protected_segment_ids, segment_order,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -655,20 +660,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         payload.undo_of_sequence,
                         changed_voxels,
                         json.dumps(protected_segment_ids),
+                        json.dumps(payload.segment_order) if payload.segment_order is not None else None,
                         iso_now(),
                     ),
                 )
                 operation = connection.execute(
                     "SELECT * FROM live_operations WHERE id = ?", (operation_id,)
                 ).fetchone()
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO live_segment_locks(
-                        room_id, segment_id, owner, locked, updated_by, updated_at
-                    ) VALUES (?, ?, ?, 0, ?, ?)
-                    """,
-                    (room_id, payload.segment_id, user, user, iso_now()),
-                )
+                if payload.segment_order is None:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO live_segment_locks(
+                            room_id, segment_id, owner, locked, updated_by, updated_at
+                        ) VALUES (?, ?, ?, 0, ?, ?)
+                        """,
+                        (room_id, payload.segment_id, user, user, iso_now()),
+                    )
                 for conflict in conflicts:
                     connection.execute(
                         """

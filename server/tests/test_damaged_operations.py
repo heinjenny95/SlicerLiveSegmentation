@@ -194,6 +194,7 @@ def test_controller_advances_past_a_damaged_operation_and_reports_it(monkeypatch
     controller._incoming_retry_at = 0.0
     controller._incoming_iterator = None
     controller._checkpoint_group = None
+    controller.segmentation_node_id = None
     controller._incoming_piece = None
     controller._incoming_continuation_scheduled = False
     controller.initial_sync_complete = True
