@@ -8,6 +8,18 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+### SSH checkpoint response deadline
+
+- Allow full-room checkpoint publication up to 120 seconds for its SSH response
+  instead of the 10-second small-request deadline. The isolated local worker's
+  outer wait includes five seconds for forwarding the inner outcome. Chat,
+  presence, health and ordinary edits retain their short independent deadlines;
+  closing the session still interrupts pending waits immediately. A timed-out
+  request may still finish remotely; late replies remain isolated by request ID.
+- Regressions use real encrypted loopback SSH and both client implementations:
+  slow checkpoints with concurrent chat/presence, finite expiry, late responses
+  and closing during a pending checkpoint.
+
 - Exercise real folder transport and controller replay together under seeded
   interleaved labels, lost acknowledgements/retries, lagged delivery, compaction
   with offline local work, explicit leave/rejoin and a late participant.

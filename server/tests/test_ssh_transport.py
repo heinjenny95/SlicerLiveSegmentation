@@ -57,9 +57,10 @@ def test_ssh_invitation_has_no_login_or_secret():
 class LocalSSHServer:
     """A real encrypted loopback SSH server; only the shipped helper may run."""
 
-    def __init__(self, folder, delay_health=False):
+    def __init__(self, folder, delay_health=False, delay_snapshot=0.0):
         self.folder = folder
         self.delay_health = delay_health
+        self.delay_snapshot = float(delay_snapshot)
         self.key = paramiko.RSAKey.generate(2048)
         self.socket = socket.socket()
         self.socket.bind(("127.0.0.1", 0))
@@ -105,6 +106,17 @@ class LocalSSHServer:
                 code = REMOTE_BOOTSTRAP
                 if owner.delay_health:
                     code = code.replace("allowed = core.LAN_RELAY_METHODS", "original_health = client.health_check\n    def delayed_health(*args, **kwargs):\n        import time\n        time.sleep(1.0)\n        return original_health(*args, **kwargs)\n    client.health_check = delayed_health\n    allowed = core.LAN_RELAY_METHODS")
+                if owner.delay_snapshot:
+                    code = code.replace(
+                        "allowed = core.LAN_RELAY_METHODS",
+                        "original_snapshot = client.publish_room_snapshot\n"
+                        "    def delayed_snapshot(*args, **kwargs):\n"
+                        "        import time\n"
+                        f"        time.sleep({owner.delay_snapshot!r})\n"
+                        "        return original_snapshot(*args, **kwargs)\n"
+                        "    client.publish_room_snapshot = delayed_snapshot\n"
+                        "    allowed = core.LAN_RELAY_METHODS",
+                    )
                 process = subprocess.Popen([sys.executable, "-u", "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=owner.folder, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
                 owner.processes.append(process)
 
@@ -467,6 +479,109 @@ def test_ssh_request_deadline_still_applies(tmp_path, isolated):
         # A late response must not destroy the connection or satisfy another RPC.
         time.sleep(1.1)
         assert client.send_chat(room["id"], "after timeout", "chat-after-timeout")
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("client_type,expected", [(SshRoomClient, 120.0), (SshProcessRoomClient, 125.0)])
+def test_only_checkpoint_gets_a_longer_ssh_response_budget(monkeypatch, client_type, expected):
+    import ssh_transport
+
+    real_queue = queue.Queue
+    deadlines = []
+
+    class ObservedQueue(real_queue):
+        def get(self, block=True, timeout=None):
+            deadlines.append(timeout)
+            return super().get(block=block, timeout=timeout)
+
+    client = client_type("linux-host/folder", "alice", "test-user")
+    client._ensure_connected = lambda: None
+
+    class Channel:
+        def sendall(self, data):
+            request = json.loads(data)
+            client._pending[request["id"]].put_nowait({"result": "ok"})
+
+    client._channel = Channel()
+    monkeypatch.setattr(ssh_transport.queue, "Queue", ObservedQueue)
+    try:
+        assert client._rpc("publish_room_snapshot", "room", []) == "ok"
+        for method in ("health_check", "send_chat", "presence_report", "operations", "push_operation"):
+            assert client._rpc(method, "room") == "ok"
+        assert deadlines == [expected, 10.0, 10.0, 10.0, 10.0, 10.0]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_slow_checkpoint_survives_normal_deadline_without_blocking_chat_or_presence(tmp_path, isolated):
+    server = LocalSSHServer(tmp_path, delay_snapshot=1.2)
+    server.pin(tmp_path / "known_hosts")
+    client = server.client("alice", tmp_path / "known_hosts", isolated=isolated)
+    client.timeout_seconds = 0.5
+    client.snapshot_timeout_seconds = 3.0
+    try:
+        room = client.join("slow-checkpoint", "b" * 64)
+        mask = np.zeros((4, 4, 4), dtype=np.uint8)
+        mask[1, 2, 3] = 1
+        operation = {"segment_id": "stable-id", **encode_mask_delta(np.zeros_like(mask), mask)}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(client.publish_room_snapshot, room["id"], [operation], expected_sequence=0)
+            time.sleep(0.15)
+            started = time.monotonic()
+            assert client.send_chat(room["id"], "during checkpoint", "parallel-snapshot-chat")
+            assert client.presence_report(room["id"], {})["users"]
+            assert time.monotonic() - started < 0.8
+            assert not slow.done(), "Checkpoint wait serialized other SSH lanes"
+            assert slow.result(timeout=4)["last_sequence"] == 1
+        received = client.operations(room["id"], 0)
+        assert np.array_equal(apply_mask_delta(np.zeros_like(mask), received[-1]), mask)
+        assert client.health_check(room["id"])
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_checkpoint_deadline_is_finite_and_late_reply_keeps_its_identity(tmp_path, isolated):
+    server = LocalSSHServer(tmp_path, delay_snapshot=1.2)
+    server.pin(tmp_path / "known_hosts")
+    client = server.client("alice", tmp_path / "known_hosts", isolated=isolated)
+    client.timeout_seconds = 0.4
+    client.snapshot_timeout_seconds = 0.6
+    try:
+        room = client.join("checkpoint-deadline", "b" * 64)
+        started = time.monotonic()
+        with pytest.raises(LiveCollaborationError, match="publish_room_snapshot.*within 0.6 seconds"):
+            client.publish_room_snapshot(room["id"], [])
+        assert time.monotonic() - started < 1.1
+        # A timeout is not a cancellation of already accepted remote work.
+        # Ignore its late reply; never feed it to a chat/health request.
+        time.sleep(1.0)
+        assert client.send_chat(room["id"], "after checkpoint timeout", "late-snapshot-chat")
+        assert client.health_check(room["id"])
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_closing_ssh_does_not_wait_for_long_checkpoint_budget(tmp_path, isolated):
+    server = LocalSSHServer(tmp_path, delay_snapshot=1.2)
+    server.pin(tmp_path / "known_hosts")
+    client = server.client("alice", tmp_path / "known_hosts", isolated=isolated)
+    try:
+        room = client.join("checkpoint-close", "b" * 64)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            slow = pool.submit(client.publish_room_snapshot, room["id"], [])
+            time.sleep(0.15)
+            started = time.monotonic()
+            client.close()
+            with pytest.raises(LiveCollaborationError, match="closed"):
+                slow.result(timeout=0.8)
+            assert time.monotonic() - started < 0.8
     finally:
         client.close()
         server.close()

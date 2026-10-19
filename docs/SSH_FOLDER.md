@@ -53,6 +53,15 @@ ends after disconnect and pending work. No daemon or additional public TCP
 listener is installed. Concurrent RPCs allow chat and presence to proceed while
 another request is waiting, subject to server resources and SSH bandwidth.
 
+Full-room checkpoint publication has a separate 120-second response deadline
+because it may flush many label/history files on the server. The isolated local
+worker allows another five seconds to forward the outcome. This background wait
+does not extend chat, presence, health or ordinary edit deadlines (10 seconds by
+default), and does not run on the GUI thread. Closing/leaving still interrupts
+local waits promptly. A response timeout does not cancel work already accepted
+on the server; a late reply cannot satisfy a different request. This allowance
+does not guarantee checkpoint or live-edit latency on a slow server/filesystem.
+
 **`/dev/shm` is normally temporary RAM-backed storage. Its contents may disappear
 on restart or unmount and are limited by RAM/swap and filesystem capacity.**
 Use a persistent server folder for durable room history, or save final

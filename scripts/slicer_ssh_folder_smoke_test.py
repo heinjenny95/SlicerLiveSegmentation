@@ -33,12 +33,14 @@ def probe():
     root = Path(__file__).resolve().parents[1]
     folder = Path(tempfile.mkdtemp(prefix="live-slicer-ssh-"))
     fixture_python = os.environ.get("LIVE_SSH_TEST_PYTHON") or str(root / ".venv" / "Scripts" / "python.exe")
-    fixture = subprocess.Popen([fixture_python, str(root / "scripts" / "run_ssh_test_server.py"), str(folder)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+    snapshot_delay = float(os.environ.get("LIVE_SSH_TEST_SNAPSHOT_DELAY", "0"))
+    fixture = subprocess.Popen([fixture_python, str(root / "scripts" / "run_ssh_test_server.py"), str(folder), str(snapshot_delay)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
     settings = qt.QSettings()
     saved = {str(key): settings.value(key) for key in settings.allKeys() if str(key).startswith("LiveSegmentation/")}
     widget = slicer.modules.livesegmentation.widgetRepresentation().self()
     controller = widget.live_collaboration
     peer = None
+    heartbeat = qt.QTimer()
     try:
         connection = json.loads(fixture.stdout.readline())
         assert not controller._text(controller.shared_folder_edit), "Startup restored a connection target"
@@ -88,6 +90,37 @@ def probe():
         assert widget.update_segment_binary_labelmap_crop(before, after, [4, 6, 5, 7, 6, 8], node, "LiveSeg-Mandibles", volume)
         wait_until(lambda: controller.last_sequence > old_sequence and not controller.outgoing and not controller.awaiting_echo)
         assert peer.operations(room["id"], result["sequence"])
+        checkpoint = None
+        if snapshot_delay:
+            beats = [time.monotonic()]
+            heartbeat.setInterval(20)
+            heartbeat.timeout.connect(lambda: beats.append(time.monotonic()))
+            heartbeat.start()
+            before_checkpoint = controller.last_sequence
+            started = time.monotonic()
+            controller.request_room_snapshot()
+            wait_until(lambda: controller._edit_push_worker is not None and controller._edit_push_worker.is_alive())
+            chat_started = time.monotonic()
+            chat = peer.send_chat(room["id"], "chat during checkpoint", "ssh-checkpoint-chat")
+            wait_until(lambda: controller.last_chat_sequence >= chat["sequence"])
+            chat_latency = time.monotonic() - chat_started
+            assert controller._edit_push_worker.is_alive(), "Checkpoint completed before the parallel-lane check"
+            wait_until(lambda: controller._last_snapshot_sequence > before_checkpoint, timeout=snapshot_delay + 20)
+            elapsed = time.monotonic() - started
+            beats.append(time.monotonic())
+            heartbeat.stop()
+            max_gap = max(b - a for a, b in zip(beats, beats[1:]))
+            assert elapsed >= snapshot_delay, "Slow server fixture did not apply"
+            assert chat_latency < 2.0 and max_gap < 1.0
+            assert controller.connected and controller.connection_healthy
+            assert not controller._connection_error_popup_shown and not controller._last_error
+            current = widget.segment_mask_region_in_reference_geometry(node, "LiveSeg-Mandibles", volume, [4, 6, 5, 7, 6, 8])
+            assert int(current.sum()) == 7
+            checkpoint = {"server_delay_seconds": snapshot_delay, "elapsed_seconds": elapsed,
+                          "chat_seconds": chat_latency, "max_gui_gap_seconds": max_gap,
+                          "remote_response_budget_seconds": controller.client.snapshot_timeout_seconds,
+                          "outer_response_budget_seconds": controller.client._request_timeout_seconds("publish_room_snapshot"),
+                          "voxels_retained": 7, "connection_healthy": True}
         old_node_id = node.GetID()
         start = time.monotonic()
         controller.leave()
@@ -99,8 +132,9 @@ def probe():
         wait_until(lambda: controller.connected and controller.initial_sync_complete)
         mask = widget.segment_mask_region_in_reference_geometry(controller._segmentation_node(), "LiveSeg-Mandibles", volume, [4, 6, 5, 7, 6, 8])
         assert int(mask.sum()) == 7
-        return {"ok": True, "module_path": slicer.util.modulePath("LiveSegmentation"), "join_return_seconds": join_return, "remote_paint_seconds": latency, "leave_return_seconds": leave_return, "rejoined_voxels": 7, "auto_detect_shared_and_server_fields": True, "chat": True, "password_cleared": True}
+        return {"ok": True, "module_path": slicer.util.modulePath("LiveSegmentation"), "join_return_seconds": join_return, "remote_paint_seconds": latency, "leave_return_seconds": leave_return, "rejoined_voxels": 7, "auto_detect_shared_and_server_fields": True, "chat": True, "password_cleared": True, "slow_checkpoint": checkpoint}
     finally:
+        heartbeat.stop()
         controller.cleanup()
         if peer:
             peer.close()
@@ -128,4 +162,4 @@ def main():
     slicer.app.exit(0 if result["ok"] else 1)
 
 
-qt.QTimer.singleShot(1000, main)
+main()

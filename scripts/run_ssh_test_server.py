@@ -14,7 +14,7 @@ from test_ssh_transport import LocalSSHServer  # noqa: E402
 def main():
     folder = Path(sys.argv[1]).resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    server = LocalSSHServer(folder)
+    server = LocalSSHServer(folder, delay_snapshot=float(sys.argv[2]) if len(sys.argv) > 2 else 0.0)
     known_hosts = folder / "test-known-hosts"
     server.pin(known_hosts)
     client = server.client("fixture", known_hosts)

@@ -217,7 +217,7 @@ finally:
 class SshRoomClient(LanRoomClient):
     transport_kind = "ssh-folder"
 
-    def __init__(self, location, user_name, username, password="", known_hosts=None, remote_python="python3", timeout_seconds=10.0):
+    def __init__(self, location, user_name, username, password="", known_hosts=None, remote_python="python3", timeout_seconds=10.0, snapshot_timeout_seconds=120.0):
         self.target = parse_ssh_folder(location)
         self.location = self.target.location
         self.user_name = str(user_name or "").strip()
@@ -230,6 +230,7 @@ class SshRoomClient(LanRoomClient):
         self.password = str(password or "")
         self.known_hosts = Path(known_hosts) if known_hosts else Path.home() / ".ssh" / "live_segmentation_known_hosts"
         self.timeout_seconds = float(timeout_seconds)
+        self.snapshot_timeout_seconds = float(snapshot_timeout_seconds)
         self.presence_session_id = uuid.uuid4().hex
         self._ssh = None
         self._channel = None
@@ -383,10 +384,19 @@ class SshRoomClient(LanRoomClient):
             except queue.Full:
                 pass
 
+    def _request_timeout_seconds(self, method):
+        # A full-state checkpoint can flush/archive many files on the server.
+        # It already runs off the GUI; do not give chat/presence/health the same
+        # long wait or change their independent request queues and deadlines.
+        if method == "publish_room_snapshot":
+            return max(self.timeout_seconds, self.snapshot_timeout_seconds)
+        return self.timeout_seconds
+
     def _rpc(self, method, *args, **kwargs):
         if method not in LAN_RELAY_METHODS:
             raise LiveCollaborationError("Unsupported SSH collaboration request")
         self._ensure_connected()
+        response_timeout = self._request_timeout_seconds(method)
         request_id = uuid.uuid4().hex
         data = (json.dumps({"id": request_id, "method": method, "args": args, "kwargs": kwargs}, separators=(",", ":")) + "\n").encode("utf-8")
         if len(data) > MAX_FRAME:
@@ -399,12 +409,12 @@ class SshRoomClient(LanRoomClient):
         try:
             with self._write_lock:
                 self._channel.sendall(data)
-            response = result.get(timeout=self.timeout_seconds)
+            response = result.get(timeout=response_timeout)
             if "error" in response:
                 raise LiveCollaborationError(response["error"])
             return response["result"]
         except queue.Empty as exc:
-            raise LiveCollaborationError(f"SSH request '{method}' did not respond within {self.timeout_seconds:g} seconds") from exc
+            raise LiveCollaborationError(f"SSH request '{method}' did not respond within {response_timeout:g} seconds") from exc
         except OSError as exc:
             raise LiveCollaborationError("SSH connection was interrupted; join the room again") from exc
         finally:
@@ -458,6 +468,12 @@ class SshProcessRoomClient(SshRoomClient):
         self._process = None
         self._reap_started = False
 
+    def _request_timeout_seconds(self, method):
+        timeout = super()._request_timeout_seconds(method)
+        # The inner SSH RPC starts after this pipe request. Let it return its
+        # precise outcome before the parent times out at the identical boundary.
+        return timeout + 5.0 if method == "publish_room_snapshot" else timeout
+
     def _ensure_connected(self):
         with self._connect_lock:
             if self._closed.is_set():
@@ -493,6 +509,7 @@ class SshProcessRoomClient(SshRoomClient):
                 setup = dict(location=self.location, user_name=self.user_name, username=self.username,
                              password=self.password, known_hosts=str(self.known_hosts),
                              remote_python=self.remote_python, timeout_seconds=self.timeout_seconds,
+                             snapshot_timeout_seconds=self.snapshot_timeout_seconds,
                              presence_session_id=self.presence_session_id)
                 try:
                     self._channel.sendall((json.dumps(setup) + "\n").encode("utf-8"))
