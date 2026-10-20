@@ -10331,11 +10331,12 @@ class LiveCollaborationController:
     def _lock_set_lane(self, session_token, client, room_id, changes):
         started = time.monotonic()
         completed = []
+        confirmed = []
         errors = []
         try:
             for segment_id, change in changes.items():
                 try:
-                    client.set_segment_lock(
+                    state = client.set_segment_lock(
                         room_id,
                         segment_id,
                         bool(change.get("locked")) if isinstance(change, dict) else bool(change),
@@ -10344,6 +10345,8 @@ class LiveCollaborationController:
                         else 0,
                         str(change.get("lock_mode", "others")) if isinstance(change, dict) else "others",
                     )
+                    if isinstance(state, dict):
+                        confirmed.append({**state, "segment_id": segment_id})
                     completed.append(segment_id)
                 except Exception as exc:
                     message = str(exc)
@@ -10358,6 +10361,7 @@ class LiveCollaborationController:
                     "lane": "lock-set",
                     "session_token": session_token,
                     "lock_segment_ids": completed,
+                    "confirmed_locks": confirmed,
                     "command_errors": errors,
                     "duration": time.monotonic() - started,
                 }
@@ -11102,6 +11106,11 @@ class LiveCollaborationController:
                 ]
             for segment_id in result.get("lock_segment_ids") or []:
                 self.pending_lock_changes.pop(segment_id, None)
+            if result.get("confirmed_locks"):
+                self._update_segment_locks([
+                    *({"segment_id": sid, **state} for sid, state in self.segment_locks_state.items()),
+                    *result["confirmed_locks"],
+                ])
             completed_action_ids = set(result.get("action_ids") or [])
             if completed_action_ids:
                 self.pending_actions = [
@@ -12028,10 +12037,22 @@ class LiveCollaborationController:
         self._scroll_chat_to_end(self.chat_dock_history)
 
     def _update_segment_locks(self, locks):
-        states = {}
+        # A pre-write poll may finish after the lock-set acknowledgement. Never
+        # use that older snapshot to reopen a newly frozen material. Explicit
+        # newer unlocks and same-revision expiry updates are still accepted.
+        def stamp(state):
+            try:
+                return datetime.fromisoformat(str(state.get("updated_at") or "").replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                return 0.0
+
+        states = {sid: state for sid, state in self.segment_locks_state.items() if stamp(state)}
         for state in locks:
             segment_id = str(state.get("segment_id") or "")
             if not segment_id:
+                continue
+            current = states.get(segment_id)
+            if current is not None and stamp(state) < stamp(current):
                 continue
             owner = str(state.get("owner") or "")
             if owner:

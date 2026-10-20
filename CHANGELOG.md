@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Apply acknowledged lock states immediately, not only after the next poll.
+  An older or incomplete lock poll cannot reopen a newer confirmed freeze;
+  explicit newer unlocks and same-revision expiry states remain effective.
+  This closes the acknowledgement-to-refresh protection gap found by the native
+  IR row-lock integration probe.
+
 - Expose a stable-ID, permission-checked asynchronous lock request for the IR
   label-row controls. Both lock modes use the existing room transport and do
   not change either user's selected material or perform network I/O in the UI.

@@ -41,6 +41,34 @@ def test_explicit_row_lock_refuses_viewer_and_another_owners_label(monkeypatch):
     assert not controller.pending_lock_changes
 
 
+def test_confirmed_lock_cannot_be_undone_by_an_older_poll(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    controller = Peer("alice", scene).controller
+    newest = {"segment_id": "A", "owner": "alice", "locked": True,
+              "lock_mode": "all", "updated_at": "2026-10-20T10:02:00+00:00"}
+    controller._update_segment_locks([newest])
+    controller._update_segment_locks([{**newest, "locked": False, "updated_at": None}])
+    assert controller._locked_by_other("A")
+    controller._update_segment_locks([])
+    assert controller._locked_by_other("A")
+    controller._update_segment_locks([{**newest, "locked": False,
+                                      "updated_at": "2026-10-20T10:03:00+00:00"}])
+    assert not controller._locked_by_other("A")
+
+
+def test_set_lane_returns_confirmed_state_with_acknowledgment(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    controller = Peer("alice", scene).controller
+    state = {"segment_id": "A", "owner": "alice", "locked": True,
+             "lock_mode": "all", "updated_at": "2026-10-20T10:02:00+00:00"}
+    client = Mock()
+    client.set_segment_lock.return_value = state
+    controller._lock_set_lane(controller._session_token, client, "room", {"A": {"locked": True, "lock_mode": "all"}})
+    result = controller._worker_results.get_nowait()
+    assert result["lock_segment_ids"] == ["A"]
+    assert result["confirmed_locks"] == [state]
+
+
 @pytest.mark.parametrize("mode", ["others", "all"])
 def test_folder_lock_modes_protect_target_and_siblings(tmp_path, mode):
     alice, bob = [c.SharedFolderRoomClient(tmp_path, name) for name in ("alice", "bob")]
