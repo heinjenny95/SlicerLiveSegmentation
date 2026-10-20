@@ -39,6 +39,10 @@ def run():
     beat.setInterval(10)
     beat.timeout.connect(lambda: beats.append(time.monotonic()))
     try:
+        window = slicer.util.mainWindow()
+        if window is not None:
+            window.setAttribute(qt.Qt.WA_DontShowOnScreen, True)
+            window.hide()
         widget = slicer.app.moduleManager().module("LiveSegmentation").widgetRepresentation().self()
         KEEP_ALIVE.append(widget)
         widget.live_collaboration.timer.stop()

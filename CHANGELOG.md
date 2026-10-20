@@ -23,6 +23,8 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   hints for each packet. Cancel obsolete pooling jobs between bounded slabs and
   revalidate native extent/shape before reusing a pooled cache. Cancellation is
   diagnostic, not a connection error; authoritative labelmaps are unchanged.
+  The native large-layer stress probe keeps its window hidden so validation
+  does not disturb an ongoing annotation session.
 
 - Preserve the latest local rename/color across delayed metadata echoes,
   including rapid consecutive renames and changes not encoded yet. Metadata
