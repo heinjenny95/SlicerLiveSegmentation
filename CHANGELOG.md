@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Expose a stable-ID, permission-checked asynchronous lock request for the IR
+  label-row controls. Both lock modes use the existing room transport and do
+  not change either user's selected material or perform network I/O in the UI.
+
 - Synchronize label ordering across room participants as an ordered metadata-only
   operation. Native drag reordering preserves each editor's selected stable ID,
   label names/colors and all voxel data. Concurrent requests resolve in room

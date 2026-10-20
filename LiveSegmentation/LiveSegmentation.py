@@ -137,6 +137,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
         self.live_collaboration = LiveCollaborationController(self)
         self.live_collaboration.setup()
+        # Explicit non-loading bridge for optional modules. The ScriptedModule
+        # wrapper does not expose an already-created Python widget globally.
+        slicer.modules.LiveSegmentationWidget = self
         self._setup_navigation_toolbar()
         self.layout.addStretch(1)
 
@@ -155,6 +158,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             self._guard_recovery_editing(self._recovery_editor.segmentationNode())
 
     def cleanup(self):
+        if vars(slicer.modules).get("LiveSegmentationWidget") is self:
+            del slicer.modules.LiveSegmentationWidget
         if self.surface_preview is not None:
             self.surface_preview.cleanup()
             self.surface_preview = None

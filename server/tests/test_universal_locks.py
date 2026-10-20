@@ -1,10 +1,44 @@
 """Owner-only protection and universal freezes have distinct edit semantics."""
 
+from unittest.mock import Mock
+
 import pytest
 
-from tests.controller_harness import Peer, install_fake_slicer
+from tests.controller_harness import FakeSegment, Peer, install_fake_slicer
 from tests.controller_harness import collaboration as c
 from tests.test_protected_claims import operation
+
+
+def test_explicit_row_lock_preserves_selection_and_queues_without_network(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    peer = Peer("alice", scene)
+    peer.node.GetSegmentation().AddSegment(FakeSegment(), "A")
+    controller = peer.controller
+    controller.connected = True
+    controller._selected_segment_id = lambda: "different-selected-label"
+    controller._update_lock_controls = Mock()
+    controller.on_timer = Mock()
+    controller.request_segment_lock("A", True, "all")
+    assert controller._selected_segment_id() == "different-selected-label"
+    assert controller.pending_lock_changes["A"]["lock_mode"] == "all"
+    assert controller._locked_by_other("A")
+    controller.on_timer.assert_called_once()
+
+
+def test_explicit_row_lock_refuses_viewer_and_another_owners_label(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    peer = Peer("alice", scene)
+    peer.node.GetSegmentation().AddSegment(FakeSegment(), "A")
+    controller = peer.controller
+    controller.connected = True
+    controller.segment_owners["A"] = "bob"
+    with pytest.raises(c.LiveCollaborationError):
+        controller.request_segment_lock("A", True, "all")
+    controller.segment_owners["A"] = "alice"
+    controller.room_roles_state["alice"] = "viewer"
+    with pytest.raises(c.LiveCollaborationError):
+        controller.request_segment_lock("A", True, "all")
+    assert not controller.pending_lock_changes
 
 
 @pytest.mark.parametrize("mode", ["others", "all"])

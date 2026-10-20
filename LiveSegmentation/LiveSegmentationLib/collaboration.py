@@ -6904,28 +6904,41 @@ class LiveCollaborationController:
 
     def toggle_selected_segment_lock(self, checked=False):
         del checked
-        if not self.connected:
-            self._show_error("Join a live room before changing a label lock", popup=True)
-            return
         segment_id = self._selected_segment_id()
-        if not segment_id:
-            self._show_error("Select a label first", popup=True)
-            return
-        owner = self.segment_owners.get(segment_id)
-        if owner and owner != self.user_name and self._current_role() != "admin":
-            self._show_error(
-                f"Only {owner}, who created this label, or a room admin can change its lock",
-                popup=True,
-            )
-            return
-        self.segment_owners.setdefault(segment_id, self.user_name)
         current = bool(self.segment_locks_state.get(segment_id, {}).get("locked", False))
         expiry = self.lock_expiry_spin.value
         expiry = expiry() if callable(expiry) else expiry
+        try:
+            self.request_segment_lock(segment_id, not current,
+                str(self._combo_current_data(self.lock_mode_combo) or "others"), expiry)
+        except LiveCollaborationError as exc:
+            self._show_error(str(exc), popup=True)
+
+    def request_segment_lock(self, segment_id, locked, lock_mode="others", expires_minutes=0):
+        """Queue one explicit stable-ID lock, without selecting it or doing I/O.
+
+        Used by the IR row controls as well as the Live panel. Room identity,
+        permissions and the asynchronous lock lane remain owned by Live.
+        """
+        if not self.connected:
+            raise LiveCollaborationError("Join a live room before changing a label lock")
+        lock_mode = _validate_lock_mode(lock_mode)
+        node = self._segmentation_node()
+        if not segment_id or node is None or node.GetSegmentation().GetSegment(segment_id) is None:
+            raise LiveCollaborationError("Select an existing label first")
+        if self._current_role() == "viewer":
+            raise LiveCollaborationError("Viewers cannot change label locks")
+        if segment_id in self.pending_lock_changes:
+            raise LiveCollaborationError("This label already has a lock update pending")
+        owner = self.segment_owners.get(segment_id)
+        if owner and owner != self.user_name and self._current_role() != "admin":
+            raise LiveCollaborationError(
+                f"Only {owner}, who created this label, or a room admin can change its lock")
+        self.segment_owners.setdefault(segment_id, self.user_name)
         self.pending_lock_changes[segment_id] = {
-            "locked": not current,
-            "expires_minutes": int(expiry),
-            "lock_mode": str(self._combo_current_data(self.lock_mode_combo) or "others"),
+            "locked": bool(locked),
+            "expires_minutes": max(0, int(expires_minutes)),
+            "lock_mode": lock_mode,
         }
         self._update_lock_controls()
         self._force_realtime_refresh = True
