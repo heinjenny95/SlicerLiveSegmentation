@@ -1331,6 +1331,18 @@ class PackedOperationMask:
         return regions[0].astype(bool), regions[1]
 
 
+def operation_changed_voxel_count(operation):
+    """Count packed bits without allocating two dense full-label masks."""
+    packed = PackedOperationMask(operation)
+    bit_counts = np.array([value.bit_count() for value in range(256)], np.int64)
+    counts = np.bincount(packed.bytes[:packed.packed_bytes], minlength=256)
+    count = int(counts @ bit_counts)
+    remainder = int(np.prod(packed.shape, dtype=np.int64)) % 8
+    if remainder:
+        count -= (int(packed.bytes[packed.packed_bytes-1]) >> remainder).bit_count()
+    return count
+
+
 def iter_operation_tiles(operation, baseline=None, tile_size=INCOMING_TILE_SIZE):
     """Yield bounded, decoded writes; commit the shared sequence only at the end.
 
@@ -1823,6 +1835,7 @@ class SharedFolderRoomClient:
         lock_timeout_seconds=10.0,
         stale_lock_seconds=60.0,
         presence_ttl_seconds=60.0,
+        background_compaction=False,
     ):
         self.shared_folder = normalize_shared_folder(shared_folder)
         self.user_name = str(user_name or "").strip()
@@ -1839,6 +1852,10 @@ class SharedFolderRoomClient:
         self._artifact_queue = queue.Queue()
         self._artifact_worker = None
         self._artifact_worker_lock = threading.Lock()
+        self.background_compaction = bool(background_compaction)
+        self._compaction_queue = queue.Queue()
+        self._compaction_worker = None
+        self._compaction_worker_lock = threading.Lock()
         self._known_presence_users = {self.user_name}
         self._presence_paths_cache = {}
         self._presence_records_cache = {}
@@ -3926,12 +3943,16 @@ class SharedFolderRoomClient:
         records = {}
         try:
             active_paths = list(room_path.joinpath("operations").glob("*.json"))
-            archive_paths = list(room_path.joinpath("operation-archives").glob("*.zip"))
         except OSError as exc:
             raise LiveCollaborationError(f"Could not inspect room history: {exc}") from exc
         def read_active(path):
             sequence = self._operation_sequence(path)
-            return (sequence, _read_json_file(path)) if sequence is not None else None
+            try:
+                return (sequence, _read_json_file(path)) if sequence is not None else None
+            except LiveCollaborationError as exc:
+                if not isinstance(exc.__cause__, FileNotFoundError):
+                    raise
+                return None  # Atomic archive publication precedes loose-file removal.
 
         for item in _parallel_map(read_active, active_paths):
             if item is not None:
@@ -3954,6 +3975,9 @@ class SharedFolderRoomClient:
                 ) from exc
             return archived
 
+        # List archives AFTER reading loose records: a background compactor may
+        # have moved a file since the initial directory listing.
+        archive_paths = list(room_path.joinpath("operation-archives").glob("*.zip"))
         for archived in _parallel_map(read_archive, archive_paths):
             for sequence, operation in archived:
                 records.setdefault(sequence, operation)
@@ -4029,6 +4053,62 @@ class SharedFolderRoomClient:
                 )
         return carried[-CARRIED_TOMBSTONE_LIMIT:]
 
+    def _compact_snapshot_operations(self, room_path, before_sequence, group_id):
+        """Immutable history only; never hold the hot sequence lock for ZIP I/O."""
+        with self._named_lock(room_path, "compaction"):
+            candidates = sorted((sequence, path) for path in room_path.joinpath("operations").glob("*.json")
+                                if (sequence := self._operation_sequence(path)) is not None and sequence <= before_sequence)
+            if not candidates:
+                return
+            archive_name = f"{candidates[0][0]:020d}-{candidates[-1][0]:020d}--{group_id[:12]}.zip"
+            archive_path = room_path / "operation-archives" / archive_name
+            temporary = _atomic_temporary_path(archive_path)
+            try:
+                with zipfile.ZipFile(temporary, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as bundle:
+                    for _, path in candidates:
+                        bundle.write(path, arcname=path.name)
+                os.replace(temporary, archive_path)
+                for item_sequence, path in candidates:
+                    operation_hash = path.stem.split("--", 1)[-1]
+                    _write_json_atomic(room_path / "operation-index" / f"{operation_hash}.json",
+                                       {"sequence": item_sequence, "file": path.name})
+                    path.unlink(missing_ok=True)
+                self._append_audit(room_path, "history.compacted", {"through_sequence": before_sequence,
+                                                                  "archive": archive_name})
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _queue_snapshot_compaction(self, room_path, before_sequence, group_id):
+        self._compaction_queue.put((room_path, before_sequence, group_id))
+        with self._compaction_worker_lock:
+            if self._compaction_worker is not None and self._compaction_worker.is_alive():
+                return
+
+            def drain():
+                while True:
+                    try:
+                        args = self._compaction_queue.get_nowait()
+                    except queue.Empty:
+                        with self._compaction_worker_lock:
+                            if self._compaction_queue.empty():
+                                self._compaction_worker = None
+                                return
+                        continue
+                    try:
+                        self._compact_snapshot_operations(*args)
+                    except Exception as exc:
+                        # No source history is removed before archive publication;
+                        # maintenance failure is recoverable at the next snapshot.
+                        try:
+                            self._append_audit(args[0], "history.compaction_failed", {"message": str(exc)})
+                        except Exception:
+                            pass
+                    finally:
+                        self._compaction_queue.task_done()
+
+            self._compaction_worker = threading.Thread(target=drain, name="LiveSegmentation-history-compaction", daemon=True)
+            self._compaction_worker.start()
+
     def publish_room_snapshot(
         self, room_id, segment_operations, compact=True, label="", expected_sequence=None
     ):
@@ -4048,12 +4128,28 @@ class SharedFolderRoomClient:
             return None
         group_id = str(uuid.uuid4())
         created = []
+        observed_sequence = self._latest_sequence(room_path)
+        prepared_operations = []
+        for operation in segment_operations:
+            prepared = dict(operation)
+            try:
+                prepared["changed_voxels"] = operation_changed_voxel_count(operation)
+            except (ValueError, KeyError, TypeError):
+                pass  # Metadata/tombstones have no voxel payload.
+            prepared_operations.append(prepared)
+        if compact and observed_sequence > 0:
+            prepared_operations = self._tombstones_to_carry(
+                room_path, observed_sequence,
+                {str(item.get("segment_id") or "") for item in segment_operations},
+            ) + prepared_operations
+        original_creators = self._segment_creators(room_path)
         with self._sequence_lock(room_path) as sequence_lock:
             before_sequence = self._latest_sequence(room_path)
-            if expected_sequence is not None and before_sequence != int(expected_sequence):
+            expected = observed_sequence if expected_sequence is None else int(expected_sequence)
+            if before_sequence != expected or before_sequence != observed_sequence:
                 return {
                     "skipped": "stale",
-                    "expected_sequence": int(expected_sequence),
+                    "expected_sequence": expected,
                     "latest_sequence": before_sequence,
                 }
             state_path = room_path / "sequence-state.json"
@@ -4064,13 +4160,7 @@ class SharedFolderRoomClient:
             label_deletions = self._label_deletion_barriers(
                 room_path, state, before_sequence
             )
-            if compact and before_sequence > 0:
-                segment_operations = self._tombstones_to_carry(
-                    room_path,
-                    before_sequence,
-                    {str(item.get("segment_id") or "") for item in segment_operations},
-                ) + list(segment_operations)
-            original_creators = self._segment_creators(room_path)
+            segment_operations = prepared_operations
             for segment_id, owner in original_creators.items():
                 lock_path = self._segment_lock_path(room_path, segment_id)
                 if not lock_path.is_file():
@@ -4110,12 +4200,6 @@ class SharedFolderRoomClient:
                     "system_snapshot": True,
                     "snapshot_label": str(label or "")[:200],
                 }
-                try:
-                    stored["changed_voxels"] = int(
-                        np.count_nonzero(decode_mask_delta(stored)[0])
-                    )
-                except Exception:
-                    pass
                 destination = (
                     room_path
                     / "operations"
@@ -4172,38 +4256,11 @@ class SharedFolderRoomClient:
                 room_path / "snapshots" / f"{sequence:020d}--{group_id}.json",
                 manifest,
             )
-            if compact and before_sequence > 0:
-                candidates = []
-                for path in room_path.joinpath("operations").glob("*.json"):
-                    item_sequence = self._operation_sequence(path)
-                    if item_sequence is not None and item_sequence <= before_sequence:
-                        candidates.append((item_sequence, path))
-                if candidates:
-                    archive_name = (
-                        f"{candidates[0][0]:020d}-{candidates[-1][0]:020d}--"
-                        f"{group_id[:12]}.zip"
-                    )
-                    archive_path = room_path / "operation-archives" / archive_name
-                    temporary = _atomic_temporary_path(archive_path)
-                    try:
-                        with zipfile.ZipFile(
-                            temporary, "x", compression=zipfile.ZIP_DEFLATED
-                        ) as bundle:
-                            for _, path in candidates:
-                                bundle.write(path, arcname=path.name)
-                        os.replace(temporary, archive_path)
-                        for item_sequence, path in candidates:
-                            # A different publisher's async receipt writer may
-                            # not have run. Persist it before removing the last
-                            # loose record used by legacy retry detection.
-                            operation_hash = path.stem.split("--", 1)[-1]
-                            _write_json_atomic(
-                                room_path / "operation-index" / f"{operation_hash}.json",
-                                {"sequence": item_sequence, "file": path.name},
-                            )
-                            path.unlink(missing_ok=True)
-                    finally:
-                        temporary.unlink(missing_ok=True)
+        if compact and before_sequence > 0:
+            if self.background_compaction:
+                self._queue_snapshot_compaction(room_path, before_sequence, group_id)
+            else:
+                self._compact_snapshot_operations(room_path, before_sequence, group_id)
         self._append_audit(
             room_path,
             "history.snapshot",
@@ -4543,7 +4600,7 @@ class LanRelayServer:
         with self._clients_lock:
             client = self._clients.get(user_name)
             if client is None:
-                client = SharedFolderRoomClient(self.storage_folder, user_name)
+                client = SharedFolderRoomClient(self.storage_folder, user_name, background_compaction=True)
                 self._clients[user_name] = client
             return client
 
@@ -7672,7 +7729,7 @@ class LiveCollaborationController:
             return client, _ssh_transport_module().parse_ssh_folder(location).location
         if transport_mode == "shared-folder":
             location = self._text(self.shared_folder_edit)
-            return SharedFolderRoomClient(location, user_name), location
+            return SharedFolderRoomClient(location, user_name, background_compaction=True), location
         if transport_mode == "direct-lan":
             host_locally = self.lan_host_checkbox.checked
             host_locally = host_locally() if callable(host_locally) else host_locally
@@ -7688,7 +7745,7 @@ class LiveCollaborationController:
             )
             shared_folder = self._text(self.shared_folder_edit)
             fallback_client = (
-                SharedFolderRoomClient(shared_folder, user_name)
+                SharedFolderRoomClient(shared_folder, user_name, background_compaction=True)
                 if shared_folder
                 else None
             )

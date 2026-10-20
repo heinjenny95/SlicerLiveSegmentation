@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Publish live-room checkpoints without compressing history under the hot
+  sequence lock. Production NAS/LAN/SSH clients archive on a separate maintenance
+  queue; snapshot validation/counting and history preparation happen before the
+  short ordered commit. Recheck the sequence before publishing. Packed counting
+  avoids full dense mask expansion; atomic archive publication precedes removal,
+  and an archive failure retains complete loose history with an audit record.
+
 - Do not preallocate obsolete native labelmap extents for a known, already
   visible own echo. No-op acknowledgements must not change content timestamps
   and invalidate AI work; real corrective writes still allocate as needed.

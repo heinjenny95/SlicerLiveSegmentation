@@ -177,7 +177,7 @@ try:
         raise RuntimeError('The selected remote folder must already exist and be readable/writable by your SSH login: ' + str(folder))
     os.umask(0o002)
     core = sys.modules['collaboration']
-    client = core.SharedFolderRoomClient(str(folder), setup['user'])
+    client = core.SharedFolderRoomClient(str(folder), setup['user'], background_compaction=True)
     allowed = core.LAN_RELAY_METHODS
     slots = threading.BoundedSemaphore(16)
     pool = ThreadPoolExecutor(max_workers=8)
