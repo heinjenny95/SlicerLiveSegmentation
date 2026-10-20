@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Preserve the latest local rename/color across delayed metadata echoes,
+  including rapid consecutive renames and changes not encoded yet. Metadata
+  reconciliation uses operation identities/order rather than display names.
+
 - Compose incoming voxel state against visible pending operations, not only the
   last acknowledged baseline. Delayed own paint echoes no longer resurrect a
   subsequent local erase or needlessly invalidate an in-flight AI request.

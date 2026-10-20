@@ -12312,8 +12312,21 @@ class LiveCollaborationController:
         # change. New segments need initial metadata; existing segments change
         # it only for an explicit metadata update.
         if created or bool(operation.get("metadata_update")):
-            segment.SetName(operation.get("segment_name") or segment_id)
-            color = str(operation.get("color_hex") or "#4A90E2").lstrip("#")
+            metadata = operation
+            pending = [*self.awaiting_echo, *self.outgoing]
+            echo_id = operation.get("client_operation_id")
+            own_index = next((i for i, item in enumerate(pending)
+                              if echo_id and item.get("client_operation_id") == echo_id), -1)
+            newer_metadata = [item for item in pending[own_index+1:]
+                              if item.get("segment_id") == segment_id and item.get("metadata_update")
+                              and item.get("client_operation_id") not in self._applied_local_operation_ids
+                              and item.get("client_operation_id") not in self._deferred_visibility_ids]
+            if newer_metadata:
+                metadata = newer_metadata[-1]
+            if not created and (node.GetID(), segment_id) in self.metadata_updates:
+                metadata = self._current_segment_metadata(node, segment_id)
+            segment.SetName(metadata.get("segment_name") or segment_id)
+            color = str(metadata.get("color_hex") or "#4A90E2").lstrip("#")
             if len(color) == 6:
                 try:
                     segment.SetColor(
@@ -12674,7 +12687,6 @@ class LiveCollaborationController:
                 self._ensure_independent_segment_labelmap(node, segment_id)
                 if (
                     key in self.metadata_updates
-                    and operation.get("author") != self.user_name
                     and metadata_before is not None
                 ):
                     # A local rename/color change that has not been published
