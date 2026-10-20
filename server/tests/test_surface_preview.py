@@ -3,9 +3,46 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"LiveSegmentation"/"LiveSegmentationLib"))
 from surface_preview import preview_mask  # noqa: E402
+
+
+def test_repeated_dirty_bounds_are_scanned_once_per_pooling_cell():
+    from surface_preview import update_preview_mask
+
+    class CountedArray:
+        shape = (1024,)*3
+        touched = 0
+        def __getitem__(self, slices):
+            shape = tuple(s.stop-s.start for s in slices)
+            self.touched += int(np.prod(shape))
+            return np.zeros(shape, np.uint8)
+    array = CountedArray()
+    _, scanned = update_preview_mask(array, 1, np.zeros((128,)*3, np.uint8), 8,
+                                     [[1, 2, 1, 2, 1, 2]]*31)
+    assert array.touched == scanned == 512
+
+
+def test_obsolete_pooling_stops_before_reading_another_large_slab():
+    import threading
+
+    from surface_preview import PreviewSuperseded, _pool_at_factor
+
+    cancel = threading.Event()
+    class SupersededArray:
+        shape = (1024,)*3
+        touched = 0
+        def __getitem__(self, slices):
+            shape = (slices.stop-slices.start, 1024, 1024)
+            self.touched += int(np.prod(shape))
+            cancel.set()
+            return np.zeros(shape, np.uint8)
+    array = SupersededArray()
+    with pytest.raises(PreviewSuperseded):
+        _pool_at_factor(array, 1, 8, cancel=cancel)
+    assert array.touched <= 1024*1024
 
 
 def test_allocated_zero_extent_label_does_not_schedule_a_preview_job():

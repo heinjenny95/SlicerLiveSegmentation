@@ -15,16 +15,25 @@ import traceback
 import numpy as np
 
 
-def preview_mask(array, label_value, maximum_axis=128):
+class PreviewSuperseded(RuntimeError):
+    """Expected cancellation, never a segmentation/connection failure."""
+
+
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise PreviewSuperseded("Preview source changed")
+
+
+def preview_mask(array, label_value, maximum_axis=128, cancel=None):
     """Occupancy pooling retains thin components, using bounded slab scratch."""
     shape = tuple(int(v) for v in array.shape)
     if len(shape) != 3 or min(shape) <= 0:
         raise ValueError("Preview requires a non-empty 3D labelmap")
     factor = max(1, math.ceil(max(shape)/maximum_axis))
-    return _pool_at_factor(array, label_value, factor), factor
+    return _pool_at_factor(array, label_value, factor, cancel=cancel), factor
 
 
-def _pool_at_factor(array, label_value, factor):
+def _pool_at_factor(array, label_value, factor, cancel=None):
     shape = tuple(int(v) for v in array.shape)
     target_shape = tuple(math.ceil(v/factor) for v in shape)
     result = np.zeros(target_shape, np.uint8)
@@ -33,6 +42,7 @@ def _pool_at_factor(array, label_value, factor):
         planar = np.zeros(shape[1:], bool)
         depth = max(1, (1024*1024)//max(1, shape[1]*shape[2]))
         for start in range(z*factor, min((z+1)*factor, shape[0]), depth):
+            _check_cancel(cancel)
             end = min(start+depth, (z+1)*factor, shape[0])
             planar |= np.any(array[start:end] == label_value, axis=0)
         padded = np.zeros((target_shape[1]*factor, target_shape[2]*factor), bool)
@@ -41,23 +51,38 @@ def _pool_at_factor(array, label_value, factor):
     return result
 
 
-def update_preview_mask(array, label_value, previous, factor, dirty_bounds):
+def update_preview_mask(array, label_value, previous, factor, dirty_bounds, cancel=None):
     """Recompute whole pooling cells, including erasures; never mutate cache."""
     result = previous.copy()
     scanned = 0
+    boxes = []
     for bounds in dirty_bounds:
         cells = [(max(0, int(bounds[2*i])//factor),
                   min(result.shape[i], math.ceil(int(bounds[2*i+1])/factor))) for i in range(3)]
         if any(hi <= lo for lo, hi in cells):
             continue
+        # Notifications often repeat the same full label/ROI bounds. Merge
+        # intersecting cell boxes so a burst cannot scan that region N times.
+        index = 0
+        while index < len(boxes):
+            other = boxes[index]
+            if all(cells[i][0] <= other[i][1] and other[i][0] <= cells[i][1] for i in range(3)):
+                cells = [(min(cells[i][0], other[i][0]), max(cells[i][1], other[i][1])) for i in range(3)]
+                boxes.pop(index)
+                index = 0
+            else:
+                index += 1
+        boxes.append(cells)
+    for cells in boxes:
+        _check_cancel(cancel)
         source_slices = tuple(slice(lo*factor, min(hi*factor, array.shape[i])) for i, (lo, hi) in enumerate(cells))
         region = array[source_slices]
         scanned += int(np.prod(region.shape))
-        result[tuple(slice(lo, hi) for lo, hi in cells)] = _pool_at_factor(region, label_value, factor)
+        result[tuple(slice(lo, hi) for lo, hi in cells)] = _pool_at_factor(region, label_value, factor, cancel=cancel)
     return result, scanned
 
 
-def build_preview_mesh(array, label_value, extent, matrix, previous=None, dirty_bounds=None):
+def build_preview_mesh(array, label_value, extent, matrix, previous=None, dirty_bounds=None, cancel=None):
     """Only private VTK objects, never an MRML node or input image, in a worker."""
     import vtk
     from vtk.util.numpy_support import numpy_to_vtk
@@ -65,10 +90,11 @@ def build_preview_mesh(array, label_value, extent, matrix, previous=None, dirty_
     started = time.monotonic()
     if previous is not None and dirty_bounds:
         factor = previous["factor"]
-        mask, scanned = update_preview_mask(array, label_value, previous["mask"], factor, dirty_bounds)
+        mask, scanned = update_preview_mask(array, label_value, previous["mask"], factor, dirty_bounds, cancel=cancel)
     else:
-        mask, factor = preview_mask(array, label_value)
+        mask, factor = preview_mask(array, label_value, cancel=cancel)
         scanned = int(np.prod(array.shape))
+    _check_cancel(cancel)
     # Padding closes surfaces at the boundary of a material's native extent.
     padded = np.pad(mask, 1)
     image = vtk.vtkImageData()
@@ -141,6 +167,8 @@ class SurfacePreview:
         self.set_active(False)
         self._restore_editors()
         self.generation += 1
+        if self.job is not None and "cancel" in self.job:
+            self.job["cancel"].set()
         self.node = node
         self.wanted.clear()
         self.revisions.clear()
@@ -373,6 +401,10 @@ class SurfacePreview:
                 self.wanted[sid] = (token, now)
             self._style(sid)
         if self.job is not None:
+            job = self.job
+            current = self.wanted.get(job["sid"])
+            if current is None or current[0] != job["revision"] or job["generation"] != self.generation:
+                job["cancel"].set()
             return
         pending = sorted((stamp, sid, token) for sid, (token, stamp) in self.wanted.items()
                          if sid in ids and token is not None and self.revisions.get(sid) != token)
@@ -391,11 +423,13 @@ class SurfacePreview:
         image.GetImageToWorldMatrix(matrix)
         coefficients = [[matrix.GetElement(r, c) for c in range(4)] for r in range(4)]
         array = slicer.util.arrayFromSegmentInternalBinaryLabelmap(self.node, sid)
-        job = {"generation": self.generation, "sid": sid, "revision": token}
+        job = {"generation": self.generation, "sid": sid, "revision": token,
+               "cancel": threading.Event(), "shape": tuple(array.shape), "extent": tuple(image.GetExtent())}
         previous = self.pooled.get(sid)
         hint = self.region_hints.get(sid)
         if (previous is None or hint is None or hint["before"] != previous["revision"]
-                or hint["after"] != token or previous["matrix"] != coefficients):
+                or hint["after"] != token or previous["matrix"] != coefficients
+                or previous.get("shape") != job["shape"] or previous.get("extent") != job["extent"]):
             previous, bounds = None, None
         else:
             bounds = [list(box) for box in hint["bounds"]]
@@ -405,7 +439,9 @@ class SurfacePreview:
         # pin survives room leave/scene close while a worker still reads its view.
         def worker(_pin=image, view=array, label=int(segment.GetLabelValue()), extent=tuple(image.GetExtent())):
             try:
-                result = build_preview_mesh(view, label, extent, coefficients, previous, bounds)
+                result = build_preview_mesh(view, label, extent, coefficients, previous, bounds, cancel=job["cancel"])
+            except PreviewSuperseded:
+                result = {"cancelled": True}
             except Exception as exc:
                 result = {"error": str(exc)}
             self.results.put((job, result))
@@ -418,6 +454,9 @@ class SurfacePreview:
             job, result = self.results.get()
             if self.job is job:
                 self.job = None
+            if result.get("cancelled"):
+                self.log("preview.cancelled", segment_id=job["sid"], reason="Source superseded")
+                continue
             if not self.active or job["generation"] != self.generation:
                 continue
             sid = job["sid"]
@@ -440,6 +479,7 @@ class SurfacePreview:
             model.SetAndObservePolyData(result["mesh"])
             self.revisions[sid] = job["revision"]
             self.pooled[sid] = {"revision": job["revision"], "matrix": job["matrix"],
+                                "shape": job["shape"], "extent": job["extent"],
                                 "factor": result["factor"], "mask": result["mask"],
                                 "scanned_voxels": result["scanned_voxels"], "incremental": result["incremental"],
                                 "ready_at": time.monotonic()}

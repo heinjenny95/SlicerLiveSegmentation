@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Coalesce overlapping 3D-preview dirty cells instead of scanning repeated ROI
+  hints for each packet. Cancel obsolete pooling jobs between bounded slabs and
+  revalidate native extent/shape before reusing a pooled cache. Cancellation is
+  diagnostic, not a connection error; authoritative labelmaps are unchanged.
+
 - Preserve the latest local rename/color across delayed metadata echoes,
   including rapid consecutive renames and changes not encoded yet. Metadata
   reconciliation uses operation identities/order rather than display names.
