@@ -11239,7 +11239,15 @@ class LiveCollaborationController:
             self._ensure_segment(node, operation)
             self._ensure_independent_segment_labelmap(node, operation["segment_id"])
             prepare = getattr(self.owner, "prepare_segment_labelmap_extent", None)
-            if callable(prepare) and operation.get("_has_claims", True):
+            operation_id = operation.get("client_operation_id")
+            visible_own_echo = bool(operation_id and operation_id not in self._deferred_visibility_ids
+                                    and any(item.get("client_operation_id") == operation_id
+                                            for item in [*self.awaiting_echo, *self.outgoing]))
+            # Already-visible own edits have native capacity. An old echo's
+            # obsolete footprint must not allocate empty voxels/change MTime
+            # while inference is running. Actual reconciliation writes still
+            # grow their required extent through the normal crop writer.
+            if callable(prepare) and operation.get("_has_claims", True) and not visible_own_echo:
                 for _ in prepare(node, operation["segment_id"], self.owner.get_volume_node(), operation["voxel_bbox"]):
                     yield {"_capacity_step": True}
         yield from iter_operation_tiles(operation, baseline)

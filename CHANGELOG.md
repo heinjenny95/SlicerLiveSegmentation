@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Do not preallocate obsolete native labelmap extents for a known, already
+  visible own echo. No-op acknowledgements must not change content timestamps
+  and invalidate AI work; real corrective writes still allocate as needed.
+
 - Coalesce overlapping 3D-preview dirty cells instead of scanning repeated ROI
   hints for each packet. Cancel obsolete pooling jobs between bounded slabs and
   revalidate native extent/shape before reusing a pooled cache. Cancellation is

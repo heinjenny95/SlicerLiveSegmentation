@@ -50,3 +50,16 @@ def test_same_display_name_is_not_treated_as_a_known_local_echo(monkeypatch):
     peer.apply(log.commit({"client_operation_id": "different-device", "segment_id": "A",
                            **c.encode_mask_delta(empty, foreign)}, "author"))
     assert peer.mask("A")[2, 2, 2] == 1
+
+
+def test_known_visible_own_echo_does_not_preallocate_native_extent(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    peer, log = Peer("author", scene), RoomLog()
+    peer.apply(log.commit({"segment_id": "A", "client_operation_id": "seed",
+                           **c.encode_metadata_update(SHAPE)}, "author"))
+    peer.paint("A", (3, 3, 3), 1)
+    peer.prepare()
+    pending = list(peer.controller.outgoing)
+    peer.controller.owner.prepare_segment_labelmap_extent = Mock(return_value=iter(()))
+    peer.apply(log.commit(pending[0], "author"))
+    peer.controller.owner.prepare_segment_labelmap_extent.assert_not_called()
