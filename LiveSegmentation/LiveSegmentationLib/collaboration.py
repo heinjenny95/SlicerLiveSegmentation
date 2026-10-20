@@ -12327,6 +12327,46 @@ class LiveCollaborationController:
         self._remember_segment_metadata(node, segment_id)
         return segment
 
+    def _visible_pending_region(self, confirmed, bounds, segment_id, exclude_id=None):
+        """Compose optimistic edits without expanding a source-volume-sized mask.
+
+        Compare incoming state against this same composition, not just the
+        confirmed baseline: paint followed by erase can otherwise look unchanged
+        and an older paint echo would resurrect it for one poll cycle.
+        """
+        result = confirmed.copy()
+        pending = [*self.awaiting_echo, *self.outgoing]
+        cache = getattr(self, "_pending_region_cache", {})
+        active_ids = {str(item.get("client_operation_id") or "") for item in pending}
+        self._pending_region_cache = cache = {
+            key: value for key, value in cache.items() if key in active_ids
+        }
+        for item in pending:
+            operation_id = str(item.get("client_operation_id") or "")
+            if (item.get("segment_id") != segment_id
+                    or operation_id == exclude_id
+                    or operation_id in self._deferred_visibility_ids
+                    or operation_id in self._applied_local_operation_ids
+                    or item.get("segment_order") is not None or item.get("segment_deleted")):
+                continue
+            item_bounds = item["voxel_bbox"]
+            overlap = [value for axis in range(3) for value in (
+                max(bounds[2 * axis], item_bounds[2 * axis]),
+                min(bounds[2 * axis + 1], item_bounds[2 * axis + 1]),
+            )]
+            if item.get("operation_kind") == "snapshot":
+                result.fill(0)
+            if any(overlap[2 * axis] >= overlap[2 * axis + 1] for axis in range(3)):
+                continue
+            packed = cache.get(operation_id)
+            if packed is None:
+                packed = cache[operation_id] = PackedOperationMask(item)
+            changed, values = packed.region(overlap)
+            slices = tuple(slice(overlap[2 * axis] - bounds[2 * axis],
+                                 overlap[2 * axis + 1] - bounds[2 * axis]) for axis in range(3))
+            result[slices][changed] = values[changed]
+        return result
+
     def _acknowledge_local_operation(self, operation):
         operation_id = str(operation.get("client_operation_id") or "")
         if not operation_id:
@@ -12692,8 +12732,11 @@ class LiveCollaborationController:
 
                 az0, az1, ay0, ay1, ax0, ax1 = affected_bounds
                 server_before_region = _baseline_region(baseline, affected_bounds)
+                optimistic_before = self._visible_pending_region(
+                    server_before_region, affected_bounds, segment_id,
+                )
                 local_changes = (
-                    current_region != server_before_region
+                    current_region != optimistic_before
                     if self.initial_sync_complete
                     else np.zeros(current_region.shape, dtype=bool)
                 )
@@ -12721,8 +12764,15 @@ class LiveCollaborationController:
                 if effects is None:
                     effects = self._activity_voxel_effects = {}
                 effects[sequence] = effects.get(sequence, False) or not np.array_equal(server_before_region, server_after_region)
-                visible_region = server_after_region.copy()
+                visible_region = self._visible_pending_region(
+                    server_after_region, affected_bounds, segment_id,
+                    exclude_id=str(operation.get("client_operation_id") or ""),
+                )
                 visible_region[local_changes] = current_region[local_changes]
+                if blocked is not None:
+                    visible_region[
+                        oz0 - az0:oz1 - az0, oy0 - ay0:oy1 - ay0, ox0 - ax0:ox1 - ax0
+                    ][blocked] = 0
 
                 applied_incrementally = True
                 preview = getattr(self.owner, "surface_preview", None)
@@ -12746,9 +12796,7 @@ class LiveCollaborationController:
                     # Geometry with a non-linear parent transform uses Slicer's
                     # general full-volume resampling path for correctness.
                     visible_full = _baseline_dense(baseline)
-                    visible_full[
-                        az0:az1, ay0:ay1, ax0:ax1
-                    ][local_changes] = current_region[local_changes]
+                    visible_full[az0:az1, ay0:ay1, ax0:ax1] = visible_region
                     self.owner.update_segment_binary_labelmap_from_array(
                         visible_full, node, segment_id, self.owner.get_volume_node()
                     )

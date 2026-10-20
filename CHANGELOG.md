@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Compose incoming voxel state against visible pending operations, not only the
+  last acknowledged baseline. Delayed own paint echoes no longer resurrect a
+  subsequent local erase or needlessly invalidate an in-flight AI request.
+  Unencoded edits, deferred room actions and protected voxels remain preserved.
+
 - Apply acknowledged lock states immediately, not only after the next poll.
   An older or incomplete lock poll cannot reopen a newer confirmed freeze;
   explicit newer unlocks and same-revision expiry states remain effective.
