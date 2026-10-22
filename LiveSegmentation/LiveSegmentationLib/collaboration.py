@@ -3570,11 +3570,19 @@ class SharedFolderRoomClient:
     def segment_locks(self, room_id):
         room_path = self._require_room(room_id)
         creators = self._segment_creators(room_path)
+        # One directory read, not a remote stat and a pool task for every label.
+        # Like the old per-file scan this is a polling snapshot, not an atomic
+        # authorization decision; ordered writes still check authoritative locks.
+        existing = {path.name for path in (room_path / "locks").iterdir()}
+        lock_data_by_id = dict(_parallel_map(
+            lambda item: (item[0], _read_json_file(item[1])),
+            [(segment_id, path) for segment_id in creators
+             if (path := self._segment_lock_path(room_path, segment_id)).name in existing],
+        ))
 
         def read_lock(item):
             segment_id, owner = item
-            lock_path = self._segment_lock_path(room_path, segment_id)
-            lock_data = _read_json_file(lock_path) if lock_path.is_file() else {}
+            lock_data = lock_data_by_id.get(segment_id, {})
             expires_epoch = float(lock_data.get("expires_epoch", 0.0) or 0.0)
             locked = bool(lock_data.get("locked", False))
             if locked and expires_epoch and time.time() >= expires_epoch:
@@ -3598,7 +3606,7 @@ class SharedFolderRoomClient:
                 ),
             }
 
-        result = _parallel_map(read_lock, creators.items())
+        result = [read_lock(item) for item in creators.items()]
         return sorted(result, key=lambda item: item["segment_id"].casefold())
 
     def _protected_segments(self, room_path):
@@ -5224,6 +5232,7 @@ class LiveCollaborationController:
         self.last_sequence = 0
         self.initial_sequence = 0
         self.initial_sync_complete = False
+        self._initial_scene_batch = None
         self._joined_at_epoch = 0.0
         self._last_edit_activity_epoch = 0.0
         self.work_time = None
@@ -8259,6 +8268,7 @@ class LiveCollaborationController:
             self._transport_stall_status_second = -1
             self.connection_healthy = True
             self.connected = True
+            self._begin_initial_scene_batch()
             self._diagnostic_event("room.join.online", user_name=self.user_name,
                                    initial_sequence=self.initial_sequence)
             self._observe_segmentation(segmentation_node)
@@ -8408,6 +8418,7 @@ class LiveCollaborationController:
         )
 
     def leave(self, notify_remote=True):
+        self._end_initial_scene_batch()
         self._diagnostic_event("room.leave", user_name=self.user_name,
                                pending_operations=len(self.outgoing), pending_echoes=len(self.awaiting_echo),
                                pending_segments=len(self.dirty_segments))
@@ -9509,17 +9520,34 @@ class LiveCollaborationController:
         segment = node.GetSegmentation().GetSegment(segment_id) if node is not None else None
         if segment is None:
             return
-        owner = self.segment_owners.get(segment_id, "")
-        state = self.segment_locks_state.get(segment_id) or {}
         try:
-            segment.SetTag("LiveSegmentation.Owner", str(owner))
-            segment.SetTag(
-                "LiveSegmentation.LockedBy",
-                str(state.get("lock_holder") or owner) if state.get("locked") else "",
-            )
-            segment.SetTag("LiveSegmentation.LockMode", str(state.get("lock_mode", "others")) if state.get("locked") else "")
+            for name, value in self._collaboration_tags(segment_id).items():
+                getter = getattr(segment, "GetTag", None)
+                try:
+                    previous = getter(name) if callable(getter) else None
+                except TypeError:
+                    import vtk
+
+                    output = vtk.mutable("")
+                    previous = str(output) if getter(name, output) else None
+                if isinstance(previous, tuple):
+                    previous = previous[1] if previous[0] else None
+                # vtkSegment::SetTag emits Modified even for an identical value.
+                # Rewriting all tags on every lock poll rebuilt native tables
+                # and flooded Qt during the first large room catch-up.
+                if previous != value:
+                    segment.SetTag(name, value)
         except Exception:
             pass
+
+    def _collaboration_tags(self, segment_id):
+        owner = self.segment_owners.get(segment_id, "")
+        state = self.segment_locks_state.get(segment_id) or {}
+        return {
+            "LiveSegmentation.Owner": str(owner),
+            "LiveSegmentation.LockedBy": str(state.get("lock_holder") or owner) if state.get("locked") else "",
+            "LiveSegmentation.LockMode": str(state.get("lock_mode", "others")) if state.get("locked") else "",
+        }
 
     def _restore_locked_segment(self, node, segment_id, baseline):
         import slicer
@@ -9652,6 +9680,11 @@ class LiveCollaborationController:
             self._segment_verifications.pop(key, None)
         capture_key = self._local_capture[0] if self._local_capture is not None else None
         keys = list(self.dirty_segments)
+        if self.force_snapshots:
+            # Publish initial labels in their visible order. Random set order
+            # made a joining native table insert rows in the middle repeatedly.
+            order = {sid: index for index, sid in enumerate(self._observed_segment_order)}
+            keys.sort(key=lambda key: order.get(key[1], len(order)))
         if capture_key in keys:
             keys.remove(capture_key)
             keys.insert(0, capture_key)
@@ -9763,6 +9796,7 @@ class LiveCollaborationController:
                 name="LiveSegmentation-local-encode", daemon=True,
             )
             self._local_encode_worker.start()
+            self._schedule_local_continuation()
             break
         for operation in self.outgoing:
             operation_id = str(operation.get("client_operation_id") or "")
@@ -9784,8 +9818,14 @@ class LiveCollaborationController:
             if session_token != self._session_token:
                 return
             self._local_continuation_scheduled = False
-            if self.connected and self.dirty_segments:
-                self._prepare_outgoing()
+            if self.connected:
+                # Keep one bounded encoder, but do not add a 50 ms controller
+                # tick to EACH initial label. Drain its result cooperatively.
+                self._drain_worker_results()
+                if self.dirty_segments:
+                    self._prepare_outgoing()
+                if self._local_encode_pending or self.dirty_segments:
+                    self._schedule_local_continuation()
 
         qt.QTimer.singleShot(GUI_CONTINUATION_MILLISECONDS, continue_local)
 
@@ -10299,9 +10339,12 @@ class LiveCollaborationController:
                         result["errors"].append(message)
                 return result
 
-            for group_result in _parallel_map(
-                push_group, grouped_operations.values(), max_workers=4
-            ):
+            # Folder writers already serialize on ONE room sequence lock.
+            # Competing with ourselves added 40 ms lock-retry sleeps repeatedly
+            # during the initial seed and could deliver its order anchor late.
+            group_results = (map(push_group, grouped_operations.values()) if _uses_shared_folder(client)
+                             else _parallel_map(push_group, grouped_operations.values(), max_workers=4))
+            for group_result in group_results:
                 outgoing_ids.extend(group_result["ids"])
                 rejected_ids.extend(group_result["rejected_ids"])
                 stale_deletion_ids.extend(group_result["stale_deletion_ids"])
@@ -11382,6 +11425,7 @@ class LiveCollaborationController:
             if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
                 self.initial_sync_complete = True
                 self._initialize_baselines_and_seed(seed=False)
+                self._end_initial_scene_batch()
             backup_ok = True
             if result.get("backup"):
                 backup_ok = self._create_project_backup(result["backup"])
@@ -11529,6 +11573,7 @@ class LiveCollaborationController:
             if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
                 self.initial_sync_complete = True
                 self._initialize_baselines_and_seed(seed=False)
+                self._end_initial_scene_batch()
             if (self._incoming_operations or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and not self._incoming_continuation_scheduled:
                 import qt
 
@@ -11562,6 +11607,30 @@ class LiveCollaborationController:
             self.session_metrics.record("gui-incoming", elapsed)
             if elapsed >= 0.025:
                 self._diagnostic_event("gui.slow_incoming", duration_s=elapsed, pending=len(self._incoming_operations))
+
+    def _begin_initial_scene_batch(self):
+        """Native MRML models rebuild once for a known large initial replay.
+
+        No voxel work or network request moves onto the GUI thread. Like a
+        Slicer bulk file load this defers native model/layout notifications;
+        Qt progress, transport workers and cooperative tile slices still run.
+        Never end a batch started by another module.
+        """
+        if self.initial_sync_complete or self.initial_sequence < 16 or self._initial_scene_batch is not None:
+            return
+        import slicer
+
+        scene = slicer.mrmlScene
+        if not hasattr(scene, "StartState") or scene.IsBatchProcessing():
+            return
+        scene.StartState(scene.BatchProcessState)
+        self._initial_scene_batch = scene
+
+    def _end_initial_scene_batch(self):
+        scene = self._initial_scene_batch
+        self._initial_scene_batch = None
+        if scene is not None:
+            scene.EndState(scene.BatchProcessState)
 
     def _commit_checkpoint_steps(self, group):
         """No visible mutation until a complete, privately staged group exists."""
@@ -12490,22 +12559,6 @@ class LiveCollaborationController:
         created = segment is None
         if segment is None:
             segment = slicer.vtkSegment()
-            # Native editors may auto-select a just-added scene material.
-            # Receiving a remote label is not a local selection request.
-            editors = []
-            get_nodes = getattr(slicer.util, "getNodesByClass", None)
-            if callable(get_nodes):
-                editors = [(editor, editor.GetSelectedSegmentID()) for editor in get_nodes("vtkMRMLSegmentEditorNode")
-                           if editor.GetSegmentationNode() == node]
-            applying = self._applying_remote
-            self._applying_remote = True
-            try:
-                segmentation.AddSegment(segment, segment_id)
-            finally:
-                for editor, selected in editors:
-                    if selected is None or segmentation.GetSegment(selected) is not None:
-                        editor.SetSelectedSegmentID(selected)
-                self._applying_remote = applying
         # Voxel patches carry metadata only as context. Applying it on every
         # patch lets a delayed paint operation revert a newer rename or color
         # change. New segments need initial metadata; existing segments change
@@ -12524,18 +12577,40 @@ class LiveCollaborationController:
                 metadata = newer_metadata[-1]
             if not created and (node.GetID(), segment_id) in self.metadata_updates:
                 metadata = self._current_segment_metadata(node, segment_id)
-            segment.SetName(metadata.get("segment_name") or segment_id)
+            name = metadata.get("segment_name") or segment_id
+            if segment.GetName() != name:
+                segment.SetName(name)
             color = str(metadata.get("color_hex") or "#4A90E2").lstrip("#")
             if len(color) == 6:
                 try:
-                    segment.SetColor(
-                        *(
-                            int(color[index : index + 2], 16) / 255.0
-                            for index in (0, 2, 4)
-                        )
-                    )
+                    rgb = tuple(int(color[index:index+2], 16) / 255.0 for index in (0, 2, 4))
+                    if tuple(segment.GetColor()) != rgb:
+                        segment.SetColor(*rgb)
                 except Exception:
                     pass
+        if created:
+            # Give the native model one fully named/colored row in its final
+            # position. Appending then moving each incoming seed label caused
+            # hundreds of complete eye/color-widget rebuilds during first join.
+            present = set(segmentation.GetSegmentIDs())
+            for name, value in self._collaboration_tags(segment_id).items():
+                segment.SetTag(name, value)
+            order = self._confirmed_segment_order
+            position = order.index(segment_id) if segment_id in order else len(order)
+            insert_before = next((sid for sid in order[position+1:] if sid in present), "")
+            get_nodes = getattr(slicer.util, "getNodesByClass", None)
+            editors = ([(editor, editor.GetSelectedSegmentID())
+                        for editor in get_nodes("vtkMRMLSegmentEditorNode")
+                        if editor.GetSegmentationNode() == node] if callable(get_nodes) else [])
+            applying = self._applying_remote
+            self._applying_remote = True
+            try:
+                segmentation.AddSegment(segment, segment_id, insert_before)
+            finally:
+                for editor, selected in editors:
+                    if selected is None or segmentation.GetSegment(selected) is not None:
+                        editor.SetSelectedSegmentID(selected)
+                self._applying_remote = applying
         self._remember_segment_metadata(node, segment_id)
         return segment
 

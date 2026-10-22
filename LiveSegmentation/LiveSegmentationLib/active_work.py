@@ -263,10 +263,16 @@ class WorkTimeUI:
         self.review_action.setToolTip("Visual review counts as work even without input. Turn off or Pause when taking a break.")
         self.review_action.triggered.connect(lambda checked=False: self.set_review(checked))
         adapter = self
+        input_types = frozenset((qt.QEvent.MouseButtonPress, qt.QEvent.MouseButtonRelease,
+                                 qt.QEvent.Wheel, qt.QEvent.KeyPress, qt.QEvent.MouseMove))
 
         class InputFilter(qt.QObject):
             def eventFilter(self, watched, event):
-                adapter.observe_input(watched, event)
+                # Model/layout/paint events are not user work. During a large
+                # initial replay Qt emits millions of them; reject those before
+                # entering the accounting adapter/import/ancestry path.
+                if event.type() in input_types:
+                    adapter.observe_input(watched, event)
                 return False  # Never consume a painting/key event.
 
         self.filter = InputFilter(slicer.util.mainWindow())

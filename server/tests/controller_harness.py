@@ -66,8 +66,10 @@ class FakeSegmentation:
         ids.insert(index, segment_id)
         self.segments = {sid: self.segments[sid] for sid in ids}
 
-    def AddSegment(self, segment, segment_id):
+    def AddSegment(self, segment, segment_id, insert_before=""):
         self.segments[str(segment_id)] = segment
+        if insert_before in self.segments:
+            self.SetSegmentIndex(segment_id, self.GetSegmentIDs().index(insert_before))
         return True
 
     def RemoveSegment(self, segment_id):

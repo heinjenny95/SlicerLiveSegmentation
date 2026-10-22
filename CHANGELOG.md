@@ -8,6 +8,15 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- PERF-20261022-06: avoid unchanged native lock-tag events and per-label missing
+  lock-file probes/pool jobs during large room catch-up. Continue the single
+  bounded local encoder cooperatively instead of waiting a controller tick for
+  every initial label. Insert fully populated labels directly in room order,
+  defer native MRML model rebuilds for a known large initial replay, reject
+  non-input Qt events before work-time accounting, and serialize folder pushes
+  instead of competing for our own room lock. Ordered replay, lock authorization,
+  work-time definitions and voxel masks are unchanged.
+
 - Personal label visibility uses its own persistent settings file even when
   Slicer is launched with --disable-settings by the safe desktop/NAS starters.
 
