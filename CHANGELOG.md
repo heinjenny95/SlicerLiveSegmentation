@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Remember personal per-label visibility by stable ID across room rejoins and
+  restarts. Coalesce settings writes, restore labels arriving during initial
+  sync, and never persist fast-preview's temporary global surface hiding.
+
 - Extend integer-source range acceleration to the separately validated Windows
   x64 Slicer 5.12.0 r34621 / VTK 9.6.2 profile (also used by standalone IR).
 

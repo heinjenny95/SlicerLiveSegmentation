@@ -8262,6 +8262,15 @@ class LiveCollaborationController:
             self._diagnostic_event("room.join.online", user_name=self.user_name,
                                    initial_sequence=self.initial_sequence)
             self._observe_segmentation(segmentation_node)
+            try:
+                from .view_preferences import safe_bind_personal_visibility
+            except ImportError:
+                from view_preferences import safe_bind_personal_visibility
+            view_scope = "room:" + hashlib.sha256(json.dumps([
+                context.get("connection_identity", ""), self.room_id, self.user_name,
+                self.source_volume_signature,
+            ]).encode("utf-8")).hexdigest()
+            safe_bind_personal_visibility(segmentation_node, scope=view_scope)
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
             for segment_id in self._known_segment_ids:
                 self._remember_segment_metadata(segmentation_node, segment_id)
