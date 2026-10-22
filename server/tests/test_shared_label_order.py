@@ -1,5 +1,6 @@
 """Room order is small, ordered metadata, never a voxel/selection update."""
 import uuid
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -97,6 +98,27 @@ def test_viewer_drag_is_local_reverted_without_publishing(room_peers):
     peer.controller._probe_segment_revisions()
     assert peer.node.GetSegmentation().GetSegmentIDs() == ["A", "B", "C"]
     assert not peer.controller.outgoing
+
+
+def test_remote_order_rebuilds_native_row_controls_without_changing_selection(room_peers, monkeypatch):
+    peers, log, _ = room_peers
+    peer = peers[1]
+    scroll = Mock(value=37)
+    table = Mock()
+    table.verticalScrollBar.return_value = scroll
+    view = Mock(selectedSegmentIDs=["B"])
+    view.segmentationNode.return_value = peer.node
+    view.findChild.return_value = table
+    view.blockSignals.return_value = False
+    window = Mock()
+    window.findChildren.return_value = [view]
+    import slicer
+    monkeypatch.setattr(slicer.util, "mainWindow", lambda: window, raising=False)
+    peer.apply(log.commit(order_operation(["C", "B", "A"]), "Jenny"))
+    assert view.setSegmentationNode.call_args_list == [((None,),), ((peer.node,),)]
+    view.setSelectedSegmentIDs.assert_called_once_with(["B"])
+    scroll.setValue.assert_called_once_with(37)
+    assert not peer.errors
 
 
 def test_compaction_rejoin_and_history_preserve_order_and_masks(tmp_path, room_peers):

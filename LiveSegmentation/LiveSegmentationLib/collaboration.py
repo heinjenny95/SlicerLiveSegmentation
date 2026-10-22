@@ -8893,11 +8893,44 @@ class LiveCollaborationController:
                     current.remove(sid)
                     current.insert(index, sid)
         finally:
+            self._refresh_segment_order_views(node)
             for editor, selected in editors:
                 if selected is None or segmentation.GetSegment(selected) is not None:
                     editor.SetSelectedSegmentID(selected)
             self._observed_segment_order = tuple(segmentation.GetSegmentIDs())
             self._applying_remote = applying
+
+    @staticmethod
+    def _refresh_segment_order_views(node):
+        """Native table index widgets must follow REMOTE moves as well as drags.
+
+        Slicer's rowsMoved path does not rebuild the eye/color/status widgets.
+        Rebind existing views only (including IR and the standard editor); never
+        instantiate another module or replace a segmentation/labelmap.
+        """
+        import slicer
+
+        main_window = getattr(slicer.util, "mainWindow", None)
+        window = main_window() if callable(main_window) else None
+        if window is None:
+            return
+        for view in window.findChildren("qMRMLSegmentsTableView"):
+            if view.segmentationNode() != node:
+                continue
+            table = view.findChild("QTableView", "SegmentsTable")
+            if table is None:
+                continue
+            selected = view.selectedSegmentIDs
+            selected = selected() if callable(selected) else selected
+            scroll = table.verticalScrollBar().value
+            blocked = view.blockSignals(True)
+            try:
+                view.setSegmentationNode(None)
+                view.setSegmentationNode(node)
+                view.setSelectedSegmentIDs(selected)
+                table.verticalScrollBar().setValue(scroll)
+            finally:
+                view.blockSignals(blocked)
 
     def _accept_segment_order(self, node, operation):
         requested = list(operation["segment_order"])

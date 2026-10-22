@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Rebuild existing native segment-table eye/color/status controls after received
+  room-wide reorder operations, retaining each participant's selection and scroll.
+
 - Keep actual own label creation/rename/color actions visible once in the coarse
   Activity timeline, independently of suppressed synchronization ACK messages.
 
