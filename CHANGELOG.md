@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Allow ordinary SSH requests 30 seconds (checkpoints 120; health probes remain
+  10 seconds). Give the isolated forwarding worker a distinct outer deadline.
+  Retry timeouts with bounded per-lane backoff and stable operation/message IDs;
+  show an amber banner first, escalating only after repeated failures lasting a
+  minute, with a five-minute popup cooldown. Retain full error diagnostics and
+  immediate handling of authentication/permissions failures.
+
 - Keep the visible Activity timeline coarse: label creation, deletion, property
   changes and reordering, without voxel/sequence/acknowledgement spam. Detailed
   operation diagnostics and the collaborative history remain intact.

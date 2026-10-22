@@ -5310,6 +5310,8 @@ class LiveCollaborationController:
         self._transport_stall_status_second = -1
         self._session_token = 0
         self.connection_healthy = False
+        self._transport_delays = {}
+        self._transport_delay_popup_at = None
         self._connection_validation_pending = False
         self._connection_validation_started_at = 0.0
         self._connection_error_popup_shown = False
@@ -6590,18 +6592,21 @@ class LiveCollaborationController:
         else:
             self.join()
 
-    def _show_error(self, message, popup=False):
+    def _show_error(self, message, popup=False, recoverable=False):
         import qt
         import slicer
 
         self._last_error = str(message)
         self._record_diagnostic_error(message)
         self.connection_healthy = False
-        self.status_label.setText(f"● Connection problem: {message}")
+        self.status_label.setText(f"● {'Synchronization delayed' if recoverable else 'Connection problem'}: {message}")
         self.status_label.setStyleSheet("color: #b3261e;")
         slicer.util.showStatusMessage(f"Live collaboration: {message}", 5000)
         if popup and os.environ.get("LIVE_SEGMENTATION_NO_ERROR_POPUPS") != "1":
-            if self.connected:
+            if self.connected and recoverable:
+                detail = ("Live synchronization is delayed.\n\n" + str(message)
+                          + "\n\nYour room remains joined. Pending changes are kept and retried in the background.")
+            elif self.connected:
                 detail = (
                     "Live Segmentation lost access to the collaboration location.\n\n"
                     f"{message}\n\n"
@@ -6623,6 +6628,48 @@ class LiveCollaborationController:
                 self._connection_error_dialog = dialog
             self._connection_error_dialog.setText(detail)
             self._connection_error_dialog.show()
+
+    def _transport_retry_ready(self, lane):
+        return time.monotonic() >= self._transport_delays.get(lane, {}).get("retry_at", 0.0)
+
+    def _handle_transport_timeout(self, result):
+        """Tolerate finite request delays without losing pending IDs or data.
+
+        Timeouts have unknown outcomes: the existing push/chat queues retry the
+        SAME idempotency IDs. Other lanes (notably chat/health) remain independent.
+        A successful health probe does not confirm a stalled edit-push lane.
+        Authentication, permissions and corrupt data still fail immediately.
+        """
+        message = str(result.get("error") or "")
+        lower = message.lower()
+        if not any(text in lower for text in ("did not respond within", "timed out", "timeout")):
+            return False
+        lane = str(result.get("lane") or "unknown")
+        now = time.monotonic()
+        state = self._transport_delays.setdefault(lane, {"since": now, "failures": 0, "warned": False})
+        state["failures"] += 1
+        state["retry_at"] = now + min(5.0, 0.5 * 2 ** min(4, state["failures"]-1))
+        self._record_diagnostic_error(message, lane=lane)
+        self._diagnostic_event("transport.delayed", lane=lane, failures=state["failures"],
+                               elapsed_seconds=now-state["since"])
+        self.connection_healthy = False
+        self.status_label.setText("● Live sync delayed — retrying in background; unsent edits kept")
+        self.status_label.setStyleSheet("color: #b26a00;")
+        self._force_health_check = True
+        if result.get("snapshot_was_requested"):
+            self._snapshot_requested = True
+            self._snapshot_label = str(result.get("snapshot_label") or "")
+        # A short delay is a banner, not an interrupting offline popup. Notify
+        # once only after a minute of repeated failures, at most every 5 min
+        # across all lanes/incidents. Always keep the persistent error history.
+        if (now-state["since"] >= 60.0 and not state["warned"]
+                and (self._transport_delay_popup_at is None or now-self._transport_delay_popup_at >= 300.0)):
+            state["warned"] = True
+            self._transport_delay_popup_at = now
+            self._show_error("Live synchronization is still delayed. Pending changes are kept and retried. "
+                             "Check the network/server if this continues. Details: " + message,
+                             popup=True, recoverable=True)
+        return True
 
     def _diagnostic_event(self, event, **details):
         log = getattr(self, "diagnostic_log", None)
@@ -8380,6 +8427,7 @@ class LiveCollaborationController:
         self._joined_at_epoch = 0.0
         self._last_edit_activity_epoch = 0.0
         self.baselines.clear()
+        self._transport_delays.clear()
         self._work_time_worker = None
         self._incoming_operations.clear()
         self._activity_voxel_effects = {}
@@ -9897,7 +9945,8 @@ class LiveCollaborationController:
         if self.dirty_segments or self.pending_segment_deletions:
             self._prepare_outgoing()
 
-        push_idle = self._edit_push_worker is None or not self._edit_push_worker.is_alive()
+        push_idle = ((self._edit_push_worker is None or not self._edit_push_worker.is_alive())
+                     and self._transport_retry_ready("edit-push"))
         snapshot_operations = []
         snapshot_label = ""
         should_snapshot = (
@@ -9928,7 +9977,7 @@ class LiveCollaborationController:
             snapshot_was_requested = bool(self._snapshot_requested)
             self._snapshot_requested = False
             self._snapshot_label = ""
-        if push_idle and (self.outgoing or snapshot_operations):
+        if push_idle and self._transport_retry_ready("edit-push") and (self.outgoing or snapshot_operations):
             self._edit_push_worker = threading.Thread(
                 target=self._edit_push_lane,
                 args=(
@@ -9948,7 +9997,7 @@ class LiveCollaborationController:
 
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
         incoming_bytes = sum(item["_packed"].bytes.nbytes for item in self._incoming_operations if "_packed" in item)
-        if pull_idle and len(self._incoming_operations) < MAX_PENDING_REMOTE_OPERATIONS and incoming_bytes < MAX_INCOMING_PACKED_BYTES and (
+        if pull_idle and self._transport_retry_ready("edit-pull") and len(self._incoming_operations) < MAX_PENDING_REMOTE_OPERATIONS and incoming_bytes < MAX_INCOMING_PACKED_BYTES and (
             force_sync or now - self._last_sync_poll >= LIVE_EDIT_POLL_INTERVAL_SECONDS
         ):
             self._last_sync_poll = now
@@ -9974,7 +10023,7 @@ class LiveCollaborationController:
         chat_send_idle = (
             self._chat_send_worker is None or not self._chat_send_worker.is_alive()
         )
-        if chat_send_idle and self.pending_chat:
+        if chat_send_idle and self._transport_retry_ready("chat-send") and self.pending_chat:
             self._chat_send_worker = threading.Thread(
                 target=self._chat_send_lane,
                 args=(self._session_token, self.client, self.room_id, list(self.pending_chat)),
@@ -9986,7 +10035,7 @@ class LiveCollaborationController:
         chat_pull_idle = (
             self._chat_pull_worker is None or not self._chat_pull_worker.is_alive()
         )
-        if chat_pull_idle and (force_realtime or now - self._last_chat_poll >= 0.20):
+        if chat_pull_idle and self._transport_retry_ready("chat-pull") and (force_realtime or now - self._last_chat_poll >= 0.20):
             self._last_chat_poll = now
             self._chat_pull_worker = threading.Thread(
                 target=self._chat_pull_lane,
@@ -10002,7 +10051,7 @@ class LiveCollaborationController:
             self._chat_pull_worker.start()
 
         lock_set_idle = self._lock_set_worker is None or not self._lock_set_worker.is_alive()
-        if lock_set_idle and self.pending_lock_changes:
+        if lock_set_idle and self._transport_retry_ready("lock-set") and self.pending_lock_changes:
             self._lock_set_worker = threading.Thread(
                 target=self._lock_set_lane,
                 args=(
@@ -10019,7 +10068,7 @@ class LiveCollaborationController:
         lock_pull_idle = (
             self._lock_pull_worker is None or not self._lock_pull_worker.is_alive()
         )
-        if lock_pull_idle and (force_realtime or now - self._last_lock_poll >= 0.50):
+        if lock_pull_idle and self._transport_retry_ready("lock-pull") and (force_realtime or now - self._last_lock_poll >= 0.50):
             self._last_lock_poll = now
             self._lock_pull_worker = threading.Thread(
                 target=self._lock_pull_lane,
@@ -10041,7 +10090,7 @@ class LiveCollaborationController:
                 name="LiveSegmentation-work-time-transfer", daemon=True,
             )
             self._work_time_worker.start()
-        if presence_idle and (force_realtime or now - self._last_presence_send >= 0.75):
+        if presence_idle and self._transport_retry_ready("presence") and (force_realtime or now - self._last_presence_send >= 0.75):
             self._last_presence_send = now
             self._presence_worker_started_at = time.monotonic()
             self._presence_stall_status_second = -1
@@ -10089,7 +10138,7 @@ class LiveCollaborationController:
             and now - self._last_edit_activity_epoch >= AUTO_BACKUP_IDLE_SECONDS
         )
         actions = list(self.pending_actions)
-        if maintenance_idle and (
+        if maintenance_idle and self._transport_retry_ready("maintenance") and (
             health_check or backup_check or self._force_advanced_refresh or actions
         ):
             if health_check:
@@ -10231,6 +10280,8 @@ class LiveCollaborationController:
                     "lane": "edit-push",
                     "session_token": session_token,
                     "error": str(exc),
+                    "snapshot_was_requested": bool(snapshot_was_requested),
+                    "snapshot_label": snapshot_label,
                     "duration": time.monotonic() - started,
                 }
             )
@@ -11036,6 +11087,8 @@ class LiveCollaborationController:
                 continue
             self._last_transport_result_at = time.monotonic()
             if "error" in result:
+                if self._handle_transport_timeout(result):
+                    continue
                 if (
                     _uses_shared_folder(self.client)
                     and result.get("lane") == "maintenance"
@@ -11085,16 +11138,21 @@ class LiveCollaborationController:
                 self._connection_error_popup_shown = True
                 self._show_error(result["error"], popup=show_popup)
                 continue
+            delay_lane = str(result.get("lane") or "unknown")
+            command_timeout = any([self._handle_transport_timeout({**result, "error": message})
+                                   for message in result.get("command_errors") or []])
+            if not command_timeout and self._transport_delays.pop(delay_lane, None) is not None:
+                self._diagnostic_event("transport.recovered", lane=delay_lane)
             health_confirmed = bool(
                 result.get("health_checked") and result.get("health_ok")
             )
             if health_confirmed:
                 self._connection_validation_pending = False
                 self._connection_validation_started_at = 0.0
-                self.connection_healthy = True
+                self.connection_healthy = not self._transport_delays
                 self._connection_error_popup_shown = False
             elif not self._connection_validation_pending:
-                self.connection_healthy = True
+                self.connection_healthy = not self._transport_delays
                 self._connection_error_popup_shown = False
             if result.get("lane") in {
                 "sync",
@@ -11255,7 +11313,10 @@ class LiveCollaborationController:
             if result.get("backup"):
                 backup_ok = self._create_project_backup(result["backup"])
             if self.connected and backup_ok and result.get("lane") != "maintenance":
-                if not self.initial_sync_complete:
+                if self._transport_delays:
+                    self.status_label.setText("● Live sync delayed — retrying in background; unsent edits kept")
+                    self.status_label.setStyleSheet("color: #b26a00; font-weight: bold;")
+                elif not self.initial_sync_complete:
                     self.status_label.setText(self._initial_sync_status_text())
                     self.status_label.setStyleSheet(
                         "color: #b26a00; font-weight: bold;"

@@ -57,10 +57,11 @@ def test_ssh_invitation_has_no_login_or_secret():
 class LocalSSHServer:
     """A real encrypted loopback SSH server; only the shipped helper may run."""
 
-    def __init__(self, folder, delay_health=False, delay_snapshot=0.0):
+    def __init__(self, folder, delay_health=False, delay_snapshot=0.0, delay_first_push=0.0):
         self.folder = folder
         self.delay_health = delay_health
         self.delay_snapshot = float(delay_snapshot)
+        self.delay_first_push = float(delay_first_push)
         self.key = paramiko.RSAKey.generate(2048)
         self.socket = socket.socket()
         self.socket.bind(("127.0.0.1", 0))
@@ -104,6 +105,18 @@ class LocalSSHServer:
                 if parts != ["python3", "-u", "-c", REMOTE_BOOTSTRAP]:
                     return False
                 code = REMOTE_BOOTSTRAP
+                if owner.delay_first_push:
+                    code = code.replace("allowed = core.LAN_RELAY_METHODS",
+                        "original_push = client.push_operation\n"
+                        "    push_calls = []\n"
+                        "    def delayed_push(*args, **kwargs):\n"
+                        "        import time\n"
+                        "        push_calls.append(1)\n"
+                        "        if len(push_calls) == 1:\n"
+                        f"            time.sleep({owner.delay_first_push!r})\n"
+                        "        return original_push(*args, **kwargs)\n"
+                        "    client.push_operation = delayed_push\n"
+                        "    allowed = core.LAN_RELAY_METHODS")
                 if owner.delay_health:
                     code = code.replace("allowed = core.LAN_RELAY_METHODS", "original_health = client.health_check\n    def delayed_health(*args, **kwargs):\n        import time\n        time.sleep(1.0)\n        return original_health(*args, **kwargs)\n    client.health_check = delayed_health\n    allowed = core.LAN_RELAY_METHODS")
                 if owner.delay_snapshot:
@@ -494,7 +507,7 @@ def test_ssh_request_deadline_still_applies(tmp_path, isolated):
 
 
 @pytest.mark.parametrize("client_type,expected", [(SshRoomClient, 120.0), (SshProcessRoomClient, 125.0)])
-def test_only_checkpoint_gets_a_longer_ssh_response_budget(monkeypatch, client_type, expected):
+def test_ssh_budgets_tolerate_slow_operations_but_keep_health_finite(monkeypatch, client_type, expected):
     import ssh_transport
 
     real_queue = queue.Queue
@@ -519,7 +532,8 @@ def test_only_checkpoint_gets_a_longer_ssh_response_budget(monkeypatch, client_t
         assert client._rpc("publish_room_snapshot", "room", []) == "ok"
         for method in ("health_check", "send_chat", "presence_report", "operations", "push_operation"):
             assert client._rpc(method, "room") == "ok"
-        assert deadlines == [expected, 10.0, 10.0, 10.0, 10.0, 10.0]
+        margin = 5.0 if client_type is SshProcessRoomClient else 0.0
+        assert deadlines == [expected, 10.0+margin, *([30.0+margin]*4)]
     finally:
         client.close()
 
@@ -591,6 +605,32 @@ def test_closing_ssh_does_not_wait_for_long_checkpoint_budget(tmp_path, isolated
             with pytest.raises(LiveCollaborationError, match="closed"):
                 slow.result(timeout=0.8)
             assert time.monotonic() - started < 0.8
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize('isolated', [False, True])
+def test_timed_out_push_retry_is_idempotent_and_other_lanes_continue(tmp_path, isolated):
+    server = LocalSSHServer(tmp_path, delay_first_push=1.2)
+    server.pin(tmp_path / 'known_hosts')
+    client = server.client('alice', tmp_path / 'known_hosts', isolated=isolated)
+    try:
+        client.timeout_seconds = .3
+        room = client.join('delayed-once', 'b'*64)
+        before = np.zeros((4,)*3, np.uint8)
+        after = before.copy()
+        after[1, 2, 3] = 1
+        op = {'segment_id': 'A', 'client_operation_id': 'same-identity', **encode_mask_delta(before, after)}
+        with pytest.raises(LiveCollaborationError, match='push_operation.*within 0.3 seconds'):
+            client.push_operation(room['id'], op)
+        assert client.send_chat(room['id'], 'not blocked', 'independent-chat')
+        assert client.push_operation(room['id'], op)
+        time.sleep(1.3)  # Allow the first accepted request and its late reply to finish.
+        operations = client.operations(room['id'], 0)
+        assert len(operations) == 1
+        np.testing.assert_array_equal(apply_mask_delta(before, operations[0]), after)
+        assert client.health_check(room['id'])
     finally:
         client.close()
         server.close()

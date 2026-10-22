@@ -217,7 +217,7 @@ finally:
 class SshRoomClient(LanRoomClient):
     transport_kind = "ssh-folder"
 
-    def __init__(self, location, user_name, username, password="", known_hosts=None, remote_python="python3", timeout_seconds=10.0, snapshot_timeout_seconds=120.0):
+    def __init__(self, location, user_name, username, password="", known_hosts=None, remote_python="python3", timeout_seconds=30.0, snapshot_timeout_seconds=120.0):
         self.target = parse_ssh_folder(location)
         self.location = self.target.location
         self.user_name = str(user_name or "").strip()
@@ -390,6 +390,8 @@ class SshRoomClient(LanRoomClient):
         # long wait or change their independent request queues and deadlines.
         if method == "publish_room_snapshot":
             return max(self.timeout_seconds, self.snapshot_timeout_seconds)
+        if method == "health_check":
+            return min(self.timeout_seconds, 10.0)
         return self.timeout_seconds
 
     def _rpc(self, method, *args, **kwargs):
@@ -472,7 +474,7 @@ class SshProcessRoomClient(SshRoomClient):
         timeout = super()._request_timeout_seconds(method)
         # The inner SSH RPC starts after this pipe request. Let it return its
         # precise outcome before the parent times out at the identical boundary.
-        return timeout + 5.0 if method == "publish_room_snapshot" else timeout
+        return timeout + 5.0
 
     def _ensure_connected(self):
         with self._connect_lock:

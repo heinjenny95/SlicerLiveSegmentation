@@ -194,7 +194,7 @@ class Peer:
         self.errors = []
         controller._append_activity = self.activity.append
         controller._sync_operation_journal = lambda *args, **kwargs: None
-        controller._show_error = lambda message, popup=False: self.errors.append(message)
+        controller._show_error = lambda message, popup=False, recoverable=False: self.errors.append(message)
         controller._refresh_label_combo = lambda *args, **kwargs: None
         controller._update_lock_controls = lambda *args, **kwargs: None
         controller._update_performance_label = lambda *args, **kwargs: None
