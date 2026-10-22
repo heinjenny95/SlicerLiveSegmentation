@@ -17,6 +17,25 @@ def test_snapshot_count_uses_packed_bits_not_dense_decode(shape):
     assert c.operation_changed_voxel_count(operation) == int(np.count_nonzero(painted))
 
 
+def test_checkpoint_archive_does_not_rewrite_label_creators_for_every_tile(tmp_path, monkeypatch):
+    alice = c.SharedFolderRoomClient(tmp_path, "alice")
+    bob = c.SharedFolderRoomClient(tmp_path, "bob")
+    room = alice.join("room", SIGNATURE)
+    bob.join("room", SIGNATURE)
+    empty = np.zeros((4,)*3, np.uint8)
+    painted = np.ones_like(empty)
+    alice.push_operation(room["id"], operation_payload("A", empty, painted))
+    alice._artifact_queue.join()
+    def no_owner_rewrite(*args):
+        pytest.fail("Existing creator metadata was rewritten for a checkpoint tile")
+    monkeypatch.setattr(bob, "_update_compact_segment_owner", no_owner_rewrite)
+    snapshot = bob.publish_room_snapshot(room["id"], [operation_payload("A", empty, painted, replace=True)], expected_sequence=1)
+    bob._artifact_queue.join()
+    bob._persist_operation_artifacts(bob._room_path, bob.operations(room["id"], 1)[0])
+    assert snapshot["last_sequence"] == 2
+    assert bob._segment_creators(bob._room_path)["A"] == "alice"
+
+
 def test_failed_background_archive_keeps_complete_loose_history(tmp_path, monkeypatch):
     client = c.SharedFolderRoomClient(tmp_path, "alice", background_compaction=True)
     room = client.join("room", SIGNATURE)
@@ -67,7 +86,8 @@ def test_background_snapshot_returns_and_peer_can_paint_while_archive_is_slow(tm
     assert [op["sequence"] for op in alice._all_operation_records(alice._room_path)] == [1, 2, 3]
 
 
-def test_checkpoint_payload_staging_does_not_block_paint_or_another_join(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tiles", [1, 867])
+def test_checkpoint_payload_staging_does_not_block_paint_or_another_join(tmp_path, monkeypatch, tiles):
     alice = c.SharedFolderRoomClient(tmp_path, "alice")
     bob = c.SharedFolderRoomClient(tmp_path, "bob", lock_timeout_seconds=.2)
     room = alice.join("room", SIGNATURE)
@@ -84,7 +104,7 @@ def test_checkpoint_payload_staging_does_not_block_paint_or_another_join(tmp_pat
     monkeypatch.setattr(c, "_write_json_atomic", slow_payload)
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(alice.publish_room_snapshot, room["id"],
-                             [operation_payload("A", empty, painted, replace=True)], expected_sequence=0)
+                             [operation_payload("A", empty, painted, replace=True) for _ in range(tiles)], expected_sequence=0)
         try:
             assert entered.wait(3)
             # Competing maintenance skips instead of holding a second lane.
@@ -95,6 +115,6 @@ def test_checkpoint_payload_staging_does_not_block_paint_or_another_join(tmp_pat
             assert result["sequence"] == 1
         finally:
             release.set()
-        assert future.result(timeout=3)["skipped"] == "stale"
+        assert future.result(timeout=20)["skipped"] == "stale"
     assert not list((alice._room_path/"snapshots").glob("*.json"))
     assert [op["segment_id"] for op in alice.operations(room["id"], 0)] == ["B"]

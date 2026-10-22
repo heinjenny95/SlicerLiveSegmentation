@@ -2125,7 +2125,7 @@ class SharedFolderRoomClient:
                 {"sequence": int(operation["sequence"]), "file": destination.name},
                 durable=False,
             )
-        if operation.get("segment_order") is not None:
+        if operation.get("segment_order") is not None or operation.get("system_snapshot"):
             return operation_hash, destination
         self._remember_segment_owner(
             room_path, operation.get("segment_id"), operation.get("author")

@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Do not rewrite label-creator aggregates for every checkpoint tile in the
+  background archive lane either; checkpoint publication already preserves
+  original owners. This avoids hundreds of redundant shared-storage round trips.
+
+- Exercise checkpoint contention with an 867-tile batch while a second writer
+  joins/paints and a competing checkpoint skips; require stale staging to leave
+  no published checkpoint or lost peer edit.
+
 - Remember personal per-label visibility by stable ID across room rejoins and
   restarts. Coalesce settings writes, restore labels arriving during initial
   sync, and never persist fast-preview's temporary global surface hiding.
