@@ -32,3 +32,43 @@ def test_real_remote_change_still_has_activity(monkeypatch):
     peer.apply({**h.collaboration.encode_mask_delta(old, new), "segment_id": "A", "segment_name": "A",
                 "author": "other", "sequence": 1, "client_operation_id": "real"})
     assert len(peer.activity) == 1 and "other" in peer.activity[0]
+
+
+def test_repeated_paint_and_own_confirmations_are_diagnostic_only(monkeypatch):
+    scene, _ = h.install_fake_slicer(monkeypatch)
+    peer = h.Peer("local", scene)
+    common = {"segment_id": "A", "segment_name": "Mandible", "color_hex": "#FF0000"}
+    peer.apply({**common, **h.collaboration.encode_metadata_update(h.SHAPE),
+                "metadata_update": True, "author": "other", "sequence": 1})
+    peer.activity.clear()
+    before = np.zeros(h.SHAPE, np.uint8)
+    for sequence in range(2, 8):
+        after = before.copy()
+        after[sequence, 1, 1] = 1
+        peer.apply({**common, **h.collaboration.encode_mask_delta(before, after),
+                    "author": "other", "sequence": sequence})
+        before = after
+    confirmation = {**common, **h.collaboration.encode_metadata_update(h.SHAPE),
+                    "metadata_update": True, "author": "local", "sequence": 8,
+                    "client_operation_id": "own-confirmation"}
+    peer.controller.outgoing.append(confirmation)
+    peer.apply(confirmation)
+    assert not peer.activity
+    np.testing.assert_array_equal(peer.mask("A"), before)
+    assert peer.controller.last_sequence == 8
+
+
+def test_coarse_label_lifecycle_and_order_without_sequence_numbers(monkeypatch):
+    scene, _ = h.install_fake_slicer(monkeypatch)
+    peer = h.Peer("local", scene)
+    common = {"segment_id": "A", "segment_name": "Mandible", "author": "other"}
+    peer.apply({**common, **h.collaboration.encode_metadata_update(h.SHAPE),
+                "metadata_update": True, "sequence": 1})
+    peer.apply({**common, **h.collaboration.encode_metadata_update(h.SHAPE),
+                "segment_name": "Mandible left", "metadata_update": True, "sequence": 2})
+    peer.controller._apply_operations([{"segment_order": ["A"], "author": "other", "sequence": 3}])
+    peer.apply({**common, "segment_deleted": True, "sequence": 4})
+    assert any("created label" in text for text in peer.activity)
+    assert any("renamed" in text for text in peer.activity)
+    assert any("deleted label" in text for text in peer.activity)
+    assert all("sequence" not in text for text in peer.activity)

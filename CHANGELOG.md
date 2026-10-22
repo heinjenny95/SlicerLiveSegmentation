@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep the visible Activity timeline coarse: label creation, deletion, property
+  changes and reordering, without voxel/sequence/acknowledgement spam. Detailed
+  operation diagnostics and the collaborative history remain intact.
+
 - Publish live-room checkpoints without compressing history under the hot
   sequence lock. Production NAS/LAN/SSH clients archive on a separate maintenance
   queue; snapshot validation/counting and history preparation happen before the

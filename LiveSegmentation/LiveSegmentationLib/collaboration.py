@@ -12649,7 +12649,7 @@ class LiveCollaborationController:
                         self._acknowledge_local_operation(operation)
                     if not operation.get("system_snapshot"):
                         actor = "You" if operation.get("author") == self.user_name else operation.get("author") or "Collaborator"
-                        self._append_activity(f"{actor} reordered labels for everyone · sequence {sequence}")
+                        self._append_activity(f"{actor} reordered labels for everyone")
                     self.last_sequence = sequence
                     applied_count += 1
                     continue
@@ -12932,10 +12932,13 @@ class LiveCollaborationController:
                 )
                 voxel_effect = self._activity_voxel_effects.pop(sequence, False)
                 metadata_effect = metadata_before != metadata_after
-                own_metadata_confirmation = bool(operation.get("metadata_update") and operation.get("author") == self.user_name
-                    and any(item.get("client_operation_id") == operation.get("client_operation_id")
-                            for item in [*self.outgoing, *self.awaiting_echo]))
-                if operation.get("metadata_update"):
+                # Activity is a human-readable room timeline, not the wire
+                # protocol. Keep every edit/sequence in diagnostics and history,
+                # but do not flood the room with paint tiles or own ACKs.
+                activity = None
+                if metadata_before is None and not operation.get("system_snapshot"):
+                    activity = f"{actor} created label “{operation.get('segment_name') or segment_id}”"
+                elif operation.get("metadata_update") and metadata_effect:
                     if metadata_before is None:
                         activity = (
                             f"{actor} created label “"
@@ -12963,18 +12966,14 @@ class LiveCollaborationController:
                             if changes
                             else f"{actor} updated label properties for “{operation.get('segment_name') or segment_id}”"
                         )
-                else:
-                    activity = (
-                        f"{actor} updated label "
-                        f"{operation.get('segment_name') or segment_id} · sequence {sequence}"
-                    )
-                if voxel_effect or metadata_effect:
+                if activity and not operation.get("system_snapshot"):
                     self._append_activity(activity)
-                elif own_metadata_confirmation:
-                    self._append_activity(f"Your label metadata synchronization confirmed · sequence {sequence}")
-                else:
+                if not voxel_effect and not metadata_effect:
                     self._diagnostic_event("operation.no_visible_effect", sequence=sequence,
                                            segment_id=str(segment_id), metadata=bool(operation.get("metadata_update")))
+                self._diagnostic_event("operation.applied", sequence=sequence, segment_id=str(segment_id),
+                                       author=operation.get("author"), voxel_effect=bool(voxel_effect),
+                                       metadata_effect=bool(metadata_effect))
                 if operation.get("author") != self.user_name:
                     highlight_changed = changed
                     if (
