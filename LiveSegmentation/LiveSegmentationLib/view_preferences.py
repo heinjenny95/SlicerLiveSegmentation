@@ -6,6 +6,18 @@ manager per MRML node via slicer.modules, so they cannot race to save defaults.
 import hashlib
 import json
 import logging
+from pathlib import Path
+
+
+def personal_view_settings():
+    import qt
+
+    # The safe starters use --disable-settings. The application's default
+    # Slicer-tmp settings are discarded on startup, so use our OWN stable file.
+    directory = Path(qt.QStandardPaths.writableLocation(qt.QStandardPaths.GenericDataLocation))
+    directory = directory / "SlicerLiveSegmentation"
+    directory.mkdir(parents=True, exist_ok=True)
+    return qt.QSettings(str(directory / "personal-label-view.ini"), qt.QSettings.IniFormat)
 
 
 class PersonalVisibility:
@@ -145,7 +157,7 @@ def bind_personal_visibility(node, source=None, scope=None):
 
     manager = registry.get(node.GetID())
     if manager is None:
-        manager = PersonalVisibility(node, qt.QSettings(), scope,
+        manager = PersonalVisibility(node, personal_view_settings(), scope,
                                      lambda callback: qt.QTimer.singleShot(200, callback))
         registry[node.GetID()] = manager
     else:

@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Personal label visibility uses its own persistent settings file even when
+  Slicer is launched with --disable-settings by the safe desktop/NAS starters.
+
 - Do not rewrite label-creator aggregates for every checkpoint tile in the
   background archive lane either; checkpoint publication already preserves
   original owners. This avoids hundreds of redundant shared-storage round trips.

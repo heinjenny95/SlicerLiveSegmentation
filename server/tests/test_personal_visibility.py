@@ -1,7 +1,20 @@
 import json
+import sys
 from types import SimpleNamespace
 
-from LiveSegmentationLib.view_preferences import PersonalVisibility
+from LiveSegmentationLib.view_preferences import PersonalVisibility, personal_view_settings
+
+
+def test_safe_starter_preferences_do_not_use_discarded_default_profile(tmp_path, monkeypatch):
+    calls = []
+    def settings(*args):
+        calls.append(args)
+        return "persistent"
+    settings.IniFormat = "ini"
+    monkeypatch.setitem(sys.modules, "qt", SimpleNamespace(QSettings=settings,
+        QStandardPaths=SimpleNamespace(GenericDataLocation=1, writableLocation=lambda _: str(tmp_path))))
+    assert personal_view_settings() == "persistent"
+    assert calls == [(str(tmp_path/"SlicerLiveSegmentation"/"personal-label-view.ini"), "ini")]
 
 
 class Display:
