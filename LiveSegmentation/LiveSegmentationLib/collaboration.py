@@ -9370,6 +9370,19 @@ class LiveCollaborationController:
             ):
                 revision_changed_ids.add(current_segment_id)
         candidates = (event_segment_ids & current_ids) | revision_changed_ids | added_ids
+        regional_target = getattr(self.owner, "regional_paint_target", lambda node: None)(node)
+        if regional_target in candidates:
+            try:
+                try:
+                    from .regional_paint import apply_claims
+                except ImportError:
+                    from regional_paint import apply_claims
+                affected = apply_claims(self, node, regional_target)
+                candidates.update(affected)
+                self._diagnostic_event("paint.regional_claims", segment_id=regional_target,
+                                       affected_ids=sorted(affected))
+            except Exception as exc:
+                self._show_error(str(exc))
         for candidate in candidates:
             key = (node.GetID(), candidate)
             self.dirty_segments.add(key)

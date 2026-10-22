@@ -13,6 +13,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/roi_geometry.py
   LiveSegmentationLib/editor_preprocessing.py
   LiveSegmentationLib/native_range.py
+  LiveSegmentationLib/regional_paint.py
   LiveSegmentationLib/view_preferences.py
   LiveSegmentationLib/version.py
   LiveSegmentationLib/ssh_transport.py

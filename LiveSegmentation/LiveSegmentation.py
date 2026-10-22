@@ -58,6 +58,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.live_collaboration = None
         self._live_session_active = False
         self._previous_segment_editor_overwrite_mode = None
+        self._native_paint_guard = None
         self._previous_segment_editor_undo_limit = None
         self._recovery_editor = None
         self._editor_preprocessing = None
@@ -349,10 +350,10 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         """Make the most recent paint stroke own every voxel it touches.
 
         A live room represents a material partition, not overlapping regions.
-        Keeping Slicer's ``OverwriteNone`` mode here allowed two ordinary
-        Segment Editor labels to claim the same voxel locally.  The transport
-        also resolves remote claims by the shared operation sequence, so the
-        local editor must use the same last-writer-wins rule.
+        The bounded Paint guard replaces only the costly global native erase
+        pass for large, unmasked Paint strokes; its deferred local claim handler
+        maintains the same material partition. All other native effects retain
+        OverwriteAll. Shared ownership is still decided by room sequence.
         """
         if editor is None:
             return
@@ -367,10 +368,32 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             parameter_node.SetOverwriteMode(
                 slicer.vtkMRMLSegmentEditorNode.OverwriteAllSegments
             )
+            from LiveSegmentationLib.regional_paint import NativePaintGuard
+
+            guard = self._native_paint_guard
+            if guard is not None and guard.parameter != parameter_node:
+                guard.close()
+                guard = None
+            if guard is None:
+                self._native_paint_guard = NativePaintGuard(self, editor)
+            else:
+                guard.refresh()
         except Exception:
             pass
 
+    def regional_paint_target(self, node):
+        guard = self._native_paint_guard
+        return guard.target(node) if guard is not None else None
+
+    def regional_paint_protection(self, editor, node, original_mask_mode):
+        """Optional IR bridge: bounded claims already protect locked siblings."""
+        guard = self._native_paint_guard
+        return bool(guard is not None and guard.protects_editor(editor, node, original_mask_mode))
+
     def _restore_segment_editor_overwrite_mode(self, editor):
+        if self._native_paint_guard is not None:
+            self._native_paint_guard.close()
+            self._native_paint_guard = None
         previous = self._previous_segment_editor_overwrite_mode
         self._previous_segment_editor_overwrite_mode = None
         if editor is None or previous is None:

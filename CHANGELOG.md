@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- PERF-20261022-05: native Paint in large live rooms now keeps Slicer's brush
+  rasterizer but resolves new voxel claims with bounded regional writes after
+  native callbacks finish, avoiding global padding/erasure of distant layers.
+  Shared baselines remain authoritative only after ordered replay; both lock
+  modes, untouched target voxels, sibling masks and failed-write rollback are
+  covered. The scoped fast path is Paint/Everywhere without an intensity mask;
+  other effects/editable-area modes retain native Slicer behavior.
+
 - PERF-20261022-06: avoid unchanged native lock-tag events and per-label missing
   lock-file probes/pool jobs during large room catch-up. Continue the single
   bounded local encoder cooperatively instead of waiting a controller tick for
