@@ -25,7 +25,7 @@ from pathlib import Path
 def supported_profile(platform_name, pointer_size, slicer_version, vtk_version, *, architecture="AMD64"):
     return (platform_name == "win32" and pointer_size == 8
             and architecture.lower() in {"amd64", "x86_64"}
-            and tuple(slicer_version) == (5, 12, 3, "34627")
+            and tuple(slicer_version) in {(5, 12, 0, "34621"), (5, 12, 3, "34627")}
             and tuple(vtk_version) == (9, 6, 2))
 
 
@@ -71,7 +71,7 @@ class NativeScalarRange:
                 backend._self_test(vtk)
                 backend.calls = 0
                 backend.seconds = 0.0
-                return backend, "validated Windows x64 / Slicer 5.12.3 r34627 / VTK 9.6.2"
+                return backend, f"validated Windows x64 / Slicer {version_text} r{version[-1]} / VTK 9.6.2"
             except (OSError, AttributeError, ValueError, AssertionError) as exc:
                 return None, f"native range bridge validation failed ({type(exc).__name__})"
         return None, "validated application's VTK library was not found"

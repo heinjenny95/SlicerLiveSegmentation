@@ -17,6 +17,7 @@ def image(*, kind=3, components=1, ghost=False, cell=False, name="vtkImageData")
 
 
 def test_exact_profile_only_not_merely_same_major_version():
+    assert supported_profile("win32", 8, (5, 12, 0, "34621"), (9, 6, 2))
     assert supported_profile("win32", 8, (5, 12, 3, "34627"), (9, 6, 2))
     assert not supported_profile("win32", 8, (5, 12, 3, "34627"), (9, 6, 2), architecture="ARM64")
     for platform, size, slicer, vtk in [

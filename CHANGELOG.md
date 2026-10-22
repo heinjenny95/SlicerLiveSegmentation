@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Extend integer-source range acceleration to the separately validated Windows
+  x64 Slicer 5.12.0 r34621 / VTK 9.6.2 profile (also used by standalone IR).
+
 - Coordinate checkpoint preparation with a separate room lease; durably stage
   tile payloads before the live sequence lock, then recheck the exact room head.
   Skip competing/stale checkpoints, avoid repeated per-tile owner-index reads,
