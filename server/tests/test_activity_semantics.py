@@ -72,3 +72,20 @@ def test_coarse_label_lifecycle_and_order_without_sequence_numbers(monkeypatch):
     assert any("renamed" in text for text in peer.activity)
     assert any("deleted label" in text for text in peer.activity)
     assert all("sequence" not in text for text in peer.activity)
+
+
+def test_own_label_creation_and_rename_remain_visible_without_ack_spam(monkeypatch):
+    scene, _ = h.install_fake_slicer(monkeypatch)
+    peer = h.Peer('local', scene)
+    c = peer.controller
+    segment = h.FakeSegment()
+    segment.SetName('Mandible')
+    peer.node.GetSegmentation().AddSegment(segment, 'A')
+    c._queue_segment_order = lambda *args: None
+    c._process_segmentation_events(peer.node, set(), preserve_added_ids=True)
+    assert any('You created label' in text for text in peer.activity)
+    peer.activity.clear()
+    segment.SetName('Mandible left')
+    c._probe_segment_revisions()
+    c._probe_segment_revisions()
+    assert len(peer.activity) == 1 and 'renamed' in peer.activity[0]

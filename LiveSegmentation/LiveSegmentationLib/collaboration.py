@@ -6833,6 +6833,23 @@ class LiveCollaborationController:
         )
         self._scroll_chat_to_end(self.activity_dock_text)
 
+    def _announce_local_label_metadata(self, before, after):
+        """Report actual local label actions once, never their later ACKs."""
+        if after is None:
+            return
+        if before is None:
+            text = f"You created label “{after.get('segment_name')}”"
+        else:
+            changes = []
+            if before.get("segment_name") != after.get("segment_name"):
+                changes.append(f"renamed “{before.get('segment_name')}” to “{after.get('segment_name')}”")
+            if before.get("color_hex") != after.get("color_hex"):
+                changes.append(f"changed the color of “{after.get('segment_name')}”")
+            if not changes:
+                return
+            text = "You " + " and ".join(changes)
+        self._append_activity(text)
+
     def show_chat_dock(self, checked=False):
         del checked
         if self.chat_dock is not None:
@@ -9061,6 +9078,7 @@ class LiveCollaborationController:
                 and previous_metadata is not None
                 and current_metadata != previous_metadata
             ):
+                self._announce_local_label_metadata(previous_metadata, current_metadata)
                 self._segment_metadata[segment_id] = current_metadata
                 self.metadata_updates.add(key)
                 self.dirty_segments.add(key)
@@ -9218,10 +9236,12 @@ class LiveCollaborationController:
                 and previous_metadata is not None
                 and current_metadata != previous_metadata
             ):
+                self._announce_local_label_metadata(previous_metadata, current_metadata)
                 metadata_changed_ids.add(current_segment_id)
             if current_metadata is not None:
                 self._segment_metadata[current_segment_id] = current_metadata
         for added_segment_id in added_ids:
+            self._announce_local_label_metadata(None, self._current_segment_metadata(node, added_segment_id))
             added_key = (node.GetID(), added_segment_id)
             self.force_snapshots.add(added_key)
             self.metadata_updates.add(added_key)

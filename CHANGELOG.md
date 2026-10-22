@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep actual own label creation/rename/color actions visible once in the coarse
+  Activity timeline, independently of suppressed synchronization ACK messages.
+
 - Allow ordinary SSH requests 30 seconds (checkpoints 120; health probes remain
   10 seconds). Give the isolated forwarding worker a distinct outer deadline.
   Retry timeouts with bounded per-lane backoff and stable operation/message IDs;
