@@ -7,7 +7,9 @@ from tests import controller_harness as h
 
 
 @pytest.mark.parametrize('lane', ['edit-push', 'edit-pull', 'chat-send', 'presence', 'maintenance'])
-def test_first_timeout_retries_without_popup_or_discard(monkeypatch, lane):
+@pytest.mark.parametrize('message', ["SSH request 'operations' did not respond within 30 seconds",
+                                    "The shared folder is busy. Try joining or saving again in a moment."])
+def test_first_timeout_retries_without_popup_or_discard(monkeypatch, lane, message):
     scene, _ = h.install_fake_slicer(monkeypatch)
     peer = h.Peer('alice', scene)
     c = peer.controller
@@ -16,7 +18,7 @@ def test_first_timeout_retries_without_popup_or_discard(monkeypatch, lane):
     c.outgoing = [operation]
     c.pending_chat = [{'client_message_id': 'stable-chat', 'text': 'hello'}]
     c._worker_results.put({'lane': lane, 'session_token': c._session_token,
-                          'error': "SSH request 'operations' did not respond within 30 seconds",
+                          'error': message,
                           'health_checked': lane == 'maintenance', 'health_ok': False})
     c._drain_worker_results()
     assert not peer.errors, 'First timeout showed the offline error dialog'

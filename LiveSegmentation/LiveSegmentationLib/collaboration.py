@@ -4112,7 +4112,23 @@ class SharedFolderRoomClient:
     def publish_room_snapshot(
         self, room_id, segment_operations, compact=True, label="", expected_sequence=None
     ):
-        """Append a compatible full-state batch and archive older loose files.
+        room_path = self._require_room(room_id)
+        # One checkpoint preparer per room, WITHOUT reserving the edit lane.
+        # The heartbeat/token-safe lease also prevents join-triggered snapshot
+        # storms. A competing checkpoint is maintenance, not a lost connection.
+        try:
+            with self._named_lock(room_path, "snapshot-preparation", timeout_seconds=0):
+                with tempfile.TemporaryDirectory(prefix=".snapshot-", dir=room_path) as staging:
+                    return self._publish_staged_room_snapshot(
+                        room_id, segment_operations, compact, label, expected_sequence, Path(staging))
+        except LiveCollaborationError as exc:
+            if str(exc) == "The shared folder is busy. Try joining or saving again in a moment.":
+                return {"skipped": "busy"}
+            raise
+
+    def _publish_staged_room_snapshot(self, room_id, segment_operations, compact, label,
+                                      expected_sequence, staging):
+        """Durably stage payloads before acquiring the live sequence lock.
 
         ``expected_sequence`` is the room sequence the snapshot was built from.
         A snapshot replaces the room state, so publishing one that does not
@@ -4143,9 +4159,25 @@ class SharedFolderRoomClient:
                 {str(item.get("segment_id") or "") for item in segment_operations},
             ) + prepared_operations
         original_creators = self._segment_creators(room_path)
+        expected = observed_sequence if expected_sequence is None else int(expected_sequence)
+        if expected != observed_sequence:
+            return {"skipped": "stale", "expected_sequence": expected, "latest_sequence": observed_sequence}
+        for index, operation in enumerate(prepared_operations):
+            operation_id = f"snapshot-{group_id}-{index}"
+            operation_hash = hashlib.sha256(operation_id.encode()).hexdigest()[:20]
+            stored = {
+                **operation, "client_operation_id": operation_id,
+                "operation_kind": str(operation.get("operation_kind") or "snapshot"),
+                "sequence": observed_sequence+index+1, "author": self.user_name,
+                "created_at": _utc_iso(), "snapshot_group_id": group_id,
+                "snapshot_group_index": index, "snapshot_group_count": len(prepared_operations),
+                "system_snapshot": True, "snapshot_label": str(label or "")[:200],
+            }
+            name = f"{stored['sequence']:020d}--{operation_hash}.json"
+            _write_json_atomic(staging / name, stored)
+            created.append(stored)
         with self._sequence_lock(room_path) as sequence_lock:
             before_sequence = self._latest_sequence(room_path)
-            expected = observed_sequence if expected_sequence is None else int(expected_sequence)
             if before_sequence != expected or before_sequence != observed_sequence:
                 return {
                     "skipped": "stale",
@@ -4160,7 +4192,6 @@ class SharedFolderRoomClient:
             label_deletions = self._label_deletion_barriers(
                 room_path, state, before_sequence
             )
-            segment_operations = prepared_operations
             for segment_id, owner in original_creators.items():
                 lock_path = self._segment_lock_path(room_path, segment_id)
                 if not lock_path.is_file():
@@ -4175,54 +4206,31 @@ class SharedFolderRoomClient:
                         },
                     )
             sequence = before_sequence
-            count = len(segment_operations)
             _, recent_operations = self._recent_feed_state(
                 room_path / "sequence-state.json",
                 "latest_sequence",
                 "recent_operations",
             )
-            for index, operation in enumerate(segment_operations):
-                sequence += 1
-                operation_id = f"snapshot-{group_id}-{index}"
-                operation_hash = hashlib.sha256(operation_id.encode()).hexdigest()[:20]
-                stored = {
-                    **operation,
-                    "client_operation_id": operation_id,
-                    "operation_kind": str(
-                        operation.get("operation_kind") or "snapshot"
-                    ),
-                    "sequence": sequence,
-                    "author": self.user_name,
-                    "created_at": _utc_iso(),
-                    "snapshot_group_id": group_id,
-                    "snapshot_group_index": index,
-                    "snapshot_group_count": count,
-                    "system_snapshot": True,
-                    "snapshot_label": str(label or "")[:200],
-                }
-                destination = (
-                    room_path
-                    / "operations"
-                    / f"{sequence:020d}--{operation_hash}.json"
-                )
+            for stored in created:
+                sequence = stored["sequence"]
+                _, destination, _ = self._operation_paths(room_path, stored)
                 sequence_lock.verify()
-                _write_json_atomic(destination, stored)
-                _write_json_atomic(
-                    room_path / "operation-index" / f"{operation_hash}.json",
-                    {"sequence": sequence, "file": destination.name},
-                    durable=False,
-                )
-                if stored.get("segment_order") is None:
+                os.replace(staging / destination.name, destination)
+                # Existing ownership must survive checkpoints by another user.
+                # Read/update derived owner metadata once per new LABEL, not
+                # once per tile (hundreds of repeated SMB reads in large rooms).
+                sid = str(stored.get("segment_id") or "")
+                if stored.get("segment_order") is None and sid not in original_creators:
                     self._remember_segment_owner(
-                        room_path, stored.get("segment_id"), stored.get("author")
+                        room_path, sid, stored.get("author")
                     )
                     self._update_compact_segment_owner(
-                        room_path, stored.get("segment_id"), stored.get("author")
+                        room_path, sid, stored.get("author")
                     )
+                    original_creators[sid] = stored.get("author")
                 recent_operations.append(
                     {"sequence": sequence, "file": destination.name}
                 )
-                created.append(stored)
             recent_operations = recent_operations[-RECENT_FEED_LIMIT:]
             _write_json_atomic(
                 room_path / "sequence-state.json",
@@ -4256,6 +4264,8 @@ class SharedFolderRoomClient:
                 room_path / "snapshots" / f"{sequence:020d}--{group_id}.json",
                 manifest,
             )
+        for stored in created:
+            self._queue_operation_artifacts(room_path, stored)
         if compact and before_sequence > 0:
             if self.background_compaction:
                 self._queue_snapshot_compaction(room_path, before_sequence, group_id)
@@ -6642,7 +6652,8 @@ class LiveCollaborationController:
         """
         message = str(result.get("error") or "")
         lower = message.lower()
-        if not any(text in lower for text in ("did not respond within", "timed out", "timeout")):
+        if not any(text in lower for text in ("did not respond within", "timed out", "timeout",
+                                               "the shared folder is busy. try joining or saving again in a moment.")):
             return False
         lane = str(result.get("lane") or "unknown")
         now = time.monotonic()

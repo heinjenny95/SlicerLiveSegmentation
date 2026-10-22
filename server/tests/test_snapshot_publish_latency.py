@@ -65,3 +65,36 @@ def test_background_snapshot_returns_and_peer_can_paint_while_archive_is_slow(tm
             release.set()
     alice._compaction_queue.join()
     assert [op["sequence"] for op in alice._all_operation_records(alice._room_path)] == [1, 2, 3]
+
+
+def test_checkpoint_payload_staging_does_not_block_paint_or_another_join(tmp_path, monkeypatch):
+    alice = c.SharedFolderRoomClient(tmp_path, "alice")
+    bob = c.SharedFolderRoomClient(tmp_path, "bob", lock_timeout_seconds=.2)
+    room = alice.join("room", SIGNATURE)
+    bob.join("room", SIGNATURE)
+    empty = np.zeros((4,)*3, np.uint8)
+    painted = np.ones((4,)*3, np.uint8)
+    entered, release = threading.Event(), threading.Event()
+    real_write = c._write_json_atomic
+    def slow_payload(path, value, **kwargs):
+        if isinstance(value, dict) and value.get("system_snapshot"):
+            entered.set()
+            assert release.wait(5)
+        return real_write(path, value, **kwargs)
+    monkeypatch.setattr(c, "_write_json_atomic", slow_payload)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(alice.publish_room_snapshot, room["id"],
+                             [operation_payload("A", empty, painted, replace=True)], expected_sequence=0)
+        try:
+            assert entered.wait(3)
+            # Competing maintenance skips instead of holding a second lane.
+            second = bob.publish_room_snapshot(room["id"], [operation_payload("A", empty, painted, replace=True)], expected_sequence=0)
+            assert second["skipped"] == "busy"
+            c.SharedFolderRoomClient(tmp_path, "late", lock_timeout_seconds=.2).join("room", SIGNATURE)
+            result = bob.push_operation(room["id"], operation_payload("B", empty, painted, operation_id="peer"))
+            assert result["sequence"] == 1
+        finally:
+            release.set()
+        assert future.result(timeout=3)["skipped"] == "stale"
+    assert not list((alice._room_path/"snapshots").glob("*.json"))
+    assert [op["segment_id"] for op in alice.operations(room["id"], 0)] == ["B"]

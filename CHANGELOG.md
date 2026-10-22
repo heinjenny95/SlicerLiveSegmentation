@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Coordinate checkpoint preparation with a separate room lease; durably stage
+  tile payloads before the live sequence lock, then recheck the exact room head.
+  Skip competing/stale checkpoints, avoid repeated per-tile owner-index reads,
+  and retry transient shared-lock contention without an immediate offline popup.
+
 - Rebuild existing native segment-table eye/color/status controls after received
   room-wide reorder operations, retaining each participant's selection and scroll.
 
