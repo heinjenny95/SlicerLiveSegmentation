@@ -139,7 +139,8 @@ SEGMENT_EVENT_COALESCE_MILLISECONDS = 20
 CONTROLLER_TIMER_INTERVAL_MILLISECONDS = 50
 LIVE_EDIT_POLL_INTERVAL_SECONDS = 0.05
 SEGMENT_REVISION_PROBE_INTERVAL_SECONDS = 0.75
-AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 5.0
+AUTOMATIC_SNAPSHOT_IDLE_SECONDS = 30.0
+AUTOMATIC_SNAPSHOT_INTERVAL_SECONDS = 60.0
 CARRIED_TOMBSTONE_LIMIT = 200
 DAMAGED_OPERATION_GRACE_SECONDS = 30.0
 JOURNAL_WRITE_RETRY_SECONDS = 5.0
@@ -5343,6 +5344,8 @@ class LiveCollaborationController:
         self._worker = None  # legacy compatibility alias; live lanes are below
         self._realtime_worker = None  # legacy compatibility alias
         self._edit_push_worker = None
+        self._snapshot_worker = None
+        self._last_snapshot_attempt_epoch = 0.0
         self._edit_pull_worker = None
         self._chat_send_worker = None
         self._chat_pull_worker = None
@@ -8300,6 +8303,8 @@ class LiveCollaborationController:
             self._worker = None
             self._realtime_worker = None
             self._edit_push_worker = None
+            self._snapshot_worker = None
+            self._last_snapshot_attempt_epoch = 0.0
             self._edit_pull_worker = None
             self._chat_send_worker = None
             self._chat_pull_worker = None
@@ -10134,55 +10139,7 @@ class LiveCollaborationController:
         if self.dirty_segments or self.pending_segment_deletions:
             self._prepare_outgoing()
 
-        push_idle = ((self._edit_push_worker is None or not self._edit_push_worker.is_alive())
-                     and self._transport_retry_ready("edit-push"))
-        snapshot_operations = []
-        snapshot_label = ""
-        should_snapshot = (
-            push_idle
-            and self.initial_sync_complete
-            and not self.outgoing
-            and not self.awaiting_echo
-            and not self.dirty_segments
-            and not self._local_encode_pending
-            and self._local_capture is None
-            and not self._incoming_operations
-            and (
-                self._snapshot_requested
-                or (
-                    self.last_sequence - self._last_snapshot_sequence >= 100
-                    and now - self._last_edit_activity_epoch
-                    >= AUTOMATIC_SNAPSHOT_IDLE_SECONDS
-                )
-            )
-        )
-        snapshot_base_sequence = None
-        snapshot_was_requested = False
-        if should_snapshot:
-            snapshot_operations = self._snapshot_operations(defer_encode=True)
-            snapshot_label = self._snapshot_label
-            # The snapshot describes the room exactly at this sequence.
-            snapshot_base_sequence = int(self.last_sequence)
-            snapshot_was_requested = bool(self._snapshot_requested)
-            self._snapshot_requested = False
-            self._snapshot_label = ""
-        if push_idle and self._transport_retry_ready("edit-push") and (self.outgoing or snapshot_operations):
-            self._edit_push_worker = threading.Thread(
-                target=self._edit_push_lane,
-                args=(
-                    self._session_token,
-                    self.client,
-                    self.room_id,
-                    list(self.outgoing),
-                    snapshot_operations,
-                    snapshot_label,
-                    snapshot_base_sequence,
-                    snapshot_was_requested,
-                ),
-                name="LiveSegmentation-edit-push",
-                daemon=True,
-            )
-            self._edit_push_worker.start()
+        self._start_edit_workers(now)
 
         pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
         incoming_bytes = sum(item["_packed"].bytes.nbytes for item in self._incoming_operations if "_packed" in item)
@@ -10354,6 +10311,52 @@ class LiveCollaborationController:
             )
             self._maintenance_worker.start()
 
+    def _start_edit_workers(self, now):
+        """Publish edits independently of potentially slow full checkpoints."""
+        push_idle = ((self._edit_push_worker is None or not self._edit_push_worker.is_alive())
+                     and self._transport_retry_ready("edit-push"))
+        if push_idle and self.outgoing:
+            self._edit_push_worker = threading.Thread(
+                target=self._edit_push_lane,
+                args=(self._session_token, self.client, self.room_id,
+                      list(self.outgoing), [], ""),
+                name="LiveSegmentation-edit-push", daemon=True)
+            self._edit_push_worker.start()
+            return
+        checkpoint_idle = self._snapshot_worker is None or not self._snapshot_worker.is_alive()
+        if not (push_idle and checkpoint_idle and self._transport_retry_ready("checkpoint")
+                and now - self._last_snapshot_attempt_epoch >= 5.0
+                and self.initial_sync_complete and not self.outgoing and not self.awaiting_echo
+                and not self.dirty_segments and not self.pending_segment_deletions
+                and not self._local_encode_pending and self._local_capture is None
+                and not self._incoming_operations):
+            return
+        automatic_due = (self.last_sequence - self._last_snapshot_sequence >= 100
+                         and now - self._last_edit_activity_epoch >= AUTOMATIC_SNAPSHOT_IDLE_SECONDS
+                         and now - self._last_snapshot_attempt_epoch >= AUTOMATIC_SNAPSHOT_INTERVAL_SECONDS)
+        if not (self._snapshot_requested or automatic_due):
+            return
+        operations = self._snapshot_operations(defer_encode=True)
+        if not operations:
+            return
+        self._last_snapshot_attempt_epoch = now
+        label, requested = self._snapshot_label, bool(self._snapshot_requested)
+        base_sequence = int(self.last_sequence)
+        self._snapshot_requested, self._snapshot_label = False, ""
+        self._snapshot_worker = threading.Thread(
+            target=self._checkpoint_lane,
+            args=(self._session_token, self.client, self.room_id, operations,
+                  label, base_sequence, requested),
+            name="LiveSegmentation-checkpoint", daemon=True)
+        self._snapshot_worker.start()
+
+    def _checkpoint_lane(self, session_token, client, room_id, operations,
+                         label, base_sequence, requested):
+        # Reuse encoding/publication and its expected-sequence safety guard,
+        # but report on a separate lane so backoff cannot block normal edits.
+        self._edit_push_lane(session_token, client, room_id, [], operations,
+                             label, base_sequence, requested, lane="checkpoint")
+
     def _edit_push_lane(
         self,
         session_token,
@@ -10364,6 +10367,7 @@ class LiveCollaborationController:
         snapshot_label,
         snapshot_base_sequence=None,
         snapshot_was_requested=False,
+        lane="edit-push",
     ):
         started = time.monotonic()
         try:
@@ -10454,7 +10458,7 @@ class LiveCollaborationController:
                     }
             self._worker_results.put(
                 {
-                    "lane": "edit-push",
+                    "lane": lane,
                     "session_token": session_token,
                     "outgoing_ids": outgoing_ids,
                     "rejected_ids": rejected_ids,
@@ -10469,7 +10473,7 @@ class LiveCollaborationController:
         except Exception as exc:
             self._worker_results.put(
                 {
-                    "lane": "edit-push",
+                    "lane": lane,
                     "session_token": session_token,
                     "error": str(exc),
                     "snapshot_was_requested": bool(snapshot_was_requested),
@@ -11514,7 +11518,7 @@ class LiveCollaborationController:
                     self.status_label.setStyleSheet(
                         "color: #b26a00; font-weight: bold;"
                     )
-                elif self._last_sync_duration >= 2.5:
+                elif (self._last_sync_duration or 0.0) >= 2.5:
                     self.status_label.setText(
                         f"● Slow connection ({self._last_sync_duration:.1f} s) — "
                         + self._live_status_text().lstrip("● ")

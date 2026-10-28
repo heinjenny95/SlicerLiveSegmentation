@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Full room checkpoints run independently of live edit uploads and their
+  acknowledgements. Wait for 30 seconds of room inactivity before automatic
+  checkpoints, space automatic attempts by 60 seconds and stale manual retries
+  by five seconds; retain immutable baselines and expected-sequence validation.
+
 - Bound the Windows worker-tree termination attempt to one second before
   force-stopping a stalled local SSH worker; cancellation remains asynchronous.
 
