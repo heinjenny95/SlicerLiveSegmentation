@@ -4005,9 +4005,72 @@ class SharedFolderRoomClient:
 
     def room_history(self, room_id, limit=500):
         room_path = self._require_room(room_id)
-        records = self._all_operation_records(room_path)
-        selected = records[-max(1, min(int(limit), 5000)) :]
+        selected = self._recent_operation_records(room_path, max(1, min(int(limit), 5000)))
         return [operation_summary(item, decode_mask_delta) for item in selected]
+
+    def _recent_operation_records(self, room_path, limit):
+        """Bound payload I/O before reading masks, including archived history.
+
+        The full replay API deliberately remains unbounded. Routine history
+        refreshes need only a recent page and must not inflate every old ZIP.
+        Read archives after loose files to tolerate concurrent compaction.
+        """
+        records = {}
+
+        def trim():
+            if len(records) > limit:
+                for sequence in sorted(records)[:-limit]:
+                    records.pop(sequence)
+
+        paths = sorted((sequence, path) for path in room_path.joinpath('operations').glob('*.json')
+                       if (sequence := self._operation_sequence(path)) is not None)[-limit:]
+
+        def read_active(item):
+            sequence, path = item
+            try:
+                return sequence, _read_json_file(path)
+            except LiveCollaborationError as exc:
+                if not isinstance(exc.__cause__, FileNotFoundError):
+                    raise
+                return None
+
+        for item in _parallel_map(read_active, paths):
+            if item is not None:
+                records[item[0]] = item[1]
+        state_path = room_path/'sequence-state.json'
+        if state_path.is_file():
+            try:
+                state = _read_json_file(state_path)
+                for operation in state.get('inline_operations') or []:
+                    sequence = int(operation.get('sequence', 0))
+                    if sequence > 0:
+                        records.setdefault(sequence, dict(operation))
+                trim()
+            except (LiveCollaborationError, TypeError, ValueError):
+                pass
+
+        def upper_bound(path):
+            match = re.match(r'^\d{20}-(\d{20})--', path.name)
+            return int(match.group(1)) if match else 10**40  # Legacy archives need inspection.
+
+        archives = sorted(room_path.joinpath('operation-archives').glob('*.zip'), key=upper_bound, reverse=True)
+        for archive in archives:
+            cutoff = min(records) if len(records) >= limit else 0
+            if upper_bound(archive) <= cutoff:
+                continue
+            try:
+                with zipfile.ZipFile(archive, 'r') as bundle:
+                    candidates = sorted((sequence, name) for name in bundle.namelist()
+                                        if (sequence := self._operation_sequence(Path(name))) is not None
+                                        and sequence > cutoff and sequence not in records)[-limit:]
+                    for sequence, name in candidates:
+                        records.setdefault(sequence, json.loads(bundle.read(name).decode('utf-8')))
+                trim()
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                raise LiveCollaborationError(f'Could not read history archive {archive.name}: {exc}') from exc
+        for sequence, operation in records.items():
+            operation['sequence'] = int(sequence)
+        return [records[key] for key in sorted(records)]
 
     def _tombstones_to_carry(self, room_path, before_sequence, live_segment_ids):
         """Return deletions that compaction is about to move out of the live feed.

@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Read only the requested recent history payloads instead of loading every
+  archived voxel operation on every SSH maintenance refresh. Bound ZIP reads,
+  skip older archive ranges and retain compaction-race recovery and full replay.
+
 - PERF-20261022-05: native Paint in large live rooms now keeps Slicer's brush
   rasterizer but resolves new voxel claims with bounded regional writes after
   native callbacks finish, avoiding global padding/erasure of distant layers.
