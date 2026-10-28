@@ -9,6 +9,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"LiveSegmentation"/"L
 from surface_preview import preview_mask  # noqa: E402
 
 
+def test_closed_editor_wrappers_do_not_break_scanning_or_restore(monkeypatch):
+    from types import SimpleNamespace
+
+    from surface_preview import SurfacePreview
+
+    from tests import controller_harness as h
+
+    h.install_fake_slicer(monkeypatch)
+    preview = SurfacePreview.__new__(SurfacePreview)
+    def deleted(*args):
+        raise ValueError('Internal C++ object already deleted')
+    dead = SimpleNamespace(segmentationNode=deleted, setVisible=deleted,
+                           setShow3DButtonVisible=deleted, hide=deleted,
+                           deleteLater=deleted)
+    node = object()
+    live = SimpleNamespace(segmentationNode=lambda: node)
+    preview.node, preview.owner = node, SimpleNamespace(_recovery_editor=dead)
+    preview.editors, preview.buttons = [(dead, True), (live, True)], [(dead, True)]
+    preview.proxies = [(dead, dead)]
+    slicer = sys.modules['slicer']
+    slicer.util.findChildren = lambda **kwargs: []
+    slicer.util.findChild = deleted
+    preview.scan_editors()
+    assert preview.editors == [(live, True)] and not preview.buttons
+    preview.editors.append((dead, True))
+    preview.buttons.append((dead, True))
+    live.setShow3DButtonVisible = lambda unused: None
+    preview._restore_editors()
+    assert not preview.editors and not preview.buttons and not preview.proxies
+
+
 def test_repeated_dirty_bounds_are_scanned_once_per_pooling_cell():
     from surface_preview import update_preview_mask
 

@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Tolerate destroyed Qt editor/button wrappers while scanning and restoring
+  the 3D preview controls, including PythonQt ValueError on module teardown.
+  Keep surviving editors active and discard stale proxy controls safely.
+
 - Full room checkpoints run independently of live edit uploads and their
   acknowledgements. Wait for 30 seconds of room inactivity before automatic
   checkpoints, space automatic attempts by 60 seconds and stale manual retries

@@ -276,7 +276,7 @@ class SurfacePreview:
                     continue
                 editor.setShow3DButtonVisible(visible)
                 self._remove_preview_button(slicer.util.findChild(editor, "Show3DButton"))
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 pass
             self.editors.remove((editor, visible))
         for button, visible in list(self.buttons):
@@ -285,12 +285,12 @@ class SurfacePreview:
                     continue
                 button.setVisible(visible)
                 self._remove_preview_button(button)
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 pass
             self.buttons.remove((button, visible))
         try:
             editors = slicer.util.findChildren(className="qMRMLSegmentEditorWidget")
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             return
         # Slicer's cached module widget can be outside the main-window tree
         # until it is first shown. Live already owns this existing editor.
@@ -298,24 +298,28 @@ class SurfacePreview:
         if standard is not None and not any(editor == standard for editor in editors):
             editors.append(standard)
         for editor in editors:
-            if editor.segmentationNode() != self.node or any(editor == item[0] for item in self.editors):
-                continue
-            # Public reversible API. Use the global preview action in any module
-            # instead of the synchronous native Show 3D button while in a room.
-            button = slicer.util.findChild(editor, "Show3DButton")
-            # isVisible() includes hidden module ancestors; isHidden() records
-            # the button's own state and can be restored after module changes.
-            was_visible = not button.isHidden()
-            self.editors.append((editor, was_visible))
-            self._add_preview_button(button)
-            editor.setShow3DButtonVisible(False)
-        for button in slicer.util.findChildren(className="qMRMLSegmentationShow3DButton"):
-            if any(button == slicer.util.findChild(editor, "Show3DButton") for editor, _ in self.editors):
-                continue
-            if button.segmentationNode() == self.node and not any(button == entry[0] for entry in self.buttons):
-                self.buttons.append((button, not button.isHidden()))
+            try:
+                if editor.segmentationNode() != self.node or any(editor == item[0] for item in self.editors):
+                    continue
+                # isHidden() records the button's own state even outside the
+                # visible module. Cached wrappers may outlive their C++ widget.
+                button = slicer.util.findChild(editor, "Show3DButton")
+                was_visible = not button.isHidden()
+                self.editors.append((editor, was_visible))
                 self._add_preview_button(button)
-                button.setVisible(False)
+                editor.setShow3DButtonVisible(False)
+            except (RuntimeError, ValueError):
+                continue
+        for button in slicer.util.findChildren(className="qMRMLSegmentationShow3DButton"):
+            try:
+                if any(button == slicer.util.findChild(editor, "Show3DButton") for editor, _ in self.editors):
+                    continue
+                if button.segmentationNode() == self.node and not any(button == entry[0] for entry in self.buttons):
+                    self.buttons.append((button, not button.isHidden()))
+                    self._add_preview_button(button)
+                    button.setVisible(False)
+            except (RuntimeError, ValueError):
+                continue
 
     def _add_preview_button(self, original):
         import qt
@@ -331,8 +335,11 @@ class SurfacePreview:
     def _remove_preview_button(self, original):
         for source, proxy in list(self.proxies):
             if source == original:
-                proxy.hide()
-                proxy.deleteLater()
+                try:
+                    proxy.hide()
+                    proxy.deleteLater()
+                except (RuntimeError, ValueError):
+                    pass
                 self.proxies.remove((source, proxy))
 
     def _restore_editors(self):
@@ -341,13 +348,13 @@ class SurfacePreview:
         for button, visible in self.buttons:
             try:
                 button.setVisible(visible)
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 pass
         self.buttons.clear()
         for editor, visible in self.editors:
             try:
                 editor.setShow3DButtonVisible(visible)
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 pass
         self.editors.clear()
 
