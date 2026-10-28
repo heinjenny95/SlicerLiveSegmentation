@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Bound the Windows worker-tree termination attempt to one second before
+  force-stopping a stalled local SSH worker; cancellation remains asynchronous.
+
 - Read only the requested recent history payloads instead of loading every
   archived voxel operation on every SSH maintenance refresh. Bound ZIP reads,
   skip older archive ranges and retain compaction-race recovery and full replay.

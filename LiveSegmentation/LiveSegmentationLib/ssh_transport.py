@@ -561,7 +561,7 @@ class SshProcessRoomClient(SshRoomClient):
                         # specific worker's subtree, never the owning Slicer.
                         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+                                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=1)
                     else:
                         process.terminate()
                 process.wait(timeout=5)
