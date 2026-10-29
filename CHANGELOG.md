@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep large SSH full-room checkpoints explicit maintenance above 256 tiles;
+  normal edits remain automatically journaled. Defer automatic checkpoints
+  during active IR inference, reject stale requests before background-I/O
+  waits and bound artifact-drain waits before returning a retryable busy result.
+
 - Acknowledge SSH edits before advisory conflict-history work, with one
   coalescing conflict worker per folder client. Skip committed checkpoint
   payload ranges before reading conflict candidates, retaining actual peer

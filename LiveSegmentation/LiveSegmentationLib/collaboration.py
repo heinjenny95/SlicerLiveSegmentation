@@ -4278,7 +4278,21 @@ class SharedFolderRoomClient:
         room_path = self._require_room(room_id)
         # Explicit compaction must include operations that are still inside the
         # hot-feed archive grace period.
-        self._artifact_queue.join()
+        if expected_sequence is not None:
+            head = self._read_sequence_head(room_path)
+            if head is not None and int(expected_sequence) != int(head):
+                return {"skipped": "stale", "expected_sequence": int(expected_sequence), "latest_sequence": int(head)}
+            # Stalled artifact/report storage must not tie up helper RPC slots
+            # for minutes. Retry the same guarded snapshot after work settles.
+            deadline = time.monotonic()+1.0
+            with self._artifact_queue.all_tasks_done:
+                while self._artifact_queue.unfinished_tasks:
+                    remaining = deadline-time.monotonic()
+                    if remaining <= 0:
+                        return {"skipped": "busy"}
+                    self._artifact_queue.all_tasks_done.wait(remaining)
+        else:
+            self._artifact_queue.join()
         if not segment_operations:
             return None
         group_id = str(uuid.uuid4())
@@ -10404,10 +10418,29 @@ class LiveCollaborationController:
                          and now - self._last_snapshot_attempt_epoch >= AUTOMATIC_SNAPSHOT_INTERVAL_SECONDS)
         if not (self._snapshot_requested or automatic_due):
             return
+        if not self._snapshot_requested:
+            import slicer
+            try:
+                from .active_work import nninteractive_busy
+            except ImportError:
+                from active_work import nninteractive_busy
+            modules = getattr(slicer, "modules", None)
+            if modules is not None and nninteractive_busy(modules):
+                return
         operations = self._snapshot_operations(defer_encode=True)
         if not operations:
             return
         self._last_snapshot_attempt_epoch = now
+        tile_count = sum(max(1, item["_snapshot_baseline"].chunk_count)
+                         if "_snapshot_baseline" in item else 1 for item in operations)
+        if (not self._snapshot_requested and getattr(self.client, "transport_kind", "") == "ssh-folder"
+                and tile_count > 256):
+            # Every edit is already journaled. Large full-room checkpoints are
+            # explicit maintenance, instead of automatic multi-minute uploads
+            # competing with active edits and consuming server helper slots.
+            self._diagnostic_event("checkpoint.deferred", reason="Large SSH room; use an explicit snapshot during a break",
+                                   estimated_operations=tile_count)
+            return
         label, requested = self._snapshot_label, bool(self._snapshot_requested)
         base_sequence = int(self.last_sequence)
         self._snapshot_requested, self._snapshot_label = False, ""
