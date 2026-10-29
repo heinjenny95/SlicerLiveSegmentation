@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Acknowledge SSH edits before advisory conflict-history work, with one
+  coalescing conflict worker per folder client. Skip committed checkpoint
+  payload ranges before reading conflict candidates, retaining actual peer
+  edits and archived/inline recovery. Limit live upload passes to eight edits.
+
 - Retry scoped prior-session work journals with their original interval IDs
   after rejoining. Persist per-journal acknowledged IDs without changing the
   source journals; transfer only the matching room/user and report accepted,

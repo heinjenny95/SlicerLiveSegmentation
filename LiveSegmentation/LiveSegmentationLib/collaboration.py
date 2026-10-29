@@ -1857,6 +1857,9 @@ class SharedFolderRoomClient:
         self._compaction_queue = queue.Queue()
         self._compaction_worker = None
         self._compaction_worker_lock = threading.Lock()
+        self._conflict_queue = queue.Queue()
+        self._conflict_worker = None
+        self._conflict_worker_lock = threading.Lock()
         self._known_presence_users = {self.user_name}
         self._presence_paths_cache = {}
         self._presence_records_cache = {}
@@ -2476,6 +2479,85 @@ class SharedFolderRoomClient:
             "work_log_file": str(room_path / "work-log.txt"),
         }
 
+    def _conflict_candidates(self, room_path, after_sequence, before_sequence):
+        # Committed manifests certify system-only sequence ranges. Their voxel
+        # payloads cannot conflict, so exclude them BEFORE opening large files.
+        ranges = []
+        for path in (room_path / "snapshots").glob("*.json"):
+            try:
+                item = _read_json_file(path)
+                first, last = int(item["first_sequence"]), int(item["last_sequence"])
+                if 0 < first <= last:
+                    ranges.append((first, last))
+            except (LiveCollaborationError, KeyError, ValueError, TypeError):
+                continue  # Unverified range => retain the conservative scan.
+
+        def needed(sequence):
+            return (after_sequence < sequence < before_sequence
+                    and not any(first <= sequence <= last for first, last in ranges))
+
+        records = {}
+        for path in (room_path / "operations").glob("*.json"):
+            sequence = self._operation_sequence(path)
+            if sequence is None or not needed(sequence):
+                continue
+            try:
+                records[sequence] = _read_json_file(path)
+            except LiveCollaborationError as exc:
+                if not isinstance(exc.__cause__, FileNotFoundError):
+                    raise
+        # Enumerate archives after loose payloads to cover concurrent compaction.
+        for path in (room_path / "operation-archives").glob("*.zip"):
+            with zipfile.ZipFile(path) as bundle:
+                for name in bundle.namelist():
+                    sequence = self._operation_sequence(Path(name))
+                    if sequence is not None and sequence not in records and needed(sequence):
+                        records[sequence] = json.loads(bundle.read(name).decode("utf-8"))
+        state_path = room_path / "sequence-state.json"
+        if state_path.is_file():
+            for item in _read_json_file(state_path).get("inline_operations") or []:
+                sequence = int(item.get("sequence", 0))
+                if needed(sequence):
+                    records.setdefault(sequence, dict(item))
+        return [item for _, item in sorted(records.items())]
+
+    def _queue_conflict_analysis(self, room_id, room_path, operation, stored, sequence, base_sequence):
+        with self._conflict_worker_lock:
+            self._conflict_queue.put((room_id, room_path, dict(operation), dict(stored), sequence, base_sequence))
+            if self._conflict_worker is not None:
+                return
+
+            def drain():
+                time.sleep(0.75)
+                while True:
+                    with self._conflict_worker_lock:
+                        jobs = []
+                        while len(jobs) < 64:
+                            try:
+                                jobs.append(self._conflict_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        if not jobs:
+                            self._conflict_worker = None
+                            return
+                    try:
+                        by_room = {}
+                        for job in jobs:
+                            by_room.setdefault(job[1], []).append(job)
+                        for path, room_jobs in by_room.items():
+                            candidates = self._conflict_candidates(path, min(j[5] for j in room_jobs), max(j[4] for j in room_jobs))
+                            for job in room_jobs:
+                                self._analyze_operation_conflicts(*job, candidates=candidates)
+                    except Exception:
+                        logging.exception("Deferred collaboration conflict analysis failed")
+                    finally:
+                        for _ in jobs:
+                            self._conflict_queue.task_done()
+
+            self._conflict_worker = threading.Thread(target=drain, daemon=True,
+                                                     name="LiveSegmentation-conflict-analysis")
+            self._conflict_worker.start()
+
     def _analyze_operation_conflicts(
         self,
         room_id,
@@ -2484,6 +2566,7 @@ class SharedFolderRoomClient:
         stored,
         sequence,
         base_sequence,
+        candidates=None,
     ):
         conflicts = []
         segment_id = str(operation.get("segment_id") or "")
@@ -2491,7 +2574,9 @@ class SharedFolderRoomClient:
             operation.get("operation_kind") != "snapshot"
             or operation.get("segment_deleted")
         ):
-            for previous in self.operations(room_id, base_sequence, limit=5000):
+            if candidates is None:
+                candidates = self._conflict_candidates(room_path, base_sequence, sequence)
+            for previous in candidates:
                 previous_sequence = int(previous.get("sequence", 0))
                 if previous_sequence <= base_sequence or previous_sequence >= sequence:
                     continue
@@ -2762,25 +2847,7 @@ class SharedFolderRoomClient:
                 epoch=datetime.fromisoformat(stored["created_at"]).timestamp(),
             )
         if defer_conflicts:
-            def analyze_later():
-                time.sleep(0.75)
-                try:
-                    self._analyze_operation_conflicts(
-                        room_id,
-                        room_path,
-                        operation,
-                        stored,
-                        sequence,
-                        base_sequence,
-                    )
-                except Exception:
-                    pass
-
-            threading.Thread(
-                target=analyze_later,
-                name="LiveSegmentation-conflict-analysis",
-                daemon=True,
-            ).start()
+            self._queue_conflict_analysis(room_id, room_path, operation, stored, sequence, base_sequence)
             return {"sequence": sequence, "duplicate": False}
 
         conflicts = self._analyze_operation_conflicts(
@@ -10320,7 +10387,7 @@ class LiveCollaborationController:
             self._edit_push_worker = threading.Thread(
                 target=self._edit_push_lane,
                 args=(self._session_token, self.client, self.room_id,
-                      list(self.outgoing), [], ""),
+                      list(self.outgoing[:8]), [], ""),
                 name="LiveSegmentation-edit-push", daemon=True)
             self._edit_push_worker.start()
             return
@@ -10396,7 +10463,8 @@ class LiveCollaborationController:
                 }
                 for operation in group:
                     try:
-                        if _uses_shared_folder(client):
+                        if (_uses_shared_folder(client)
+                                or getattr(client, "transport_kind", "") == "ssh-folder"):
                             pushed = client.push_operation(
                                 room_id, operation, defer_conflicts=True
                             )
