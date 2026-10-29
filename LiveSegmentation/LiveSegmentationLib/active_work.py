@@ -301,7 +301,8 @@ class WorkTimeUI:
             from .work_time_transfer import WorkIntervalTransfer
         except ImportError:
             from work_time_transfer import WorkIntervalTransfer
-        self.local_log.interval_transfer = WorkIntervalTransfer(self.local_log, self.controller.user_name)
+        self.local_log.interval_transfer = WorkIntervalTransfer(
+            self.local_log, self.controller.user_name, getattr(self.controller, "room_created_at", None))
         self.pending = []
         self.error = ""
         self.clock = ActiveWorkClock(session_id, self._sample, idle_seconds=self.idle_spin.value)

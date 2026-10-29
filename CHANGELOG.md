@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Constrain historical work-time replay to the current room creation epoch,
+  so deleting/recreating a simple room name cannot import an older dataset's
+  measurements. Preserve unassignable journals for review instead of uploading.
+
 - Treat a not-yet-created local recovery scope as an empty first session,
   rather than reporting a transfer failure before the first journal is written.
 

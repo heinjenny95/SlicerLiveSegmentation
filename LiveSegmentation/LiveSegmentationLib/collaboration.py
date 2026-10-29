@@ -2474,6 +2474,7 @@ class SharedFolderRoomClient:
             "name": metadata.get("name") or str(room_name).strip(),
             "created": created,
             "created_by": metadata.get("created_by"),
+            "created_at": metadata.get("created_at"),
             "latest_sequence": latest_sequence,
             "presence": self._read_presence(room_path),
             "work_log_file": str(room_path / "work-log.txt"),
@@ -8312,6 +8313,7 @@ class LiveCollaborationController:
                 self._remember_recent_shared_folder(client.location)
                 qt.QSettings().setValue(self.SETTINGS_PREFIX + "sshUser", client.username)
             self.room_id = room["id"]
+            self.room_created_at = room.get("created_at")
             self.room_name = str(room["name"])
             self.user_name = context["user_name"]
             self.segmentation_node_id = segmentation_node.GetID()

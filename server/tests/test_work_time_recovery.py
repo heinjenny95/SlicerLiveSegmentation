@@ -31,11 +31,11 @@ def test_restart_recovers_only_matching_user_and_acknowledged_ids_stay_acked(tmp
     current = RoomWorkLog(tmp_path/('b'*32), create_room=True)
     current.submit('work.interval', 'Alice', 'session-one', two)
     assert current.flush(3)
-    transfer = WorkIntervalTransfer(current, 'Alice')
+    transfer = WorkIntervalTransfer(current, 'Alice', created_after=90)
     batch, _ = transfer.choose([two])
     assert {s['sample_id'] for s in batch} == {one['sample_id'], two['sample_id']}
     transfer.acknowledge([one['sample_id']])
-    restarted = WorkIntervalTransfer(current, 'Alice')
+    restarted = WorkIntervalTransfer(current, 'Alice', created_after=90)
     batch, _ = restarted.choose([two])
     assert [s['sample_id'] for s in batch] == [two['sample_id']]
     restarted.acknowledge([two['sample_id']])
@@ -67,7 +67,7 @@ def test_controller_retries_old_journal_even_without_new_current_samples(tmp_pat
     assert old.flush(3)
     current = RoomWorkLog(tmp_path/('e'*32), create_room=True)
     current.room_path.mkdir()
-    current.interval_transfer = WorkIntervalTransfer(current, 'Alice')
+    current.interval_transfer = WorkIntervalTransfer(current, 'Alice', created_after=90)
     client = MagicMock()
     client.record_work_intervals.return_value = {'accepted_ids':[item['sample_id']]}
     c._work_time_lane(c._session_token, client, 'room', [], current)
@@ -93,3 +93,15 @@ def test_time_transfer_reports_error_text_and_elapsed_time(monkeypatch):
     c._drain_worker_results()
     assert any(call.args[0]=='work_time.transfer' and call.kwargs.get('error')=='Explicit transfer failure'
                for call in c._diagnostic_event.call_args_list)
+
+
+def test_recreated_room_does_not_import_previous_room_generation(tmp_path):
+    old = RoomWorkLog(tmp_path/('1'*32), create_room=True)
+    item = sample('old-generation-sample')
+    old.submit('work.interval', 'Alice', 'session-one', item)
+    assert old.flush(3)
+    current = RoomWorkLog(tmp_path/('2'*32), create_room=True)
+    current.room_path.mkdir()
+    transfer = WorkIntervalTransfer(current, 'Alice')
+    transfer.created_after = 110.0
+    assert transfer.choose([])[0] == [], 'Prior generation intervals were imported into a recreated room'

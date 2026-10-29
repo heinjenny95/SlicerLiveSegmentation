@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime
 
 try:
     from .work_log import read_records, validate_work_samples
@@ -11,7 +12,7 @@ except ImportError:
 
 
 class WorkIntervalTransfer:
-    def __init__(self, local_log, user):
+    def __init__(self, local_log, user, created_after=None):
         self.current = local_log.room_path
         self.user = str(user)
         self.records = {}
@@ -21,6 +22,11 @@ class WorkIntervalTransfer:
         self.warnings = []
         self.inflight = set()
         self.recovered_count = 0
+        try:
+            self.created_after = (float(created_after) if isinstance(created_after, (int, float))
+                                  else datetime.fromisoformat(created_after).timestamp())
+        except (ValueError, TypeError):
+            self.created_after = None
 
     def _load(self):
         parent = self.current.parent.resolve()
@@ -46,6 +52,13 @@ class WorkIntervalTransfer:
                     sample = validate_work_samples([record['details']])[0]
                 except (KeyError, TypeError, ValueError) as exc:
                     self.warnings.append(str(exc))
+                    continue
+                if run != self.current and (self.created_after is None
+                                             or sample['start_epoch'] < self.created_after):
+                    # Room names/paths can be reused after deletion, including
+                    # for a different source volume. Keep ambiguous journals
+                    # intact; never silently attribute them to the new room.
+                    self.warnings.append('Historical interval predates this room or room generation is unavailable')
                     continue
                 self.records[sample['sample_id']] = (run, sample)
         self.loaded = True
