@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Acknowledge work intervals after the corresponding journal fsync, separately
+  from slow derived TXT rendering. Submission generations keep newly queued
+  intervals unacknowledged until their own durable append completes.
+
 - Tolerate destroyed Qt editor/button wrappers while scanning and restoring
   the 3D preview controls, including PythonQt ValueError on module teardown.
   Keep surviving editors active and discard stale proxy controls safely.

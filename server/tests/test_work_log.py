@@ -15,6 +15,50 @@ from collaboration import SharedFolderRoomClient, encode_mask_delta  # noqa: E40
 from work_log import RoomWorkLog, read_records, render_report  # noqa: E402
 
 
+def test_durable_interval_ack_does_not_wait_for_slow_txt_render(tmp_path, monkeypatch):
+    import work_log
+    entered, release = threading.Event(), threading.Event()
+    original = work_log.render_report
+    def slow_report(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+    monkeypatch.setattr(work_log, 'render_report', slow_report)
+    log = RoomWorkLog(tmp_path)
+    log.submit('test', 'Alice', 'session', event_id='durable-event')
+    try:
+        # Force the private journal lane to start; report work may continue.
+        result = log.flush(.2, report=False)
+        assert entered.wait(1)
+        assert result, 'Already-fsynced intervals were rejected while TXT was rendering'
+        assert any(r['id']=='durable-event' for r in read_records(tmp_path)[0])
+    finally:
+        release.set()
+        assert log.flush(5)
+
+
+def test_new_interval_during_report_must_be_durable_before_ack(tmp_path, monkeypatch):
+    import work_log
+    entered, release = threading.Event(), threading.Event()
+    original = work_log.render_report
+    def slow_report(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+    monkeypatch.setattr(work_log, 'render_report', slow_report)
+    log = RoomWorkLog(tmp_path)
+    log.submit('test', 'Alice', 'session', event_id='first-event')
+    log.flush(.1, report=False)
+    assert entered.wait(1)
+    try:
+        log.submit('test', 'Alice', 'session', event_id='later-event')
+        assert not log.flush(.05, report=False), 'An unpersisted interval was acknowledged'
+    finally:
+        release.set()
+        assert log.flush(5)
+    assert log.flush(.05, report=False)
+
+
 def test_room_produces_persistent_txt_with_both_people_and_actions(tmp_path):
     alice = SharedFolderRoomClient(tmp_path, "Alice")
     bob = SharedFolderRoomClient(tmp_path, "Bob")

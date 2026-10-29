@@ -321,6 +321,9 @@ class RoomWorkLog:
         self._worker = None
         self._busy = False
         self._completed_batches = 0
+        self._submitted_generation = 0
+        self._durable_generation = 0
+        self._batch_generation = 0
         self._urgent = False
         self._force_report = False
         self._last_report = 0.0
@@ -349,6 +352,7 @@ class RoomWorkLog:
         record = self._record(event, user, session_id, details, event_id, epoch)
         with self._guard:
             self._pending.append(record)
+            self._submitted_generation += 1
             self._urgent |= event in {"room.join", "room.leave"}
             self._force_report |= event in {"room.join", "room.leave"}
             self._start_worker()
@@ -362,6 +366,7 @@ class RoomWorkLog:
                 return
             self._last_heartbeat[key] = now
             self._heartbeats[key] = self._record("room.heartbeat", *key, epoch=epoch)
+            self._submitted_generation += 1
             self._start_worker()
             self._guard.notify_all()
 
@@ -397,6 +402,7 @@ class RoomWorkLog:
                         self._guard.notify_all()
                         return
                 self._busy = True
+                self._batch_generation = self._submitted_generation
             try:
                 self._persist(records, force_report=force_report or bool(self.error))
                 self.error = ""
@@ -432,6 +438,12 @@ class RoomWorkLog:
                 os.fsync(stream.fileno())
             self._dirty_report = True
         self.saved_at = utc_stamp(time.time())
+        # A derived TXT report can be much slower than journal fsync. Remote
+        # interval acknowledgements require the journal barrier, not a complete
+        # re-render of all historical attendance/actions from every writer.
+        with self._guard:
+            self._durable_generation = max(self._durable_generation, self._batch_generation)
+            self._guard.notify_all()
         if not force_report and time.monotonic() - self._last_report < REPORT_SECONDS:
             return
         with self.report_lock() if callable(self.report_lock) else self.report_lock:
@@ -456,10 +468,18 @@ class RoomWorkLog:
         deadline = time.monotonic() + timeout
         with self._guard:
             completed_before = self._completed_batches
+            target_generation = self._submitted_generation
             self._urgent = True
             self._force_report |= bool(report)
             self._start_worker()
             self._guard.notify_all()
+            if not report:
+                while self._durable_generation < target_generation:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or (self.error and self._completed_batches > completed_before):
+                        return False
+                    self._guard.wait(remaining)
+                return True
             while self._urgent or self._pending or self._heartbeats or self._busy:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or (self.error and self._completed_batches > completed_before):
