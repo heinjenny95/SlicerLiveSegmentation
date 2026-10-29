@@ -8,6 +8,9 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Treat a not-yet-created local recovery scope as an empty first session,
+  rather than reporting a transfer failure before the first journal is written.
+
 - Keep large SSH full-room checkpoints explicit maintenance above 256 tiles;
   normal edits remain automatically journaled. Defer automatic checkpoints
   during active IR inference, reject stale requests before background-I/O

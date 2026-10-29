@@ -15,6 +15,13 @@ def sample(identifier):
                 idle_threshold_seconds=60, nninteractive_busy=False)
 
 
+def test_first_session_can_scan_a_not_yet_created_local_scope(tmp_path):
+    log = RoomWorkLog(tmp_path/'new-scope'/('f'*32), create_room=True)
+    transfer = WorkIntervalTransfer(log, 'Alice')
+    batch, already = transfer.choose([])
+    assert batch == already == [] and not transfer.has_pending
+
+
 def test_restart_recovers_only_matching_user_and_acknowledged_ids_stay_acked(tmp_path):
     old = RoomWorkLog(tmp_path/('a'*32), create_room=True)
     one, two = sample('original-sample-1'), sample('original-sample-2')

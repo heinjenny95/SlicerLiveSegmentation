@@ -24,6 +24,9 @@ class WorkIntervalTransfer:
 
     def _load(self):
         parent = self.current.parent.resolve()
+        if not parent.is_dir():
+            self.loaded = True
+            return
         for run in sorted(parent.iterdir()):
             if (not run.is_dir() or not re.fullmatch(r'[a-f0-9]{32}', run.name)
                     or run.resolve().parent != parent):
