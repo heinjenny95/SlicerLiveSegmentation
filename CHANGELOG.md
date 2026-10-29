@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Retry scoped prior-session work journals with their original interval IDs
+  after rejoining. Persist per-journal acknowledged IDs without changing the
+  source journals; transfer only the matching room/user and report accepted,
+  recovered and pending counts plus actual error messages and elapsed time.
+
 - Acknowledge work intervals after the corresponding journal fsync, separately
   from slow derived TXT rendering. Submission generations keep newly queued
   intervals unacknowledged until their own durable append completes.

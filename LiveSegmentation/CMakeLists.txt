@@ -9,6 +9,7 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/surface_preview.py
   LiveSegmentationLib/features.py
   LiveSegmentationLib/work_log.py
+  LiveSegmentationLib/work_time_transfer.py
   LiveSegmentationLib/active_work.py
   LiveSegmentationLib/roi_geometry.py
   LiveSegmentationLib/editor_preprocessing.py

@@ -297,6 +297,11 @@ class WorkTimeUI:
         root = Path(qt.QStandardPaths.writableLocation(qt.QStandardPaths.GenericDataLocation))
         root = root / "LiveSegmentation" / "work-time-recovery" / key / uuid.uuid4().hex
         self.local_log = RoomWorkLog(root, create_room=True)
+        try:
+            from .work_time_transfer import WorkIntervalTransfer
+        except ImportError:
+            from work_time_transfer import WorkIntervalTransfer
+        self.local_log.interval_transfer = WorkIntervalTransfer(self.local_log, self.controller.user_name)
         self.pending = []
         self.error = ""
         self.clock = ActiveWorkClock(session_id, self._sample, idle_seconds=self.idle_spin.value)

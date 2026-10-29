@@ -10225,7 +10225,8 @@ class LiveCollaborationController:
             self._lock_pull_worker.start()
 
         presence_idle = self._presence_worker is None or not self._presence_worker.is_alive()
-        if (self.work_time is not None and self.work_time.pending
+        if (self.work_time is not None and (self.work_time.pending
+                or getattr(getattr(self.work_time.local_log, "interval_transfer", None), "has_pending", False))
                 and (self._work_time_worker is None or not self._work_time_worker.is_alive())
                 and now - self._last_work_time_send >= 5.0):
             self._last_work_time_send = now
@@ -10595,12 +10596,26 @@ class LiveCollaborationController:
 
     def _work_time_lane(self, session_token, client, room_id, samples, local_log):
         result = {"lane": "work-time", "session_token": session_token}
+        started = time.monotonic()
         try:
             if not local_log.flush(3.0, report=False):
                 raise LiveCollaborationError("Local work-time backup could not be confirmed")
-            result.update(client.record_work_intervals(room_id, samples))
+            transfer = getattr(local_log, "interval_transfer", None)
+            already = []
+            if transfer is not None:
+                samples, already = transfer.choose(samples)
+            response = client.record_work_intervals(room_id, samples) if samples else {"accepted_ids": []}
+            accepted = list(response.get("accepted_ids") or [])
+            if transfer is not None:
+                transfer.acknowledge(accepted)
+                result.update(recovered_count=transfer.recovered_count,
+                              recovery_pending=transfer.has_pending,
+                              recovery_warnings=len(transfer.warnings))
+            result.update(response)
+            result["accepted_ids"] = accepted + already
         except Exception as exc:
             result["error"] = str(exc)
+        result["duration"] = time.monotonic()-started
         self._worker_results.put(result)
 
     def _presence_lane(self, session_token, client, room_id, details):
@@ -11176,6 +11191,12 @@ class LiveCollaborationController:
                 continue
             lane = str(result.get("lane") or "sync")
             if lane == "work-time":
+                self._diagnostic_event("work_time.transfer", duration_s=float(result.get("duration") or 0),
+                                       accepted_count=len(result.get("accepted_ids") or []),
+                                       recovered_count=int(result.get("recovered_count") or 0),
+                                       recovery_pending=bool(result.get("recovery_pending")),
+                                       recovery_warnings=int(result.get("recovery_warnings") or 0),
+                                       error=str(result.get("error") or ""))
                 if self.work_time is not None:
                     self.work_time.acknowledge(result.get("accepted_ids") or [])
                     error = str(result.get("error") or "")
