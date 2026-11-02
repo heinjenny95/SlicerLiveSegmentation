@@ -68,7 +68,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self.navigation_action = None
         self.ir_navigation_action = None
         self.diagnostics_action = None
-        self.surface_preview = None
 
     def setup(self):
         super().setup()
@@ -161,9 +160,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
     def cleanup(self):
         if vars(slicer.modules).get("LiveSegmentationWidget") is self:
             del slicer.modules.LiveSegmentationWidget
-        if self.surface_preview is not None:
-            self.surface_preview.cleanup()
-            self.surface_preview = None
         if self._source_range_preprocessing is not None:
             self._source_range_preprocessing.cleanup()
             self._source_range_preprocessing = None
@@ -210,9 +206,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         controller = getattr(self, "live_collaboration", None)
         if controller is not None:
             controller._diagnostic_event("gui.module_selected", module=str(module_name))
-        preview = getattr(self, "surface_preview", None)
-        if preview is not None and preview.node is not None:
-            qt.QTimer.singleShot(0, preview.scan_editors)
         if module_name != "SegmentEditor" or not self._live_session_active:
             return
         segmentation = self.get_segmentation_node()
@@ -257,12 +250,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         diagnostics.setToolTip("Persistent errors and local diagnostic logs; available in every module")
         diagnostics.triggered.connect(self.live_collaboration.show_diagnostic_history)
         self.diagnostics_action = diagnostics
-        preview = toolbar.addAction("3D preview")
-        preview.setCheckable(True)
-        preview.setToolTip("Fast approximate local 3D preview; labels and exports remain full resolution. Replaces native Show 3D during a live room.")
-        from LiveSegmentationLib.surface_preview import SurfacePreview
-
-        self.surface_preview = SurfacePreview(self, preview)
         main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
         self.navigation_toolbar = toolbar
         self.navigation_action = action
@@ -318,9 +305,6 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
     def set_live_session_active(self, active):
         active = bool(active)
         self._live_session_active = active
-        preview = getattr(self, "surface_preview", None)
-        if preview is not None:
-            preview.bind(self.get_segmentation_node() if active else None)
         self.open_segment_editor_button.enabled = active
         editor = self._standard_segment_editor_widget()
         if active:
@@ -1056,9 +1040,12 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         # numpy_to_vtk retains the NumPy owner for this zero-copy scalar buffer.
         image.GetPointData().SetScalars(numpy_support.numpy_to_vtk(target.reshape(-1), deep=False))
         image.SetGeometryFromImageToWorldMatrix(matrix)
+        native_surface = segmentation.ContainsRepresentation("Closed surface")
         segment.RemoveAllRepresentations(binary_name)
         segment.AddRepresentation(binary_name, image)
         segment.Modified()
+        if native_surface:
+            segmentation.CreateRepresentation("Closed surface")
 
     @classmethod
     def stage_checkpoint_segment_steps(cls, node, segment_id, volume, baseline, previous, preserve_local):
@@ -1130,6 +1117,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             current_matrix = cls._reference_ijk_to_segmentation_ras_matrix(stage["volume"], node)
             if current_matrix is None or not cls._matrices_match(current_matrix, stage["matrix"]):
                 return False
+        native_surface = segmentation.ContainsRepresentation("Closed surface")
         with slicer.util.RenderBlocker():
             modify = node.StartModify()
             try:
@@ -1141,6 +1129,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                     segment.Modified()
             finally:
                 node.EndModify(modify)
+            if native_surface:
+                segmentation.CreateRepresentation("Closed surface")
         return True
 
     @classmethod
@@ -1190,6 +1180,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 for other_id in segmentation.GetSegmentIDs()
             )
             if contained and isolated and cls._matrices_match(image_matrix, reference_matrix):
+                native_surface = segmentation.ContainsRepresentation("Closed surface")
                 internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
                     segmentation_node, segment_id
                 )
@@ -1201,6 +1192,10 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 # through vtkSegmentation's global source-image observer.
                 segment.RemoveAllRepresentations(binary_name)
                 segment.Modified()
+                if native_surface:
+                    # Preserve the representation the user requested through
+                    # native Show 3D, using Slicer's own conversion parameters.
+                    segmentation.CreateRepresentation("Closed surface")
                 return True
         if segment.GetRepresentation(binary_name) is None:
             segmentation.CreateRepresentation(binary_name)

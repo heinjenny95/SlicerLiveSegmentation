@@ -90,8 +90,8 @@ class PersonalVisibility:
             changed |= self.states.get(sid) != state
             self.states[sid] = state
         if changed:
-            # No global visibility flags: fast 3D preview temporarily hides the
-            # original surfaces. Persisting that flag would hide ALL next time.
+            # Persist personal per-label choices. Global view visibility stays
+            # under the native Slicer controls, not these room preferences.
             self.settings.setValue(self.key, json.dumps(self.states, sort_keys=True))
             self.settings.sync()
 

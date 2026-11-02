@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Remove the approximate 3D preview and all native Show 3D button replacement,
+  mesh removal, visibility override and background preview jobs. Native Slicer
+  controls remain available in a room and keep their conversion settings.
+  Regional writes and checkpoint pointer swaps recreate an already-requested
+  native closed surface using Slicer's converter; 2D-only work does not create
+  surfaces. Retain label dragging, delete confirmation, locks and diagnostics.
+
 - Constrain historical work-time replay to the current room creation epoch,
   so deleting/recreating a simple room name cannot import an older dataset's
   measurements. Preserve unassignable journals for review instead of uploading.

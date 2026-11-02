@@ -6,7 +6,6 @@ set(MODULE_PYTHON_SCRIPTS
   LiveSegmentationLib/collaboration.py
   LiveSegmentationLib/checkpoints.py
   LiveSegmentationLib/diagnostics.py
-  LiveSegmentationLib/surface_preview.py
   LiveSegmentationLib/features.py
   LiveSegmentationLib/work_log.py
   LiveSegmentationLib/work_time_transfer.py
