@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Skip immutable history archives whose valid filename sequence range lies
+  wholly outside the advisory conflict window before opening the ZIP directory.
+  Intersecting archives and legacy, malformed or reversed range names retain
+  conservative candidate inspection and existing loose-record precedence.
+
 - Inspect immutable operation filenames once per fresh shared-folder write,
   combining legacy retry lookup with sequence allocation. Keep inline/receipt
   retries immediate and retain filename authority when both cached heads are

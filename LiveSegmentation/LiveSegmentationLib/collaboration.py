@@ -2646,6 +2646,14 @@ class SharedFolderRoomClient:
                     raise
         # Enumerate archives after loose payloads to cover concurrent compaction.
         for path in (room_path / "operation-archives").glob("*.zip"):
+            bounds = re.match(r"^(\d{20})-(\d{20})--", path.name)
+            if bounds:
+                first, last = int(bounds[1]), int(bounds[2])
+                if 0 < first <= last and (last <= after_sequence or first >= before_sequence):
+                    # Canonical immutable archive bounds cannot intersect this
+                    # open conflict window. Legacy/malformed/reversed bounds
+                    # retain the full conservative member scan below.
+                    continue
             with zipfile.ZipFile(path) as bundle:
                 for name in bundle.namelist():
                     sequence = self._operation_sequence(Path(name))
