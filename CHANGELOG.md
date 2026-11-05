@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Reject spatially distant sparse label baselines before applying received
+  exclusive voxel claims. A small incoming tile no longer allocates/scans a
+  dense crop for every anatomical label on the GUI thread; overlapping and
+  retained deleted-label ownership still follows the ordered operations.
+
 - Remove the approximate 3D preview and all native Show 3D button replacement,
   mesh removal, visibility override and background preview jobs. Native Slicer
   controls remain available in a room and keep their conversion settings.

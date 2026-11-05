@@ -781,6 +781,11 @@ class ChunkedMaskBaseline:
                     )
                     yield coordinate, region_slices, chunk_slices
 
+    def has_stored_region(self, bounds):
+        """Conservatively reject a region with no stored nonzero chunks."""
+        return any(coordinate in self.chunks
+                   for coordinate, _, _ in self._intersections(bounds))
+
     def region(self, bounds):
         z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
         result = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.uint8)
@@ -12965,6 +12970,11 @@ class LiveCollaborationController:
             if baseline is None:
                 # A label that has not entered the ordered shared state yet is
                 # an unsent local edit. Do not erase it before it gets a turn.
+                continue
+            if isinstance(baseline, ChunkedMaskBaseline) and not baseline.has_stored_region(operation_bounds):
+                # Most anatomical labels are distant from a received tile.
+                # Sparse occupancy proves those empty without allocating and
+                # scanning a dense 64-cubed crop for every label on the GUI.
                 continue
             server_before = _baseline_region(baseline, operation_bounds)
             if not np.any(server_before[claimed]):
