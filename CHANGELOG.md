@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Bootstrap fresh shared-folder and SSH readers from the latest validated,
+  committed room checkpoint even while older loose history remains. Read its
+  immutable parts by exact name and finish the same transaction from its ZIP
+  archive if concurrent compaction moves it. Reuse a filename-only catch-up
+  catalog seeded by the single join validation scan, refresh it on gaps and
+  compaction, and extend it from complete recent tails. Bound operation pages
+  to 8 MiB encoded data, allowing an individually larger legacy operation.
+
 - Bound the local timeline to 1000 payload-free summaries, retain only the last
   1000 activity text blocks, and filter new rows incrementally during replay.
   Retain the latest own shared-edit Undo target

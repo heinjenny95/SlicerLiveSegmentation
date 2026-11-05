@@ -32,6 +32,7 @@ import urllib.request
 import uuid
 import zipfile
 import zlib
+from bisect import bisect_right
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -110,6 +111,7 @@ RECENT_FEED_LIMIT = 1000
 HISTORY_ROW_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
+OPERATION_PAGE_BYTES_LIMIT = 8 * 1024 * 1024
 SEQUENCE_HEAD_FILENAME = "sequence-head.json"
 SHARED_JSON_READ_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.12, 0.16)
 # Institutional SMB shares may need several seconds for a cold DNS, VPN,
@@ -1233,7 +1235,6 @@ def operation_defect(operation, volume_shape=None):
     return validated_operation_mask(operation, volume_shape)[0]
 
 
-
 def validated_operation_mask(operation, volume_shape=None, resident_limit=None):
     """Validate foreign data and return its one locally constructed decoder."""
     order = operation.get("segment_order")
@@ -1406,7 +1407,6 @@ def incoming_operation_bytes(operation):
         public = {key: value for key, value in operation.items() if key != "payload" and not key.startswith("_")}
         metadata = 4096 + 2 * len(json.dumps(public, ensure_ascii=True))
     return len(operation.get("payload") or "") + int(resident) + int(metadata)
-
 
 
 def operation_changed_voxel_count(operation):
@@ -1951,6 +1951,9 @@ class SharedFolderRoomClient:
         self._last_presence_directory_scan = 0.0
         self._last_operation_recovery_scan = 0.0
         self._last_chat_recovery_scan = 0.0
+        self._operation_catalog = None
+        self._operation_catalog_guard = threading.Lock()
+        self._bootstrap_checkpoint = None
         self.work_log = None
 
     @staticmethod
@@ -2005,7 +2008,7 @@ class SharedFolderRoomClient:
             label="live-operation watermark",
         )
 
-    def _latest_sequence(self, room_path):
+    def _latest_sequence(self, room_path, immutable_entries=None):
         state_path = room_path / "sequence-state.json"
         latest = self._read_sequence_head(room_path) or 0
         if state_path.is_file():
@@ -2019,25 +2022,29 @@ class SharedFolderRoomClient:
         # another computer has published an immutable operation file.
         operations_path = room_path / "operations"
         try:
-            candidates = operations_path.glob("*.json")
-            for path in candidates:
-                sequence = self._operation_sequence(path)
-                if sequence is not None:
-                    latest = max(latest, sequence)
+            if immutable_entries is None:
+                immutable_entries = (
+                    (sequence, path) for path in operations_path.glob("*.json")
+                    if (sequence := self._operation_sequence(path)) is not None
+                )
+            latest = max(latest, max((sequence for sequence, _ in immutable_entries), default=0))
         except OSError as exc:
             raise LiveCollaborationError(
                 f"Could not list shared operations in {operations_path}: {exc}"
             ) from exc
         return latest
 
-    def _duplicate_operation_sequences(self, room_path):
+    def _duplicate_operation_sequences(self, room_path, immutable_entries=None):
         counts = {}
         operations_path = room_path / "operations"
         try:
-            for path in operations_path.glob("*.json"):
-                sequence = self._operation_sequence(path)
-                if sequence is not None:
-                    counts[sequence] = counts.get(sequence, 0) + 1
+            if immutable_entries is None:
+                immutable_entries = (
+                    (sequence, path) for path in operations_path.glob("*.json")
+                    if (sequence := self._operation_sequence(path)) is not None
+                )
+            for sequence, _ in immutable_entries:
+                counts[sequence] = counts.get(sequence, 0) + 1
         except OSError as exc:
             raise LiveCollaborationError(
                 f"Could not validate shared operation ordering: {exc}"
@@ -2516,23 +2523,30 @@ class SharedFolderRoomClient:
                 f"plugin version {minimum_version} or newer. Update the plugin on "
                 "every computer before joining this room."
             )
-        duplicate_sequences = self._duplicate_operation_sequences(room_path)
-        if duplicate_sequences:
-            raise LiveCollaborationError(
-                "This room contains duplicate operation sequence(s) "
-                + ", ".join(str(item) for item in duplicate_sequences)
-                + " from an older stale-cache collision. Its ordering is ambiguous. "
-                "Create a new room with Live Segmentation 0.14.0 or newer."
-            )
         # Seed/migrate the compact watermark once at join. Even an empty room
         # can then stay on the tiny 0-sequence polling path instead of opening
         # the larger state cache and listing its directory until the first edit.
         with self._sequence_lock(room_path):
-            latest_sequence = self._latest_sequence(room_path)
+            # One immutable listing validates duplicates and the authoritative
+            # watermark, then serves all cold catch-up pages. Never reuse this
+            # polling catalog as the authority when allocating writer sequences.
+            immutable_entries = self._scan_operation_catalog(room_path / "operations")
+            duplicate_sequences = self._duplicate_operation_sequences(room_path, immutable_entries)
+            if duplicate_sequences:
+                raise LiveCollaborationError(
+                    "This room contains duplicate operation sequence(s) "
+                    + ", ".join(str(item) for item in duplicate_sequences)
+                    + " from an older stale-cache collision. Its ordering is ambiguous. "
+                    "Create a new room with Live Segmentation 0.14.0 or newer."
+                )
+            latest_sequence = self._latest_sequence(room_path, immutable_entries)
             if self._read_sequence_head(room_path) != latest_sequence:
                 self._write_sequence_head(room_path, latest_sequence)
         self._room_id = room_key
         self._room_path = room_path
+        with self._operation_catalog_guard:
+            self._operation_catalog = self._make_operation_catalog(immutable_entries, latest_sequence)
+        self._bootstrap_checkpoint = None
         self._segment_owners_cache = {}
         self._known_presence_users = {
             value
@@ -2949,6 +2963,158 @@ class SharedFolderRoomClient:
             result["conflicts"] = conflicts
         return result
 
+    @classmethod
+    def _scan_operation_catalog(cls, operations_path):
+        try:
+            return [
+                (sequence, path)
+                for path in operations_path.glob("*.json")
+                if (sequence := cls._operation_sequence(path)) is not None
+            ]
+        except OSError as exc:
+            raise LiveCollaborationError(f"Could not list shared operations: {exc}") from exc
+
+    @staticmethod
+    def _make_operation_catalog(entries, latest):
+        entries = sorted(entries)
+        return entries, [sequence for sequence, _ in entries], int(latest)
+
+    def _catalog_operation_paths(self, room_path, after_sequence, limit, latest, recent, *, refresh=False, entries=None):
+        """Cache immutable names, never payloads or writer sequence authority."""
+        with self._operation_catalog_guard:
+            catalog = None if refresh else self._operation_catalog
+            if entries is not None:
+                catalog = self._make_operation_catalog(entries, latest)
+            elif catalog is not None and latest > catalog[2]:
+                additions = {
+                    int(item["sequence"]): room_path / "operations" / str(item["file"])
+                    for item in recent if int(item["sequence"]) > catalog[2]
+                }
+                # A complete hot tail can extend the old cold catalog without
+                # repeatedly enumerating tens of thousands of older filenames.
+                required = latest - catalog[2]
+                if len(additions) == required and all(
+                    sequence in additions for sequence in range(catalog[2] + 1, latest + 1)
+                ):
+                    tail = sorted(additions.items())
+                    catalog = (
+                        catalog[0] + tail,
+                        catalog[1] + [sequence for sequence, _ in tail],
+                        latest,
+                    )
+                else:
+                    catalog = None
+            if catalog is None:
+                catalog = self._make_operation_catalog(
+                    self._scan_operation_catalog(room_path / "operations"), latest
+                )
+            self._operation_catalog = catalog
+            start = bisect_right(catalog[1], after_sequence)
+            return catalog[0][start:start + limit]
+
+    @staticmethod
+    def _bounded_operation_page(operations):
+        """Bound the encoded RPC response, allowing one large legacy record."""
+        result, byte_count = [], 2  # JSON list brackets and commas below.
+        for operation in operations:
+            size = len(json.dumps(operation, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if result and byte_count + size + 1 > OPERATION_PAGE_BYTES_LIMIT:
+                break
+            result.append(operation)
+            byte_count += size + 1
+        return result
+
+    @staticmethod
+    def _checkpoint_operation_path(room_path, manifest, index):
+        operation_id = f"snapshot-{manifest['id']}-{index}"
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:20]
+        return room_path / "operations" / f"{manifest['first_sequence'] + index:020d}--{digest}.json"
+
+    def _checkpoint_page(self, room_path, manifest, after_sequence, limit):
+        """Read exact committed part names, including a concurrent ZIP migration."""
+        first = manifest["first_sequence"]
+        count = manifest["last_sequence"] - first + 1
+        start = max(0, after_sequence + 1 - first)
+        page, byte_count, archives = [], 2, None
+        for index in range(start, min(count, start + limit)):
+            path = self._checkpoint_operation_path(room_path, manifest, index)
+            try:
+                # Stat before parsing prevents loading an entire large page just
+                # to discard most of its payloads at the response byte boundary.
+                size = path.stat().st_size
+                if page and byte_count + size + 1 > OPERATION_PAGE_BYTES_LIMIT:
+                    break
+                operation = _read_json_file(path)
+            except (OSError, LiveCollaborationError):
+                # Compaction publishes the archive before unlinking any source.
+                # Keep the already chosen group pinned; changing to a newer group
+                # here would leave the receiver with an incomplete transaction.
+                if archives is None:
+                    archives = sorted((room_path / "operation-archives").glob("*.zip"), reverse=True)
+                operation = None
+                for archive_path in archives:
+                    bounds = re.match(r"^(\d{20})-(\d{20})--", archive_path.name)
+                    sequence = first + index
+                    if bounds and not int(bounds[1]) <= sequence <= int(bounds[2]):
+                        continue
+                    try:
+                        with zipfile.ZipFile(archive_path) as bundle:
+                            entry = bundle.getinfo(path.name)
+                            if page and byte_count + entry.file_size + 1 > OPERATION_PAGE_BYTES_LIMIT:
+                                return self._bounded_operation_page(page)
+                            operation = json.loads(bundle.read(entry))
+                        break
+                    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+                        continue
+                if operation is None:
+                    raise LiveCollaborationError("A committed room checkpoint part is temporarily unavailable; retry synchronization.")
+            if (not isinstance(operation, dict)
+                    or operation.get("system_snapshot") is not True
+                    or operation.get("snapshot_group_id") != manifest["id"]
+                    or operation.get("snapshot_group_index") != index
+                    or operation.get("snapshot_group_count") != count
+                    or operation.get("sequence") != first + index):
+                raise LiveCollaborationError("A committed room checkpoint has inconsistent operation headers.")
+            size = len(json.dumps(operation, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if page and byte_count + size + 1 > OPERATION_PAGE_BYTES_LIMIT:
+                break
+            page.append(operation)
+            byte_count += size + 1
+        return page
+
+    def _fresh_checkpoint_page(self, room_path, after_sequence, limit):
+        manifest = self._bootstrap_checkpoint
+        if manifest is not None and (after_sequence == 0 or manifest["first_sequence"] - 1 <= after_sequence < manifest["last_sequence"]):
+            return self._checkpoint_page(room_path, manifest, after_sequence, limit)
+        if after_sequence != 0:
+            return None
+        # A manifest is published only after every immutable part is committed
+        # under the sequence lock. Its prefix bounds the transaction; ordinary
+        # per-label snapshots and staging files cannot become bootstrap targets.
+        for path in sorted((room_path / "snapshots").glob("*.json"), reverse=True):
+            try:
+                candidate = _read_json_file(path)
+                group_id = str(candidate["id"])
+                first, last = int(candidate["first_sequence"]), int(candidate["last_sequence"])
+                before = int(candidate["before_sequence"])
+                if (not re.fullmatch(r"[a-f0-9-]{16,64}", group_id)
+                        or before < 0 or first != before + 1
+                        or not 1 <= last - first + 1 <= 100000
+                        or path.name != f"{last:020d}--{group_id}.json"):
+                    continue
+                manifest = {"id": group_id, "first_sequence": first, "last_sequence": last}
+                # The tiny mutable head can legitimately lag on SMB. Validate
+                # the actual terminal immutable part instead of trusting either
+                # an ahead-of-head manifest or a stale head value by itself.
+                if last != first:
+                    self._checkpoint_page(room_path, manifest, last - 1, 1)
+                page = self._checkpoint_page(room_path, manifest, 0, limit)
+            except (OSError, KeyError, TypeError, ValueError, LiveCollaborationError):
+                continue
+            self._bootstrap_checkpoint = manifest
+            return page
+        return None
+
     def operations(self, room_id, after_sequence, limit=500):
         room_path = self._require_room(room_id)
         after_sequence = int(after_sequence)
@@ -2959,6 +3125,24 @@ class SharedFolderRoomClient:
             raise LiveCollaborationError(
                 f"Shared operations folder is unavailable: {operations_path}"
             )
+        checkpoint_page = self._fresh_checkpoint_page(room_path, after_sequence, limit)
+        if checkpoint_page is not None:
+            # Preserve ordinary pagination semantics when the transaction ends
+            # before the requested count; its immediately following live edits
+            # can share the response, subject to the same encoded byte bound.
+            if (checkpoint_page and len(checkpoint_page) < limit
+                    and checkpoint_page[-1]["sequence"] == self._bootstrap_checkpoint["last_sequence"]
+                    and (self._read_sequence_head(room_path) or 0) > checkpoint_page[-1]["sequence"]
+                    and len(json.dumps(checkpoint_page, ensure_ascii=False).encode("utf-8")) < OPERATION_PAGE_BYTES_LIMIT):
+                checkpoint_page += self.operations(room_id, checkpoint_page[-1]["sequence"], limit - len(checkpoint_page))
+            operations = self._bounded_operation_page(checkpoint_page)
+            for operation in operations:
+                segment_id, author = str(operation.get("segment_id") or ""), str(operation.get("author") or "")
+                if segment_id and author:
+                    self._segment_owners_cache.setdefault(segment_id, author)
+                if author:
+                    self._known_presence_users.add(author)
+            return operations
         state_path = room_path / "sequence-state.json"
         head_latest = self._read_sequence_head(room_path)
         immutable_entries = []
@@ -3038,7 +3222,7 @@ class SharedFolderRoomClient:
                 author = str(operation.get("author") or "")
                 if segment_id and author:
                     self._segment_owners_cache.setdefault(segment_id, author)
-            return operations
+            return self._bounded_operation_page(operations)
 
         recent = [
             item
@@ -3057,28 +3241,35 @@ class SharedFolderRoomClient:
                 (int(item["sequence"]), operations_path / str(item["file"]))
                 for item in recent
                 if int(item["sequence"]) > after_sequence
-            ]
+            ][:limit]
             if any(not path.is_file() for _, path in selected):
                 selected = []
                 recent_covers_request = False
         if not recent_covers_request:
-            if not immutable_entries:
-                try:
-                    immutable_entries = [
-                        (sequence, path)
-                        for path in operations_path.glob("*.json")
-                        if (sequence := self._operation_sequence(path)) is not None
-                    ]
-                except OSError as exc:
-                    raise LiveCollaborationError(
-                        f"Could not list shared operations: {exc}"
-                    ) from exc
-            selected.extend(
-                (sequence, path)
-                for sequence, path in immutable_entries
-                if sequence > after_sequence
+            selected = self._catalog_operation_paths(
+                room_path, after_sequence, limit, latest, recent,
+                entries=immutable_entries or None,
             )
-        selected = sorted(selected)[:limit]
+            if any(not path.is_file() for _, path in selected):
+                selected = self._catalog_operation_paths(
+                    room_path, after_sequence, limit, latest, recent, refresh=True
+                )
+        # A large legacy operation may legitimately exceed the normal page
+        # budget, but avoid loading dozens of these into one RPC response.
+        bounded_paths, encoded_bytes = [], 2
+        for item in sorted(selected)[:limit]:
+            try:
+                size = item[1].stat().st_size
+            except OSError:
+                # A compaction race is retried from a newly listed checkpoint.
+                with self._operation_catalog_guard:
+                    self._operation_catalog = None
+                return []
+            if bounded_paths and encoded_bytes + size + 1 > OPERATION_PAGE_BYTES_LIMIT:
+                break
+            bounded_paths.append(item)
+            encoded_bytes += size + 1
+        selected = bounded_paths
 
         def read_operation(item):
             sequence, path = item
@@ -3111,7 +3302,14 @@ class SharedFolderRoomClient:
             operation["sequence"] = sequence
             return operation
 
-        operations = _parallel_map(read_operation, selected)
+        try:
+            operations = _parallel_map(read_operation, selected)
+        except LiveCollaborationError:
+            if any(not path.exists() for _, path in selected):
+                with self._operation_catalog_guard:
+                    self._operation_catalog = None
+                return []
+            raise
         operations_by_sequence = {
             int(operation["sequence"]): operation for operation in operations
         }
@@ -3148,7 +3346,12 @@ class SharedFolderRoomClient:
                 self._segment_owners_cache.setdefault(segment_id, author)
             if author:
                 self._known_presence_users.add(author)
-        return operations
+        if not operations:
+            # A stale SMB catalog must not permanently hide a later committed
+            # checkpoint when the expected next immutable entry disappeared.
+            with self._operation_catalog_guard:
+                self._operation_catalog = None
+        return self._bounded_operation_page(operations)
 
     def _presence_path(self, room_path):
         return self._presence_path_for_user(room_path, self.user_name)
