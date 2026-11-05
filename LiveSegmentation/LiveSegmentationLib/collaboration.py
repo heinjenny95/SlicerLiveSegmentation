@@ -123,7 +123,9 @@ PREFLIGHT_PARTICIPANT_TTL_SECONDS = 120.0
 PREFLIGHT_TIMEOUT_SECONDS = 20.0
 PRESENCE_DELAY_WARNING_SECONDS = 3.0
 PRESENCE_DISPLAY_GRACE_SECONDS = 20.0
-INITIAL_SYNC_OPERATION_BATCH = 6
+# Network pages are independent of the cooperatively tiled GUI writes below.
+# Larger catch-up pages avoid hundreds of round trips on an SSH/VPN link.
+INITIAL_SYNC_OPERATION_BATCH = 64
 LIVE_SYNC_OPERATION_BATCH = 8
 IMMUTABLE_RECOVERY_SCAN_INTERVAL_SECONDS = 1.0
 PRESENCE_DIRECTORY_SCAN_INTERVAL_SECONDS = 2.0
@@ -150,6 +152,7 @@ GUI_CONTINUATION_MILLISECONDS = 5
 NATIVE_SURFACE_BATCH_SECONDS = 0.5
 INCOMING_TILE_SIZE = 64
 MAX_PENDING_REMOTE_OPERATIONS = 16
+MAX_PENDING_INITIAL_OPERATIONS = 128
 MAX_INCOMING_PACKED_BYTES = 32 * 1024 * 1024
 PACKED_RESIDENT_LIMIT_BYTES = 8 * 1024 * 1024
 OUTGOING_TILE_SIZE = 128
@@ -5510,6 +5513,7 @@ class LiveCollaborationController:
         self._snapshot_worker = None
         self._last_snapshot_attempt_epoch = 0.0
         self._edit_pull_worker = None
+        self._edit_pull_pending = False
         self._chat_send_worker = None
         self._chat_pull_worker = None
         self._presence_worker = None
@@ -6382,7 +6386,7 @@ class LiveCollaborationController:
         total = max(1, int(self.initial_sequence))
         return (
             "● Connected — loading shared segmentation… "
-            f"{completed} / {total} changes"
+            f"shared version {completed} / {total}"
         )
 
     def _update_transport_fields(self, index=None):
@@ -8474,6 +8478,7 @@ class LiveCollaborationController:
             self._snapshot_worker = None
             self._last_snapshot_attempt_epoch = 0.0
             self._edit_pull_worker = None
+            self._edit_pull_pending = False
             self._chat_send_worker = None
             self._chat_pull_worker = None
             self._presence_worker = None
@@ -8725,6 +8730,7 @@ class LiveCollaborationController:
         self._incoming_surface_started_at = 0.0
         self._incoming_surface_operations = 0
         self._incoming_received_sequence = 0
+        self._edit_pull_pending = False
         self._incoming_continuation_scheduled = False
         self._incoming_retry_at = 0.0
         self._local_capture = None
@@ -10313,30 +10319,7 @@ class LiveCollaborationController:
 
         self._start_edit_workers(now)
 
-        pull_idle = self._edit_pull_worker is None or not self._edit_pull_worker.is_alive()
-        incoming_bytes = sum(item["_packed"].bytes.nbytes for item in self._incoming_operations if "_packed" in item)
-        if pull_idle and self._transport_retry_ready("edit-pull") and len(self._incoming_operations) < MAX_PENDING_REMOTE_OPERATIONS and incoming_bytes < MAX_INCOMING_PACKED_BYTES and (
-            force_sync or now - self._last_sync_poll >= LIVE_EDIT_POLL_INTERVAL_SECONDS
-        ):
-            self._last_sync_poll = now
-            operation_limit = (
-                INITIAL_SYNC_OPERATION_BATCH
-                if not self.initial_sync_complete
-                else LIVE_SYNC_OPERATION_BATCH
-            )
-            self._edit_pull_worker = threading.Thread(
-                target=self._edit_pull_lane,
-                args=(
-                    self._session_token,
-                    self.client,
-                    self.room_id,
-                    max(int(self.last_sequence), self._incoming_received_sequence),
-                    operation_limit,
-                ),
-                name="LiveSegmentation-edit-pull",
-                daemon=True,
-            )
-            self._edit_pull_worker.start()
+        self._start_edit_pull_worker(now, force_sync)
 
         chat_send_idle = (
             self._chat_send_worker is None or not self._chat_send_worker.is_alive()
@@ -10674,6 +10657,39 @@ class LiveCollaborationController:
                     "duration": time.monotonic() - started,
                 }
             )
+
+    def _start_edit_pull_worker(self, now, force_sync):
+        # A finished thread may still have a result waiting on the GUI queue.
+        # Keep its request reserved until that result advances the receive
+        # cursor, including when a native MRML write spans several timer turns.
+        if getattr(self, "_edit_pull_pending", False):
+            return
+        if self._edit_pull_worker is not None and self._edit_pull_worker.is_alive():
+            return
+        if not self._transport_retry_ready("edit-pull"):
+            return
+        if not force_sync and now - self._last_sync_poll < LIVE_EDIT_POLL_INTERVAL_SECONDS:
+            return
+        cap = MAX_PENDING_REMOTE_OPERATIONS if self.initial_sync_complete else MAX_PENDING_INITIAL_OPERATIONS
+        slots = cap - len(self._incoming_operations)
+        budget = MAX_INCOMING_PACKED_BYTES - sum(incoming_operation_bytes(item) for item in self._incoming_operations)
+        if slots <= 0 or budget < 4096:
+            return
+        limit = min(slots, LIVE_SYNC_OPERATION_BATCH if self.initial_sync_complete else INITIAL_SYNC_OPERATION_BATCH)
+        self._last_sync_poll = now
+        self._edit_pull_pending = True
+        try:
+            self._edit_pull_worker = threading.Thread(
+                target=self._edit_pull_lane,
+                args=(self._session_token, self.client, self.room_id,
+                      max(int(self.last_sequence), self._incoming_received_sequence), limit, budget),
+                name="LiveSegmentation-edit-pull", daemon=True,
+            )
+            self._edit_pull_worker.start()
+        except Exception:
+            self._edit_pull_pending = False
+            raise
+
 
     def _edit_pull_lane(
         self, session_token, client, room_id, after_sequence, operation_limit=500,
@@ -11404,6 +11420,8 @@ class LiveCollaborationController:
             if result.get("session_token") != self._session_token or not self.connected:
                 continue
             lane = str(result.get("lane") or "sync")
+            if lane == "edit-pull":
+                self._edit_pull_pending = False
             if lane == "work-time":
                 self._diagnostic_event("work_time.transfer", duration_s=float(result.get("duration") or 0),
                                        accepted_count=len(result.get("accepted_ids") or []),

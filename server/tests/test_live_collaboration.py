@@ -390,7 +390,11 @@ def test_edit_pull_lane_limits_initial_sync_batch():
 
 
 def test_live_catch_up_batch_is_bounded_for_gui_responsiveness():
-    assert collaboration_module.INITIAL_SYNC_OPERATION_BATCH <= 8
+    # Transport pages need not be as small as a single GUI work slice. The
+    # receiver tiles writes under a separate time budget and queue byte cap.
+    assert 8 < collaboration_module.INITIAL_SYNC_OPERATION_BATCH <= 64
+    assert collaboration_module.MAX_PENDING_INITIAL_OPERATIONS <= 128
+    assert collaboration_module.GUI_WORK_BUDGET_SECONDS <= 0.008
     assert collaboration_module.LIVE_SYNC_OPERATION_BATCH <= 8
 
 

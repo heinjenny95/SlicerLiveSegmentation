@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep one edit-pull request reserved until its result is consumed, preventing
+  duplicate catch-up pages when a native write outlasts a worker. Fetch initial
+  state in up to 64-operation background pages with a 128-operation / 32 MiB
+  queue budget; GUI writes retain their independent 8 ms cooperative budget.
+  Initial progress identifies the shared version instead of implying that the
+  cumulative sequence is a count of files still to download.
+
 - Validate incoming voxel payloads once and release their encoded copies after
   decoding. Stream legacy bitsets above 8 MiB (or the remaining queue budget)
   through private temporary files, unpacking only display tiles. Count changed
