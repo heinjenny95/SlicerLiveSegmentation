@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Validate incoming voxel payloads once and release their encoded copies after
+  decoding. Stream legacy bitsets above 8 MiB (or the remaining queue budget)
+  through private temporary files, unpacking only display tiles. Count changed
+  bits in bounded blocks and release temporary backing when an operation ends.
+
 - Coalesce requested native closed-surface regeneration across received tiles
   and queued operations for up to 500 ms between operation boundaries. Convert
   only changed labels once per cohort with

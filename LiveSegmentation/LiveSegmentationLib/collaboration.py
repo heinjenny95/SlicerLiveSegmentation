@@ -151,6 +151,7 @@ NATIVE_SURFACE_BATCH_SECONDS = 0.5
 INCOMING_TILE_SIZE = 64
 MAX_PENDING_REMOTE_OPERATIONS = 16
 MAX_INCOMING_PACKED_BYTES = 32 * 1024 * 1024
+PACKED_RESIDENT_LIMIT_BYTES = 8 * 1024 * 1024
 OUTGOING_TILE_SIZE = 128
 
 
@@ -1225,37 +1226,44 @@ def operation_defect(operation, volume_shape=None):
     it is read; otherwise every participant stops at its sequence number for
     good. Decompression is bounded by the size the bounds imply.
     """
+    return validated_operation_mask(operation, volume_shape)[0]
+
+
+
+def validated_operation_mask(operation, volume_shape=None, resident_limit=None):
+    """Validate foreign data and return its one locally constructed decoder."""
     order = operation.get("segment_order")
     if order is not None:
         if (not isinstance(order, list) or not 1 <= len(order) <= 10000
                 or any(not isinstance(sid, str) or not sid.strip() or len(sid) > 200 for sid in order)
                 or len(set(order)) != len(order)):
-            return "invalid segment order (expected unique label IDs)"
+            return "invalid segment order (expected unique label IDs)", None
         if (operation.get("segment_deleted") or operation.get("metadata_update")
                 or operation.get("operation_kind") != "patch"
                 or operation.get("voxel_bbox") != [0, 1, 0, 1, 0, 1]):
-            return "segment order must be a metadata-only patch"
+            return "segment order must be a metadata-only patch", None
     if operation.get("segment_deleted"):
-        return None
+        return None, None
     try:
         if operation.get("encoding") != LIVE_ENCODING:
-            return "unsupported encoding"
+            return "unsupported encoding", None
         bounds = [int(value) for value in operation["voxel_bbox"]]
         shape = tuple(int(value) for value in operation["volume_shape"])
         if len(bounds) != 6 or len(shape) != 3:
-            return "bounds or volume shape have the wrong length"
+            return "bounds or volume shape have the wrong length", None
         if volume_shape is not None and shape != tuple(int(v) for v in volume_shape):
-            return "operation belongs to a different volume geometry"
+            return "operation belongs to a different volume geometry", None
         for axis in range(3):
             low, high = bounds[2 * axis], bounds[2 * axis + 1]
             if low < 0 or high <= low or high > shape[axis]:
-                return "bounds are empty or outside the volume"
-        PackedOperationMask(operation)
-        if order is not None and np.any(decode_mask_delta(operation)[0]):
-            return "segment order cannot change voxels"
+                return "bounds are empty or outside the volume", None
+        packed = (PackedOperationMask(operation) if resident_limit is None
+                  else PackedOperationMask(operation, resident_limit=resident_limit))
+        if order is not None and np.any(packed.region(bounds)[0]):
+            return "segment order cannot change voxels", None
     except (KeyError, TypeError, ValueError, zlib.error) as exc:
-        return f"payload cannot be decoded ({exc})"
-    return None
+        return f"payload cannot be decoded ({exc})", None
+    return None, packed
 
 
 def decode_mask_delta(operation):
@@ -1305,7 +1313,7 @@ def apply_mask_delta(mask, operation):
 class PackedOperationMask:
     """Keep legacy large operations bit-packed; expand only one display tile."""
 
-    def __init__(self, operation):
+    def __init__(self, operation, resident_limit=None):
         if operation.get("encoding") != LIVE_ENCODING:
             raise ValueError("Unsupported live-operation encoding")
         self.bounds = tuple(int(value) for value in operation["voxel_bbox"])
@@ -1313,11 +1321,58 @@ class PackedOperationMask:
         if any(size <= 0 for size in self.shape):
             raise ValueError("Live-operation bounds are empty")
         self.packed_bytes = (int(np.prod(self.shape, dtype=np.int64)) + 7) // 8
+        self._backing_file = None
+        self.has_claims = False
+        expected = self.packed_bytes * 2
+        limit = PACKED_RESIDENT_LIMIT_BYTES if resident_limit is None else min(PACKED_RESIDENT_LIMIT_BYTES, max(0, int(resident_limit)))
+        self.resident_bytes = expected if expected <= limit else 0
+        raw = bytearray() if self.resident_bytes else None
+        if raw is None:
+            # A valid historical full-volume operation may contain ~1 GiB of
+            # packed masks. Stream it to private temporary storage and page in
+            # only the tiles being displayed; never inflate it twice in RAM.
+            self._backing_file = tempfile.TemporaryFile()
         decoder = zlib.decompressobj()
-        raw = decoder.decompress(base64.b64decode(operation["payload"], validate=True), self.packed_bytes * 2 + 1)
-        if len(raw) != self.packed_bytes * 2 or not decoder.eof:
-            raise ValueError("Live-operation payload length does not match its bounds")
-        self.bytes = np.frombuffer(raw, dtype=np.uint8)
+        compressed = base64.b64decode(operation["payload"], validate=True)
+        written = 0
+        try:
+            for start in range(0, len(compressed), 65536):
+                remaining = compressed[start:start + 65536]
+                while remaining:
+                    part = decoder.decompress(remaining, min(1024 * 1024, expected + 1 - written))
+                    remaining = decoder.unconsumed_tail
+                    written += len(part)
+                    if written > expected:
+                        raise ValueError("Live-operation payload length does not match its bounds")
+                    self.has_claims = self.has_claims or bool(np.any(np.frombuffer(part, np.uint8)))
+                    if raw is not None:
+                        raw.extend(part)
+                    else:
+                        self._backing_file.write(part)
+            if written != expected or not decoder.eof:
+                raise ValueError("Live-operation payload length does not match its bounds")
+            if raw is not None:
+                self.bytes = np.frombuffer(raw, dtype=np.uint8)
+                self.bytes.flags.writeable = False
+            else:
+                self._backing_file.flush()
+                self.bytes = np.memmap(self._backing_file, dtype=np.uint8, mode="r", shape=(expected,))
+        except Exception:
+            if self._backing_file is not None:
+                self._backing_file.close()
+                self._backing_file = None
+            raise
+
+    def __del__(self):
+        backing = getattr(self, "_backing_file", None)
+        if backing is not None:
+            try:
+                mapped = getattr(getattr(self, "bytes", None), "_mmap", None)
+                if mapped is not None:
+                    mapped.close()
+                backing.close()
+            except Exception:
+                pass
 
     def region(self, bounds):
         z0, z1, y0, y1, x0, x1 = [int(value) for value in bounds]
@@ -1338,12 +1393,32 @@ class PackedOperationMask:
         return regions[0].astype(bool), regions[1]
 
 
+def incoming_operation_bytes(operation):
+    """Conservatively account for encoded, decoded, and metadata queue storage."""
+    packed = operation.get("_packed")
+    resident = 0 if packed is None else getattr(packed, "resident_bytes", packed.bytes.nbytes)
+    metadata = operation.get("_metadata_bytes")
+    if metadata is None:
+        public = {key: value for key, value in operation.items() if key != "payload" and not key.startswith("_")}
+        metadata = 4096 + 2 * len(json.dumps(public, ensure_ascii=True))
+    return len(operation.get("payload") or "") + int(resident) + int(metadata)
+
+
+
 def operation_changed_voxel_count(operation):
     """Count packed bits without allocating two dense full-label masks."""
     packed = PackedOperationMask(operation)
-    bit_counts = np.array([value.bit_count() for value in range(256)], np.int64)
-    counts = np.bincount(packed.bytes[:packed.packed_bytes], minlength=256)
-    count = int(counts @ bit_counts)
+    bit_counts = np.array([value.bit_count() for value in range(256)], np.uint8)
+    count = 0
+    if packed._backing_file is not None:
+        packed._backing_file.seek(0)
+    for start in range(0, packed.packed_bytes, 1024 * 1024):
+        size = min(1024 * 1024, packed.packed_bytes - start)
+        data = (np.frombuffer(packed._backing_file.read(size), np.uint8)
+                if packed._backing_file is not None else packed.bytes[start:start + size])
+        # bincount converts the complete input to platform integers, which is
+        # another multi-gigabyte allocation for old full-volume operations.
+        count += int(bit_counts[data].sum(dtype=np.int64))
     remainder = int(np.prod(packed.shape, dtype=np.int64)) % 8
     if remainder:
         count -= (int(packed.bytes[packed.packed_bytes-1]) >> remainder).bit_count()
@@ -10601,7 +10676,8 @@ class LiveCollaborationController:
             )
 
     def _edit_pull_lane(
-        self, session_token, client, room_id, after_sequence, operation_limit=500
+        self, session_token, client, room_id, after_sequence, operation_limit=500,
+        byte_budget=MAX_INCOMING_PACKED_BYTES,
     ):
         started = time.monotonic()
         try:
@@ -10611,24 +10687,45 @@ class LiveCollaborationController:
             prepared = []
             prepared_bytes = 0
             for operation in operations:
-                item = dict(operation)
-                defect = item.get("_undecodable") or operation_defect(
-                    item, getattr(self, "volume_shape", None)
+                # Foreign JSON must not smuggle in a locally trusted decoded
+                # cache. The transport's damaged-record marker is the sole
+                # private field we accept here.
+                item = {key: value for key, value in operation.items()
+                        if not key.startswith("_") or key == "_undecodable"}
+                item["_metadata_bytes"] = incoming_operation_bytes({key: value for key, value in item.items() if key != "payload"})
+                if prepared_bytes + item["_metadata_bytes"] > byte_budget:
+                    break
+                predicted = len(item.get("payload") or "") + item["_metadata_bytes"]
+                try:
+                    bounds = item["voxel_bbox"]
+                    size = (int(np.prod([int(bounds[i + 1]) - int(bounds[i]) for i in (0, 2, 4)], dtype=np.int64)) + 7) // 8 * 2
+                    if 0 < size <= PACKED_RESIDENT_LIMIT_BYTES:
+                        predicted += size
+                except (KeyError, IndexError, TypeError, ValueError):
+                    pass  # Full validation below reports the damaged record.
+                if prepared and prepared_bytes + predicted > byte_budget:
+                    break
+                defect, packed = (str(item["_undecodable"]), None) if item.get("_undecodable") else validated_operation_mask(
+                    item, getattr(self, "volume_shape", None),
+                    resident_limit=max(0, byte_budget - prepared_bytes - item["_metadata_bytes"]),
                 )
                 if defect is not None:
                     # One damaged operation must not stop the room at its
                     # sequence number for every participant, forever.
                     item["_undecodable"] = str(defect)
+                    item.pop("payload", None)
                     prepared.append(item)
+                    prepared_bytes += incoming_operation_bytes(item)
                     continue
-                if not item.get("segment_deleted"):
-                    bounds = item["voxel_bbox"]
-                    predicted_bytes = (int(np.prod([bounds[index + 1] - bounds[index] for index in (0, 2, 4)], dtype=np.int64)) + 7) // 8 * 2
-                    if prepared and prepared_bytes + predicted_bytes > MAX_INCOMING_PACKED_BYTES:
-                        break
-                    item["_packed"] = PackedOperationMask(item)
-                    item["_has_claims"] = bool(np.any(item["_packed"].bytes))
-                    prepared_bytes += item["_packed"].bytes.nbytes
+                if packed is not None:
+                    item["_packed"] = packed
+                    item["_has_claims"] = packed.has_claims
+                    # The validated bitset now owns the data. UI history uses
+                    # summaries and never needs the redundant base64 string.
+                    item.pop("payload", None)
+                elif item.get("segment_deleted"):
+                    item.pop("payload", None)
+                prepared_bytes += incoming_operation_bytes(item)
                 prepared.append(item)
             self._worker_results.put(
                 {
