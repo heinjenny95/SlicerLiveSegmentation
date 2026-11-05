@@ -307,7 +307,7 @@ def render_report(records, issues=(), generated_at=None):
 
 
 class RoomWorkLog:
-    """Non-blocking submission; fsync and report work live in a private lane."""
+    """Non-blocking submission with independent journal and derived-TXT lanes."""
 
     def __init__(self, room_path, report_lock=None, create_room=False):
         self.room_path = Path(room_path)
@@ -323,13 +323,23 @@ class RoomWorkLog:
         self._completed_batches = 0
         self._submitted_generation = 0
         self._durable_generation = 0
+        self._journal_initialized = False
         self._batch_generation = 0
         self._urgent = False
         self._force_report = False
         self._last_report = 0.0
         self._dirty_report = False
-        self.error = ""
+        self._journal_error = ""
+        self._report_error = ""
+        self._report_worker = None
+        self._report_requested_serial = 0
+        self._report_completed_serial = 0
+        self._report_requested_generation = 0
         self.saved_at = ""
+
+    @property
+    def error(self):
+        return self._journal_error or self._report_error
 
     def _record(self, event, user, session_id, details=None, event_id=None, epoch=None):
         record = {"schema": 1, "id": str(event_id or uuid.uuid4().hex),
@@ -390,7 +400,7 @@ class RoomWorkLog:
                 self._urgent = False
                 self._force_report = False
                 if not records and not urgent:
-                    if self._dirty_report:
+                    if self._dirty_report and self._report_worker is None and not self._report_error:
                         report_due = self._last_report + REPORT_SECONDS
                         if time.monotonic() < report_due:
                             deadline = min(time.monotonic() + FLUSH_SECONDS, report_due)
@@ -404,18 +414,18 @@ class RoomWorkLog:
                 self._busy = True
                 self._batch_generation = self._submitted_generation
             try:
-                self._persist(records, force_report=force_report or bool(self.error))
-                self.error = ""
+                self._persist(records, force_report=force_report)
+                self._journal_error = ""
             except Exception as exc:
-                self.error = f"Study log not fully saved: {type(exc).__name__}: {exc}"
-                logging.warning(self.error)
+                self._journal_error = f"Study journal not fully saved: {type(exc).__name__}: {exc}"
+                logging.warning(self._journal_error)
                 with self._guard:
                     # An uncertain append can repeat IDs; readback deduplicates.
                     self._pending = records + self._pending
             with self._guard:
                 self._busy = False
                 self._completed_batches += 1
-                if self.error:
+                if self._journal_error:
                     # Retry only when new work/heartbeat or flush wakes the lane.
                     # A failed NAS must not spawn unbounded retry threads.
                     self._worker = None
@@ -436,16 +446,70 @@ class RoomWorkLog:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._dirty_report = True
         self.saved_at = utc_stamp(time.time())
         # A derived TXT report can be much slower than journal fsync. Remote
         # interval acknowledgements require the journal barrier, not a complete
         # re-render of all historical attendance/actions from every writer.
         with self._guard:
             self._durable_generation = max(self._durable_generation, self._batch_generation)
+            self._journal_initialized = True
+            self._dirty_report |= bool(records)
             self._guard.notify_all()
-        if not force_report and time.monotonic() - self._last_report < REPORT_SECONDS:
-            return
+            if (force_report or self._report_error
+                    or time.monotonic() - self._last_report >= REPORT_SECONDS):
+                self._request_report(self._durable_generation)
+
+    def _request_report(self, generation):
+        """Coalesce report requests under _guard; never block journal fsync."""
+        self._report_requested_serial += 1
+        self._report_requested_generation = max(self._report_requested_generation, generation)
+        if self._report_worker is None:
+            try:
+                self._report_worker = threading.Thread(
+                    target=self._run_reports, name="LiveSegmentation-work-report", daemon=True
+                )
+                self._report_worker.start()
+            except Exception as exc:
+                # Journal fsync may already have succeeded. Report startup is
+                # a derived-output failure and must never requeue that batch or
+                # leave an unstarted worker blocking subsequent report retries.
+                self._report_worker = None
+                self._report_error = f"Study report not started: {type(exc).__name__}: {exc}"
+                logging.warning(self._report_error)
+        self._guard.notify_all()
+        return self._report_requested_serial
+
+    def _run_reports(self):
+        while True:
+            with self._guard:
+                if self._report_completed_serial >= self._report_requested_serial:
+                    self._report_worker = None
+                    if self._dirty_report:
+                        self._start_worker()  # Keep the periodic TXT timer alive.
+                    self._guard.notify_all()
+                    return
+                while (not self._journal_initialized
+                       or self._durable_generation < self._report_requested_generation):
+                    self._guard.wait()
+                serial = self._report_requested_serial
+                generation = self._durable_generation
+            try:
+                self._write_report()
+            except Exception as exc:
+                with self._guard:
+                    self._report_error = f"Study report not fully saved: {type(exc).__name__}: {exc}"
+                    self._report_worker = None
+                    self._guard.notify_all()
+                logging.warning(self._report_error)
+                return  # Retain the old TXT; retry on the next work/flush request.
+            with self._guard:
+                self._report_error = ""
+                self._report_completed_serial = max(self._report_completed_serial, serial)
+                self._last_report = time.monotonic()
+                self._dirty_report = self._durable_generation > generation
+                self._guard.notify_all()
+
+    def _write_report(self):
         with self.report_lock() if callable(self.report_lock) else self.report_lock:
             # Independent journal files are always durable before report replace.
             records, issues = read_records(self.room_path)
@@ -460,8 +524,6 @@ class RoomWorkLog:
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)
-        self._last_report = time.monotonic()
-        self._dirty_report = False
 
     def flush(self, timeout=5.0, report=True):
         """Explicit shutdown/test barrier. NEVER call from the Slicer GUI thread."""
@@ -470,19 +532,22 @@ class RoomWorkLog:
             completed_before = self._completed_batches
             target_generation = self._submitted_generation
             self._urgent = True
-            self._force_report |= bool(report)
+            report_serial = self._request_report(target_generation) if report else None
             self._start_worker()
             self._guard.notify_all()
             if not report:
                 while self._durable_generation < target_generation:
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or (self.error and self._completed_batches > completed_before):
+                    if remaining <= 0 or (self._journal_error and self._completed_batches > completed_before):
                         return False
                     self._guard.wait(remaining)
                 return True
-            while self._urgent or self._pending or self._heartbeats or self._busy:
+            while (self._durable_generation < target_generation
+                   or self._report_completed_serial < report_serial):
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or (self.error and self._completed_batches > completed_before):
+                if (remaining <= 0
+                        or (self._journal_error and self._completed_batches > completed_before)
+                        or (self._report_error and self._report_worker is None)):
                     return False
                 self._guard.wait(remaining)
             return not self.error

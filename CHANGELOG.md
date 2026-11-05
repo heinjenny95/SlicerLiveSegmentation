@@ -8,6 +8,13 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Persist timing journals independently of the coalesced derived TXT report.
+  New work intervals can be fsynced and acknowledged while a previous report
+  is rendering or waiting for its shared report lock. A full report flush still
+  waits for its requested journal generation and an atomic TXT replacement;
+  failed reports retain the old TXT and visible error without re-appending
+  already durable journal records. Historical recovery warnings remain intact.
+
 - Bootstrap fresh shared-folder and SSH readers from the latest validated,
   committed room checkpoint even while older loose history remains. Read its
   immutable parts by exact name and finish the same transaction from its ZIP
