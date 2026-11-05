@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Inspect immutable operation filenames once per fresh shared-folder write,
+  combining legacy retry lookup with sequence allocation. Keep inline/receipt
+  retries immediate and retain filename authority when both cached heads are
+  stale, including across sequence gaps; no room format or protocol change.
+
 - Persist timing journals independently of the coalesced derived TXT report.
   New work intervals can be fsynced and acknowledged while a previous report
   is rendering or waiting for its shared report lock. A full report flush still
@@ -23,12 +28,6 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   compaction, and extend it from complete recent tails. Bound operation pages
   to 8 MiB encoded data, allowing an individually larger legacy operation.
 
-- Bound the local timeline to 1000 payload-free summaries, retain only the last
-  1000 activity text blocks, and filter new rows incrementally during replay.
-  Retain the latest own shared-edit Undo target
-  independently of that window. Release ingested checkpoint payloads and
-  replaced native images before subsequent derived-surface work.
-
 - Keep one edit-pull request reserved until its result is consumed, preventing
   duplicate catch-up pages when a native write outlasts a worker. Fetch initial
   state in up to 64-operation background pages with a 128-operation / 32 MiB
@@ -40,6 +39,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
   decoding. Stream legacy bitsets above 8 MiB (or the remaining queue budget)
   through private temporary files, unpacking only display tiles. Count changed
   bits in bounded blocks and release temporary backing when an operation ends.
+
+- Bound the local timeline to 1000 payload-free summaries, retain only the last
+  1000 activity text blocks, and filter new rows incrementally during replay.
+  Retain the latest own shared-edit Undo target
+  independently of that window. Release ingested checkpoint payloads and
+  replaced native images before subsequent derived-surface work.
 
 - Coalesce requested native closed-surface regeneration across received tiles
   and queued operations for up to 500 ms between operation boundaries. Convert

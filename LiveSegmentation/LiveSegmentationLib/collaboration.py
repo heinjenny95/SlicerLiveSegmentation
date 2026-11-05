@@ -1971,6 +1971,44 @@ class SharedFolderRoomClient:
         return int(match.group(1)) if match else None
 
     @staticmethod
+    def _scan_writer_operation_names(operations_path, operation_hash):
+        """Find a legacy retry and immutable sequence authority in one walk.
+
+        Wildcard Path.glob queries still enumerate every filename. Combining
+        both writer checks avoids two cold-directory walks under the sequence
+        lock while keeping immutable names authoritative over cached heads.
+        """
+        pattern = re.compile(r"^(\d{20})--[a-f0-9]+\.json$")
+        suffix = os.path.normcase(f"--{operation_hash}.json")
+        legacy_name = legacy_key = max_ascii = None
+        max_unicode = 0
+        try:
+            with os.scandir(operations_path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    match = pattern.match(name)
+                    # Accepted names need no case normalization. Retain the
+                    # host's glob/Path ordering rules for odd legacy names.
+                    accepted = match is not None and name.endswith(".json")
+                    normalized = name if accepted else os.path.normcase(name)
+                    if normalized.endswith(suffix) and (legacy_key is None or normalized < legacy_key):
+                        legacy_name, legacy_key = name, normalized
+                    if not accepted:
+                        continue
+                    digits = match[1]
+                    if digits.isascii():
+                        if max_ascii is None or digits > max_ascii:
+                            max_ascii = digits
+                    else:
+                        # Existing \d/int parsing also accepts decimal digits
+                        # outside ASCII, whose lexical order is not numeric.
+                        max_unicode = max(max_unicode, int(digits))
+        except OSError as exc:
+            raise LiveCollaborationError(f"Could not inspect shared operation names: {exc}") from exc
+        return (max(int(max_ascii or "0"), max_unicode),
+                operations_path / legacy_name if legacy_name is not None else None)
+
+    @staticmethod
     def _message_sequence(path):
         match = re.match(r"^(\d{20})--[a-f0-9]+\.json$", Path(path).name)
         return int(match.group(1)) if match else None
@@ -2763,7 +2801,6 @@ class SharedFolderRoomClient:
                     state = _read_json_file(state_path)
                 except LiveCollaborationError:
                     state = {}
-            existing = None
             for recent_operation in state.get("inline_operations") or []:
                 if str(recent_operation.get("client_operation_id") or "") == operation_id:
                     return {
@@ -2783,9 +2820,7 @@ class SharedFolderRoomClient:
                         return {"sequence": indexed_sequence, "duplicate": True}
                 except (LiveCollaborationError, TypeError, ValueError):
                     pass
-            if existing is None:
-                legacy_matches = sorted(operations_path.glob(f"*--{operation_hash}.json"))
-                existing = legacy_matches[0] if legacy_matches else None
+            immutable_latest, existing = self._scan_writer_operation_names(operations_path, operation_hash)
             if existing is not None:
                 sequence = self._operation_sequence(existing)
                 return {"sequence": sequence, "duplicate": True}
@@ -2809,24 +2844,10 @@ class SharedFolderRoomClient:
             except (TypeError, ValueError):
                 state_latest = 0
             head_latest = self._read_sequence_head(room_path)
-            hot_latest = max(state_latest, int(head_latest or 0))
-            next_prefix = f"{hot_latest + 1:020d}--*.json"
-            try:
-                next_slot_taken = next(operations_path.glob(next_prefix), None) is not None
-            except OSError as exc:
-                raise LiveCollaborationError(
-                    f"Could not validate the next shared operation slot: {exc}"
-                ) from exc
-            caches_disagree = head_latest is not None and state_latest != int(head_latest)
-            # Healthy current rooms need only two tiny JSON reads plus one
-            # exact sequence-slot query. A full listing of all historical
-            # operation files on every brush stroke made mature NAS rooms
-            # progressively slower. We retain the expensive reconciliation
-            # only for interrupted writes, old rooms, or a detected collision.
-            if caches_disagree or head_latest is None or next_slot_taken:
-                latest_sequence = self._latest_sequence(room_path)
-            else:
-                latest_sequence = hot_latest
+            # Both replaceable heads can be stale, including after an orphaned
+            # immutable write beyond a gap. The single scan above supplies the
+            # allocation authority without a second wildcard directory walk.
+            latest_sequence = max(state_latest, int(head_latest or 0), immutable_latest)
             label_deletions = self._label_deletion_barriers(
                 room_path, state, latest_sequence
             )
