@@ -8,6 +8,14 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Coalesce requested native closed-surface regeneration across received tiles
+  and queued operations for up to 500 ms between operation boundaries. Convert
+  only changed labels once per cohort with
+  Slicer's native single-segment converter, yielding between labels and
+  recording conversion timings. Native source-cache invalidation, Show 3D
+  controls and conversion settings remain authoritative; ordinary independent
+  writes retain their existing synchronous native behavior.
+
 - Reject spatially distant sparse label baselines before applying received
   exclusive voxel claims. A small incoming tile no longer allocates/scans a
   dense crop for every anatomical label on the GUI thread; overlapping and

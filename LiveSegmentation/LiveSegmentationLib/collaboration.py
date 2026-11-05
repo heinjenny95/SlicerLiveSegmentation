@@ -147,6 +147,7 @@ JOURNAL_WRITE_RETRY_SECONDS = 5.0
 FULL_PROJECT_BACKUP_SETTINGS_VERSION = 2
 GUI_WORK_BUDGET_SECONDS = 0.008
 GUI_CONTINUATION_MILLISECONDS = 5
+NATIVE_SURFACE_BATCH_SECONDS = 0.5
 INCOMING_TILE_SIZE = 64
 MAX_PENDING_REMOTE_OPERATIONS = 16
 MAX_INCOMING_PACKED_BYTES = 32 * 1024 * 1024
@@ -5453,6 +5454,10 @@ class LiveCollaborationController:
         self._incoming_operations = deque()
         self._incoming_iterator = None
         self._incoming_piece = None
+        self._incoming_surface_updates = None
+        self._incoming_surface_iterator = None
+        self._incoming_surface_started_at = 0.0
+        self._incoming_surface_operations = 0
         self._incoming_received_sequence = 0
         self._incoming_continuation_scheduled = False
         self._incoming_retry_at = 0.0
@@ -8640,6 +8645,10 @@ class LiveCollaborationController:
         self._checkpoint_commit_iterator = None
         self._incoming_iterator = None
         self._incoming_piece = None
+        self._incoming_surface_updates = None
+        self._incoming_surface_iterator = None
+        self._incoming_surface_started_at = 0.0
+        self._incoming_surface_operations = 0
         self._incoming_received_sequence = 0
         self._incoming_continuation_scheduled = False
         self._incoming_retry_at = 0.0
@@ -11692,7 +11701,10 @@ class LiveCollaborationController:
             # while inference is running. Actual reconciliation writes still
             # grow their required extent through the normal crop writer.
             if callable(prepare) and operation.get("_has_claims", True) and not visible_own_echo:
-                for _ in prepare(node, operation["segment_id"], self.owner.get_volume_node(), operation["voxel_bbox"]):
+                surface_options = {}
+                if self._incoming_surface_updates is not None:
+                    surface_options["surface_updates"] = self._incoming_surface_updates
+                for _ in prepare(node, operation["segment_id"], self.owner.get_volume_node(), operation["voxel_bbox"], **surface_options):
                     yield {"_capacity_step": True}
         yield from iter_operation_tiles(operation, baseline)
 
@@ -11722,7 +11734,16 @@ class LiveCollaborationController:
         deadline = time.perf_counter() + GUI_WORK_BUDGET_SECONDS
         started = time.perf_counter()
         try:
-            while (self._incoming_operations or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and time.perf_counter() < deadline:
+            while (self._incoming_operations or getattr(self, "_incoming_surface_updates", None) is not None
+                   or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and time.perf_counter() < deadline:
+                surface_due = (
+                    getattr(self, "_incoming_surface_updates", None) is not None
+                    and self._incoming_iterator is None
+                    and (self._incoming_surface_iterator is not None or not self._incoming_operations
+                         or time.perf_counter() - self._incoming_surface_started_at >= NATIVE_SURFACE_BATCH_SECONDS)
+                )
+                if surface_due and not self._finish_incoming_native_surfaces():
+                    continue
                 if self._checkpoint_group is not None and self._checkpoint_group.complete:
                     if self._checkpoint_commit_iterator is None:
                         self._checkpoint_commit_iterator = self._commit_checkpoint_steps(self._checkpoint_group)
@@ -11732,6 +11753,8 @@ class LiveCollaborationController:
                         self._checkpoint_group = None
                         self._checkpoint_commit_iterator = None
                     continue
+                if not self._incoming_operations:
+                    break
                 operation = self._incoming_operations[0]
                 if self._checkpoint_group is not None or (operation.get("system_snapshot") and operation.get("snapshot_group_id")):
                     if self._checkpoint_group is None:
@@ -11755,6 +11778,12 @@ class LiveCollaborationController:
                     node = self._segmentation_node()
                     if node is None:
                         return
+                    if self._incoming_surface_updates is None:
+                        begin_surfaces = getattr(self.owner, "begin_native_surface_updates", None)
+                        if callable(begin_surfaces):
+                            self._incoming_surface_updates = begin_surfaces(node)
+                            self._incoming_surface_started_at = time.perf_counter()
+                            self._incoming_surface_operations = 0
                     operation["_metadata_before"] = self._current_segment_metadata(node, operation["segment_id"])
                     baseline = self.baselines.get((node.GetID(), operation["segment_id"]))
                     if baseline is None:
@@ -11771,11 +11800,15 @@ class LiveCollaborationController:
                     self._append_history_operations([clean_operation])
                     self._incoming_operations.popleft()
                     self._incoming_iterator = None
+                    self._incoming_surface_operations += 1
                     self._refresh_label_combo()
                     continue
                 piece = self._incoming_piece
                 no_op = piece.get("_capacity_step") or (piece.get("_partial_operation") and not np.any(piece["_decoded"][0]))
-                if not no_op and self._apply_operations([piece]) is False:
+                surface_options = {}
+                if self._incoming_surface_updates is not None:
+                    surface_options["surface_updates"] = self._incoming_surface_updates
+                if not no_op and self._apply_operations([piece], **surface_options) is False:
                     self._incoming_retry_at = time.monotonic() + 1.0
                     return
                 self._incoming_piece = None
@@ -11783,7 +11816,8 @@ class LiveCollaborationController:
                 self.initial_sync_complete = True
                 self._initialize_baselines_and_seed(seed=False)
                 self._end_initial_scene_batch()
-            if (self._incoming_operations or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and not self._incoming_continuation_scheduled:
+            if (self._incoming_operations or getattr(self, "_incoming_surface_updates", None) is not None
+                    or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and not self._incoming_continuation_scheduled:
                 import qt
 
                 self._incoming_continuation_scheduled = True
@@ -11816,6 +11850,39 @@ class LiveCollaborationController:
             self.session_metrics.record("gui-incoming", elapsed)
             if elapsed >= 0.025:
                 self._diagnostic_event("gui.slow_incoming", duration_s=elapsed, pending=len(self._incoming_operations))
+
+    def _finish_incoming_native_surfaces(self):
+        """Convert changed native surfaces once for a short received cohort."""
+        if self._incoming_surface_updates is None:
+            return True
+        batch = self._incoming_surface_updates
+        operation_count = self._incoming_surface_operations
+        if self._incoming_surface_iterator is None:
+            self._incoming_surface_iterator = self._incoming_surface_updates.finish_steps()
+        started = time.perf_counter()
+        previous_applying = self._applying_remote
+        self._applying_remote = True
+        try:
+            next(self._incoming_surface_iterator)
+            return False
+        except StopIteration:
+            self._incoming_surface_updates = None
+            self._incoming_surface_iterator = None
+            self._incoming_surface_started_at = 0.0
+            self._incoming_surface_operations = 0
+            return True
+        except Exception:
+            self._incoming_surface_iterator = None
+            raise
+        finally:
+            self._applying_remote = previous_applying
+            elapsed = time.perf_counter() - started
+            self.session_metrics.record("gui-native-surface", elapsed)
+            if elapsed >= 0.025:
+                self._diagnostic_event("gui.native_surface", duration_s=elapsed,
+                                       segment_id=batch.last_segment_id,
+                                       conversions=batch.conversion_count,
+                                       operations=operation_count)
 
     def _begin_initial_scene_batch(self):
         """Native MRML models rebuild once for a known large initial replay.
@@ -11872,7 +11939,16 @@ class LiveCollaborationController:
                 if stage.get("local_changes"):
                     dirty.add(key)
             commit = getattr(self.owner, "commit_checkpoint_segments", None)
-            if not staged or (callable(commit) and commit(node, staged)):
+            surface_options = {}
+            if staged and self._incoming_surface_updates is None:
+                begin_surfaces = getattr(self.owner, "begin_native_surface_updates", None)
+                if callable(begin_surfaces):
+                    self._incoming_surface_updates = begin_surfaces(node)
+                    self._incoming_surface_started_at = time.perf_counter()
+                    self._incoming_surface_operations = 0
+            if self._incoming_surface_updates is not None:
+                surface_options["surface_updates"] = self._incoming_surface_updates
+            if not staged or (callable(commit) and commit(node, staged, **surface_options)):
                 break
             # A local stroke during staging invalidates the private copy, not
             # the stroke. Rebuild cooperatively from the current MRML revision.
@@ -11915,10 +11991,16 @@ class LiveCollaborationController:
             self._refresh_label_combo()
             self.session_metrics.increment("checkpoint_groups_applied")
             self.session_metrics.increment("checkpoint_voxel_replacements", len(staged))
+            self._incoming_surface_operations += len(group.records)
             self._diagnostic_event("checkpoint.committed", group_id=group.group_id, operation_count=group.count,
                                    native_replacements=len(staged), duration_s=time.monotonic()-checkpoint_started)
         finally:
             self._applying_remote = False
+
+        # The checkpoint's voxel/baseline transaction is already committed.
+        # Return to Qt between its full-resolution derived-surface conversions.
+        while not self._finish_incoming_native_surfaces():
+            yield None
 
     def _skip_damaged_operation(self, operation):
         """Pass over an operation nobody can apply and say so."""
@@ -12938,7 +13020,7 @@ class LiveCollaborationController:
         return values, blocked
 
     def _apply_exclusive_voxel_claims(
-        self, node, winning_segment_id, operation_bounds, claimed_voxels
+        self, node, winning_segment_id, operation_bounds, claimed_voxels, *, surface_updates=None
     ):
         """Apply global last-operation-wins ownership across all labels.
 
@@ -13006,6 +13088,7 @@ class LiveCollaborationController:
                 crop_updater = getattr(
                     self.owner, "update_segment_binary_labelmap_crop", None
                 )
+                surface_options = {} if surface_updates is None else {"surface_updates": surface_updates}
                 applied_incrementally = bool(
                     callable(crop_updater)
                     and crop_updater(
@@ -13015,6 +13098,7 @@ class LiveCollaborationController:
                         node,
                         other_segment_id,
                         self.owner.get_volume_node(),
+                        **surface_options,
                     )
                 )
                 if not applied_incrementally:
@@ -13047,7 +13131,7 @@ class LiveCollaborationController:
                 self.dirty_segments.add(other_key)
             self._remember_segment_revision(node, other_segment_id)
 
-    def _apply_operations(self, operations):
+    def _apply_operations(self, operations, *, surface_updates=None):
         import slicer
 
         apply_started = time.monotonic()
@@ -13158,6 +13242,7 @@ class LiveCollaborationController:
                         self._apply_exclusive_voxel_claims(
                             node, segment_id, operation["voxel_bbox"],
                             np.logical_and(changed, values != 0),
+                            surface_updates=surface_updates,
                         )
                     finally:
                         self._applying_remote = False
@@ -13279,6 +13364,7 @@ class LiveCollaborationController:
                     crop_updater = getattr(
                         self.owner, "update_segment_binary_labelmap_crop", None
                     )
+                    surface_options = {} if surface_updates is None else {"surface_updates": surface_updates}
                     applied_incrementally = bool(
                         callable(crop_updater)
                         and crop_updater(
@@ -13288,6 +13374,7 @@ class LiveCollaborationController:
                             node,
                             segment_id,
                             self.owner.get_volume_node(),
+                            **surface_options,
                         )
                     )
                 if not applied_incrementally:
@@ -13304,6 +13391,7 @@ class LiveCollaborationController:
                     segment_id,
                     operation_bounds,
                     claimed_voxels,
+                    surface_updates=surface_updates,
                 )
                 self.baselines[key] = baseline
                 self._ensure_independent_segment_labelmap(node, segment_id)

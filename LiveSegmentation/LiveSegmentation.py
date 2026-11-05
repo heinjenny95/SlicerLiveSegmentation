@@ -33,6 +33,68 @@ def clear_legacy_connection_settings():
 clear_legacy_connection_settings()
 
 
+class NativeSurfaceUpdateBatch:
+    """Coalesce native derived meshes for a short received operation cohort."""
+
+    def __init__(self, node):
+        self.node = node
+        segmentation = node.GetSegmentation()
+        self.original_surface_ids = {
+            str(sid) for sid in segmentation.GetSegmentIDs()
+            if segmentation.GetSegment(sid).GetRepresentation("Closed surface") is not None
+        }
+        self.requested = bool(self.original_surface_ids)
+        self.dirty_ids = set()
+        self.last_segment_id = None
+        self.conversion_count = 0
+
+    def record(self, node, segment_id, native_surface_requested):
+        if node != self.node:
+            raise ValueError("Native surface batch belongs to another segmentation")
+        segmentation = node.GetSegmentation()
+        if native_surface_requested and not self.requested:
+            self.requested = True
+            self.original_surface_ids = {
+                str(sid) for sid in segmentation.GetSegmentIDs()
+                if segmentation.GetSegment(sid).GetRepresentation("Closed surface") is not None
+            }
+        if self.requested:
+            self.dirty_ids.add(str(segment_id))
+
+    def finish_steps(self):
+        """Use the current native settings, yielding between affected labels."""
+        if not self.requested:
+            return
+        segmentation = self.node.GetSegmentation()
+        unaffected = {
+            sid for sid in self.original_surface_ids - self.dirty_ids
+            if segmentation.GetSegment(sid) is not None
+        }
+        logic = slicer.modules.segmentations.logic()
+        finished_ids = set()
+        for sid in sorted(self.dirty_ids):
+            watched = {item for item in unaffected | finished_ids if segmentation.GetSegment(item) is not None}
+            if watched and not any(segmentation.GetSegment(item).GetRepresentation("Closed surface") is not None for item in watched):
+                # Respect native Show 3D-off actions between yielded pieces or
+                # between conversions, including a cohort changing all labels.
+                self.dirty_ids.clear()
+                return
+            segment = segmentation.GetSegment(sid)
+            if segment is None:
+                continue
+            if segment.GetRepresentation("Closed surface") is None:
+                self.last_segment_id = sid
+                surface = logic.CreateRepresentationForOneSegment(segmentation, sid, "Closed surface")
+                if surface is None:
+                    raise RuntimeError("Slicer could not regenerate the changed native surface")
+                segment.AddRepresentation("Closed surface", surface)
+                segment.Modified()
+                self.conversion_count += 1
+            finished_ids.add(sid)
+            yield None
+        self.dirty_ids.clear()
+
+
 class LiveSegmentation(ScriptedLoadableModule):
     """Thin live-synchronization layer for Slicer's standard segmentation nodes."""
 
@@ -53,6 +115,10 @@ class LiveSegmentation(ScriptedLoadableModule):
 
 
 class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
+    @staticmethod
+    def begin_native_surface_updates(node):
+        return NativeSurfaceUpdateBatch(node)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.live_collaboration = None
@@ -973,7 +1039,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
 
     @classmethod
     def prepare_segment_labelmap_extent(
-        cls, segmentation_node, segment_id, reference_volume_node, voxel_bbox
+        cls, segmentation_node, segment_id, reference_volume_node, voxel_bbox, *, surface_updates=None
     ):
         """Grow an isolated layer with bounded copies before applying tiles.
 
@@ -1041,10 +1107,12 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         image.GetPointData().SetScalars(numpy_support.numpy_to_vtk(target.reshape(-1), deep=False))
         image.SetGeometryFromImageToWorldMatrix(matrix)
         native_surface = segmentation.ContainsRepresentation("Closed surface")
+        if surface_updates is not None:
+            surface_updates.record(segmentation_node, segment_id, native_surface)
         segment.RemoveAllRepresentations(binary_name)
         segment.AddRepresentation(binary_name, image)
         segment.Modified()
-        if native_surface:
+        if native_surface and surface_updates is None:
             segmentation.CreateRepresentation("Closed surface")
 
     @classmethod
@@ -1101,7 +1169,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 "volume": volume, "local_changes": local_changes}
 
     @classmethod
-    def commit_checkpoint_segments(cls, node, stages):
+    def commit_checkpoint_segments(cls, node, stages, *, surface_updates=None):
         """Verify all staged images before a short, render-blocked pointer swap."""
         binary = vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
         segmentation = node.GetSegmentation()
@@ -1118,6 +1186,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             if current_matrix is None or not cls._matrices_match(current_matrix, stage["matrix"]):
                 return False
         native_surface = segmentation.ContainsRepresentation("Closed surface")
+        if surface_updates is not None:
+            for stage in stages:
+                surface_updates.record(node, stage["segment_id"], native_surface)
         with slicer.util.RenderBlocker():
             modify = node.StartModify()
             try:
@@ -1129,7 +1200,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                     segment.Modified()
             finally:
                 node.EndModify(modify)
-            if native_surface:
+            if native_surface and surface_updates is None:
                 segmentation.CreateRepresentation("Closed surface")
         return True
 
@@ -1142,6 +1213,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         segmentation_node,
         segment_id,
         reference_volume_node,
+        *,
+        surface_updates=None,
     ):
         """Apply additions/removals only inside a small reference-geometry crop."""
         current = np.asarray(current_crop, dtype=np.uint8)
@@ -1181,6 +1254,8 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
             )
             if contained and isolated and cls._matrices_match(image_matrix, reference_matrix):
                 native_surface = segmentation.ContainsRepresentation("Closed surface")
+                if surface_updates is not None:
+                    surface_updates.record(segmentation_node, segment_id, native_surface)
                 internal = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
                     segmentation_node, segment_id
                 )
@@ -1192,7 +1267,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 # through vtkSegmentation's global source-image observer.
                 segment.RemoveAllRepresentations(binary_name)
                 segment.Modified()
-                if native_surface:
+                if native_surface and surface_updates is None:
                     # Preserve the representation the user requested through
                     # native Show 3D, using Slicer's own conversion parameters.
                     segmentation.CreateRepresentation("Closed surface")
