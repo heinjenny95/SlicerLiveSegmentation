@@ -107,6 +107,7 @@ SHARED_FOLDER_SCHEMA_VERSION = 3
 SHARED_FOLDER_MINIMUM_PLUGIN_VERSION = MINIMUM_COMPATIBLE_PLUGIN_VERSION
 MAX_PARALLEL_IO_WORKERS = 8
 RECENT_FEED_LIMIT = 1000
+HISTORY_ROW_LIMIT = 1000
 INLINE_OPERATION_LIMIT = 8
 INLINE_OPERATION_BYTES_LIMIT = 256 * 1024
 SEQUENCE_HEAD_FILENAME = "sequence-head.json"
@@ -5592,6 +5593,8 @@ class LiveCollaborationController:
         self.chat_anchors = {}
         self.history_records = []
         self.history_sequences = set()
+        self._history_segment_ids = set()
+        self._last_own_history_record = None
         self.conflicts_state = []
         self.material_template_state = None
         self.backup_records = []
@@ -7071,6 +7074,7 @@ class LiveCollaborationController:
         )
         self.activity_dock_text = qt.QPlainTextEdit()
         self.activity_dock_text.setReadOnly(True)
+        self.activity_dock_text.setMaximumBlockCount(HISTORY_ROW_LIMIT)
         self.activity_dock_text.setPlaceholderText("Your and collaborators' label changes appear here")
         self.activity_dock.setWidget(self.activity_dock_text)
         main_window.addDockWidget(qt.Qt.RightDockWidgetArea, self.activity_dock)
@@ -7643,7 +7647,7 @@ class LiveCollaborationController:
 
     def undo_last_shared_edit(self, checked=False):
         del checked
-        target = next(
+        target = getattr(self, "_last_own_history_record", None) or next(
             (
                 record
                 for record in sorted(
@@ -8450,6 +8454,8 @@ class LiveCollaborationController:
             self.chat_anchors.clear()
             self.history_records.clear()
             self.history_sequences.clear()
+            self._history_segment_ids.clear()
+            self._last_own_history_record = None
             self.conflicts_state.clear()
             self.backup_records.clear()
             self.last_diagnostics = None
@@ -8776,6 +8782,8 @@ class LiveCollaborationController:
         self.chat_anchors.clear()
         self.history_records.clear()
         self.history_sequences.clear()
+        self._history_segment_ids.clear()
+        self._last_own_history_record = None
         self.conflicts_state.clear()
         self.material_template_state = None
         self.backup_records.clear()
@@ -10690,7 +10698,6 @@ class LiveCollaborationController:
             self._edit_pull_pending = False
             raise
 
-
     def _edit_pull_lane(
         self, session_token, client, room_id, after_sequence, operation_limit=500,
         byte_budget=MAX_INCOMING_PACKED_BYTES,
@@ -12068,6 +12075,9 @@ class LiveCollaborationController:
             # A local stroke during staging invalidates the private copy, not
             # the stroke. Rebuild cooperatively from the current MRML revision.
             yield None
+        native_replacements = len(staged)
+        staged.clear()
+        stage = None  # The generator's final loop variable also owns an old image.
         self._applying_remote = True
         try:
             for segment_id, baseline in group.baselines.items():
@@ -12105,10 +12115,10 @@ class LiveCollaborationController:
             self._append_history_operations([group.records[0]])
             self._refresh_label_combo()
             self.session_metrics.increment("checkpoint_groups_applied")
-            self.session_metrics.increment("checkpoint_voxel_replacements", len(staged))
+            self.session_metrics.increment("checkpoint_voxel_replacements", native_replacements)
             self._incoming_surface_operations += len(group.records)
             self._diagnostic_event("checkpoint.committed", group_id=group.group_id, operation_count=group.count,
-                                   native_replacements=len(staged), duration_s=time.monotonic()-checkpoint_started)
+                                   native_replacements=native_replacements, duration_s=time.monotonic()-checkpoint_started)
         finally:
             self._applying_remote = False
 
@@ -12520,15 +12530,19 @@ class LiveCollaborationController:
     def _append_history_operations(self, operations):
         import qt
 
-        known_segments = {
-            str(record.get("segment_id") or "")
-            for record in self.history_records
-            if record.get("segment_id")
-        }
+        known_segments = getattr(self, "_history_segment_ids", None)
+        if known_segments is None:
+            self._history_segment_ids = known_segments = {
+                str(record["segment_id"]) for record in self.history_records if record.get("segment_id")
+            }
+        query = str(self._text(self.history_filter_edit)).casefold()
         for record in sorted(operations, key=lambda item: int(item.get("sequence", 0))):
             sequence = int(record.get("sequence", 0) or 0)
             if sequence <= 0 or sequence in self.history_sequences:
                 continue
+            previous_action = record.get("_history_action")
+            previous_type = record.get("_history_type")
+            record = operation_summary(record)
             segment_id = str(record.get("segment_id") or "")
             segment_name = str(record.get("segment_name") or segment_id or "label")
             author = str(record.get("author") or "Unknown")
@@ -12565,26 +12579,35 @@ class LiveCollaborationController:
                 known_segments.discard(segment_id)
             else:
                 known_segments.add(segment_id)
-            item = qt.QTreeWidgetItem(
-                [
-                    self._local_clock_text(record.get("created_at"), include_seconds=True),
-                    action,
-                    str(sequence),
-                    str(record.get("changed_voxels", "")),
-                    activity_type,
-                ]
-            )
+            # Preserve already-rendered descriptions when a bounded server
+            # history page is merged with the current local timeline.
+            action = str(previous_action) if previous_action is not None else action
+            activity_type = str(previous_type) if previous_type is not None else activity_type
+            record["_history_action"] = action
+            record["_history_type"] = activity_type
+            values = [self._local_clock_text(record.get("created_at"), include_seconds=True),
+                      action, str(sequence), str(record.get("changed_voxels", "")), activity_type]
+            item = qt.QTreeWidgetItem(values)
             item.setData(0, 32, sequence)
             self.history_tree.insertTopLevelItem(0, item)
-            self.history_records.append(dict(record))
+            item.setHidden(bool(query) and query not in " ".join(values).casefold())
+            self.history_records.append(record)
             self.history_sequences.add(sequence)
-        self.filter_history_tree()
+            latest_own = getattr(self, "_last_own_history_record", None)
+            if (author == self.user_name and not record.get("system_snapshot")
+                    and (latest_own is None or sequence > int(latest_own["sequence"]))):
+                self._last_own_history_record = record
+            while len(self.history_records) > HISTORY_ROW_LIMIT:
+                dropped = self.history_records.pop(0)
+                self.history_sequences.discard(int(dropped["sequence"]))
+                old_item = self.history_tree.takeTopLevelItem(len(self.history_records))
+                del old_item
 
     def _update_advanced_state(self, advanced):
         import qt
 
         merged_history = {
-            int(record.get("sequence", 0)): dict(record)
+            int(record.get("sequence", 0)): operation_summary(record)
             for record in (advanced.get("history") or [])
             if int(record.get("sequence", 0) or 0) > 0
         }

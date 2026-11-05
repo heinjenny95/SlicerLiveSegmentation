@@ -34,10 +34,14 @@ class CheckpointGroup:
         segment_id = str(operation["segment_id"])
         if operation.get("_undecodable"):
             raise ValueError("Damaged checkpoint part; local labels retained")
+        # Once ingested, baselines own the voxels. Keep only the metadata
+        # required for the eventual atomic commit and local acknowledgements.
+        record = {key: value for key, value in operation.items()
+                  if key != "payload" and not key.startswith("_")}
         if operation.get("segment_order") is not None:
-            self.order = operation
+            self.order = record
         elif operation.get("segment_deleted"):
-            self.deletions[segment_id] = operation
+            self.deletions[segment_id] = record
             self.baselines.pop(segment_id, None)
         else:
             baseline = self.baselines.setdefault(segment_id, self.baseline_factory(self.shape))
@@ -49,9 +53,9 @@ class CheckpointGroup:
                 changed, values = tile["_decoded"]
                 baseline.set_region(tile["voxel_bbox"], changed, values)
                 yield None
-            self.metadata[segment_id] = operation
+            self.metadata[segment_id] = record
             self.deletions.pop(segment_id, None)
-        self.records.append({key: value for key, value in operation.items() if not key.startswith("_")})
+        self.records.append(record)
         self.index += 1
         self.last_sequence = int(operation["sequence"])
 

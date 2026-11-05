@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Bound the local timeline to 1000 payload-free summaries, retain only the last
+  1000 activity text blocks, and filter new rows incrementally during replay.
+  Retain the latest own shared-edit Undo target
+  independently of that window. Release ingested checkpoint payloads and
+  replaced native images before subsequent derived-surface work.
+
 - Keep one edit-pull request reserved until its result is consumed, preventing
   duplicate catch-up pages when a native write outlasts a worker. Fetch initial
   state in up to 64-operation background pages with a 128-operation / 32 MiB
