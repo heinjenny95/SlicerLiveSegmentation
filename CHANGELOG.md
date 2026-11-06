@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep a locally committed label name and color when a peer's edit arrives
+  before the deferred native event can queue the rename. Use the current local
+  metadata when completing a tiled incoming edit so a rename made between
+  tiles is still published in order.
+
 - Refresh the label picker once when the initial room state is ready instead
   of rescanning every label after each historical edit. Historical edit
   notices stay in activity and diagnostics without interrupting the join

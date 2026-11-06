@@ -13234,6 +13234,24 @@ class LiveCollaborationController:
         created = segment is None
         if segment is None:
             segment = slicer.vtkSegment()
+        elif self.initial_sync_complete and (
+            segment_id in self._pending_segmentation_event_ids
+            or self._pending_segmentation_event_unspecified
+        ):
+            # A native rename can have committed while its VTK notification is
+            # still waiting in the deferred event queue. Capture that intent
+            # before an incoming edit replaces the name or remembers the new
+            # name as if it had already been synchronized.
+            previous = self._segment_metadata.get(segment_id)
+            current = self._current_segment_metadata(node, segment_id)
+            if (previous is not None and current != previous
+                    and self._current_role() != "viewer" and not self._locked_by_other(segment_id)):
+                key = (node.GetID(), segment_id)
+                self._segment_metadata[segment_id] = current
+                self.metadata_updates.add(key)
+                self.dirty_segments.add(key)
+                self._force_sync_refresh = True
+                self._announce_local_label_metadata(previous, current)
         # Voxel patches carry metadata only as context. Applying it on every
         # patch lets a delayed paint operation revert a newer rename or color
         # change. New segments need initial metadata; existing segments change
@@ -13642,24 +13660,6 @@ class LiveCollaborationController:
                 self._ensure_segment(node, operation)
                 self._apply_segment_order_to_node(node)
                 self._ensure_independent_segment_labelmap(node, segment_id)
-                if (
-                    key in self.metadata_updates
-                    and metadata_before is not None
-                ):
-                    # A local rename/color change that has not been published
-                    # yet is analogous to an unsent local voxel edit: keep it
-                    # visible and let its later ordered operation decide the
-                    # final shared state.
-                    local_segment = node.GetSegmentation().GetSegment(segment_id)
-                    local_segment.SetName(metadata_before["segment_name"])
-                    local_color = metadata_before["color_hex"].lstrip("#")
-                    local_segment.SetColor(
-                        *(
-                            int(local_color[index : index + 2], 16) / 255.0
-                            for index in (0, 2, 4)
-                        )
-                    )
-                    self._remember_segment_metadata(node, segment_id)
                 metadata_after = self._current_segment_metadata(node, segment_id)
                 operation_bounds = [
                     int(value) for value in operation["voxel_bbox"]
