@@ -48,6 +48,7 @@ class NativeSurfaceUpdateBatch:
         self.last_segment_id = None
         self.conversion_count = 0
         self.binary_notifications = {}
+        self._native_representation_event = False
 
     def record(self, node, segment_id, native_surface_requested):
         if node != self.node:
@@ -76,6 +77,11 @@ class NativeSurfaceUpdateBatch:
         self.binary_notifications[str(segment_id)] = segment
         return True
 
+    def native_representations_changed(self):
+        # Check the final native state after the event stack returns. A native
+        # edit may invalidate all meshes and regenerate them in the same call.
+        self._native_representation_event = True
+
     def finish_steps(self):
         """Use the current native settings, yielding between affected labels."""
         segmentation = self.node.GetSegmentation()
@@ -94,11 +100,16 @@ class NativeSurfaceUpdateBatch:
         finished_ids = set()
         for sid in sorted(self.dirty_ids):
             watched = {item for item in unaffected | finished_ids if segmentation.GetSegment(item) is not None}
-            if watched and not any(segmentation.GetSegment(item).GetRepresentation("Closed surface") is not None for item in watched):
+            check_all = self._native_representation_event
+            self._native_representation_event = False
+            if check_all:
+                watched = segmentation.GetSegmentIDs()
+            if (check_all or watched) and not any(
+                segmentation.GetSegment(item).GetRepresentation("Closed surface") is not None for item in watched
+            ):
                 # Respect native Show 3D-off actions between yielded pieces or
                 # between conversions, including a cohort changing all labels.
-                self.dirty_ids.clear()
-                return
+                break
             segment = segmentation.GetSegment(sid)
             if segment is None:
                 continue

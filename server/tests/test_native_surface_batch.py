@@ -233,6 +233,39 @@ def test_show_3d_off_between_conversions_stops_an_all_label_cohort():
     assert not batch.dirty_ids
 
 
+@pytest.mark.parametrize("restore_other_surface", [False, True])
+def test_native_representation_change_checks_current_surfaces_before_rebuild(monkeypatch, restore_other_surface):
+    from tests import controller_harness as harness
+
+    batch_type, cls, node, segmentation, single = native_scope()
+    scene, _ = harness.install_fake_slicer(monkeypatch)
+    controller = harness.Peer("receiver", scene).controller
+    controller._observed_segmentation = segmentation
+    batch = controller._incoming_surface_updates = batch_type(node)
+    write_tiles(cls, node, segmentation, surface_updates=batch)
+    values = segmentation.GetSegment("B").values[:2, :2, :2].copy()
+    assert cls.update_segment_binary_labelmap_crop(
+        values, 1-values, [0, 2, 0, 2, 0, 2], node, "B", object(), surface_updates=batch
+    )
+    assert all(s.GetRepresentation(SURFACE) is None for s in segmentation.segments.values())
+    steps = batch.finish_steps()
+    assert next(steps) is None  # The first binary notification yielded to Qt.
+    # Native RemoveRepresentation emits its global event even if the per-label
+    # invalidation already removed every surface before the user clicked off.
+    on_change = getattr(controller, "_on_native_representation_change", lambda *_: None)
+    on_change(segmentation, "ContainedRepresentationNamesModified")
+    if restore_other_surface:
+        # A local native edit can regenerate its surface before Qt resumes us.
+        segmentation.GetSegment("B").AddRepresentation(SURFACE, object())
+        assert list(steps) == [None, None, None]
+        single.assert_called_once_with(segmentation, "A", SURFACE)
+    else:
+        assert list(steps) == [None]
+        single.assert_not_called()
+    assert not batch.dirty_ids
+    np.testing.assert_array_equal(segmentation.GetSegment("B").values[:2, :2, :2], 1-values)
+
+
 def received_cohorts(monkeypatch, *, expire_after_first=False):
     from tests import controller_harness as harness
 

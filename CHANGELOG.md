@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Respect native Show 3D being switched off while incoming changes temporarily
+  invalidate every cached mesh. Keep the pending binary display update and
+  cancel the pending surface regeneration.
+
 - Coalesce received binary labelmap notifications while native Show 3D is
   enabled as well. Invalidate stale meshes immediately and refresh each changed
   surface with Slicer's full-resolution converter at the end of its cohort.

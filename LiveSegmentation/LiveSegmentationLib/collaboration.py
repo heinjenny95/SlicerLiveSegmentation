@@ -9213,6 +9213,10 @@ class LiveCollaborationController:
             vtkSegmentationCore.vtkSegmentation.SegmentsOrderModified,
             lambda caller, event: self._on_segmentation_modified(caller, event),
         ))
+        self._observer_tags.append(self._observed_segmentation.AddObserver(
+            vtkSegmentationCore.vtkSegmentation.ContainedRepresentationNamesModified,
+            self._on_native_representation_change,
+        ))
         string_events = (
             vtkSegmentationCore.vtkSegmentation.SegmentAdded,
             vtkSegmentationCore.vtkSegmentation.SegmentRemoved,
@@ -9249,6 +9253,11 @@ class LiveCollaborationController:
                 source_callback,
             )
         )
+
+    def _on_native_representation_change(self, caller, _event):
+        if (self.connected and not self._applying_remote
+                and caller == self._observed_segmentation and self._incoming_surface_updates is not None):
+            self._incoming_surface_updates.native_representations_changed()
 
     @staticmethod
     def _segment_revision(node, segment_id):
