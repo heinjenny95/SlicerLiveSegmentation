@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Coalesce the native display notification for received in-place 2D labelmap
+  writes until the current batch finishes. Apply voxels and scalar revisions
+  immediately. Keep native surface conversion and ordinary writes unchanged.
+
 - Accept the shared label order while a native name editor is open and apply
   its latest visible order after Enter or Escape. Defer row-control repairs
   until then, preserving the selected label and scroll position.

@@ -34,7 +34,7 @@ clear_legacy_connection_settings()
 
 
 class NativeSurfaceUpdateBatch:
-    """Coalesce native derived meshes for a short received operation cohort."""
+    """Coalesce native display work for a short received operation cohort."""
 
     def __init__(self, node):
         self.node = node
@@ -47,6 +47,7 @@ class NativeSurfaceUpdateBatch:
         self.dirty_ids = set()
         self.last_segment_id = None
         self.conversion_count = 0
+        self.binary_notifications = {}
 
     def record(self, node, segment_id, native_surface_requested):
         if node != self.node:
@@ -61,11 +62,28 @@ class NativeSurfaceUpdateBatch:
         if self.requested:
             self.dirty_ids.add(str(segment_id))
 
+    def defer_binary_notification(self, segment_id, segment, binary_name):
+        """Group display notifications only while no derived data is cached."""
+        names = []
+        try:
+            segment.GetContainedRepresentationNames(names)
+        except (AttributeError, TypeError):
+            return False
+        if names != [binary_name]:
+            return False
+        self.binary_notifications[str(segment_id)] = segment
+        return True
+
     def finish_steps(self):
         """Use the current native settings, yielding between affected labels."""
+        segmentation = self.node.GetSegmentation()
+        while self.binary_notifications:
+            sid, segment = self.binary_notifications.popitem()
+            if segmentation.GetSegment(sid) == segment:
+                segment.Modified()
+                yield None
         if not self.requested:
             return
-        segmentation = self.node.GetSegmentation()
         unaffected = {
             sid for sid in self.original_surface_ids - self.dirty_ids
             if segmentation.GetSegment(sid) is not None
@@ -1265,8 +1283,15 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 # This layer is isolated. Invalidate only its derived meshes;
                 # image.Modified() invalidates every label's representation
                 # through vtkSegmentation's global source-image observer.
+                defer_notification = (
+                    surface_updates is not None and not native_surface
+                    and not surface_updates.requested
+                    and segmentation.GetSourceRepresentationName() == binary_name
+                    and surface_updates.defer_binary_notification(segment_id, segment, binary_name)
+                )
                 segment.RemoveAllRepresentations(binary_name)
-                segment.Modified()
+                if not defer_notification:
+                    segment.Modified()
                 if native_surface and surface_updates is None:
                     # Preserve the representation the user requested through
                     # native Show 3D, using Slicer's own conversion parameters.

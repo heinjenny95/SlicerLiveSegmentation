@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
 
 BINARY = "Binary labelmap"
 SURFACE = "Closed surface"
@@ -20,6 +21,9 @@ class Segment:
 
     def GetRepresentation(self, name):
         return self.representations.get(name)
+
+    def GetContainedRepresentationNames(self, names):
+        names.extend(self.representations)
 
     def RemoveAllRepresentations(self, except_name):
         self.representations = {except_name: self.representations[except_name]}
@@ -41,6 +45,9 @@ class Segmentation:
 
     def GetSegment(self, sid):
         return self.segments.get(sid)
+
+    def GetSourceRepresentationName(self):
+        return BINARY
 
     def ContainsRepresentation(self, name):
         # Native Slicer checks the first segment, assuming representation types
@@ -129,15 +136,63 @@ def test_batch_respects_native_show_3d_off_and_deleted_labels():
     single.assert_not_called()
 
 
-def test_2d_only_batch_does_not_create_native_surfaces():
+def test_2d_batch_writes_scalars_immediately_and_notifies_once_at_flush():
     batch_type, cls, node, segmentation, single = native_scope()
     for segment in segmentation.segments.values():
         segment.RemoveAllRepresentations(BINARY)
     batch = batch_type(node)
-    write_tiles(cls, node, segmentation, surface_updates=batch)
-    assert list(batch.finish_steps()) == []
+    segment = segmentation.GetSegment("A")
+    scalars = segment.image.GetPointData().GetScalars()
+    for index in range(3):
+        before = segment.values[:2, :2, :2].copy()
+        assert cls.update_segment_binary_labelmap_crop(
+            before, 1-before, [0, 2, 0, 2, 0, 2], node, "A", object(), surface_updates=batch
+        )
+        np.testing.assert_array_equal(segment.values[:2, :2, :2], 1-before)
+        assert scalars.Modified.call_count == index+1
+        segment.Modified.assert_not_called()
+    assert list(batch.finish_steps()) == [None]
+    segment.Modified.assert_called_once()
     assert segmentation.global_conversions == 0
     single.assert_not_called()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_2d_notification_skips_removed_or_replaced_segment(replacement):
+    batch_type, cls, node, segmentation, _ = native_scope()
+    original = segmentation.GetSegment("A")
+    for segment in segmentation.segments.values():
+        segment.RemoveAllRepresentations(BINARY)
+    batch = batch_type(node)
+    write_tiles(cls, node, segmentation, surface_updates=batch)
+    del segmentation.segments["A"]
+    if replacement:
+        segmentation.segments["A"] = Segment(np.zeros((8,)*3, np.uint8))
+    assert list(batch.finish_steps()) == []
+    original.Modified.assert_not_called()
+    if replacement:
+        segmentation.GetSegment("A").Modified.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["local", "other-representation", "unknown-representations"])
+def test_2d_noncohort_and_representation_fallback_notify_immediately(mode):
+    batch_type, cls, node, segmentation, _ = native_scope()
+    for segment in segmentation.segments.values():
+        segment.RemoveAllRepresentations(BINARY)
+    segment = segmentation.GetSegment("A")
+    if mode == "other-representation":
+        segment.AddRepresentation("Fractional labelmap", object())
+    if mode == "unknown-representations":
+        segment.GetContainedRepresentationNames = Mock(side_effect=TypeError)
+    batch = None if mode == "local" else batch_type(node)
+    before = segment.values[:2, :2, :2].copy()
+    assert cls.update_segment_binary_labelmap_crop(
+        before, 1-before, [0, 2, 0, 2, 0, 2], node, "A", object(), surface_updates=batch
+    )
+    segment.Modified.assert_called_once()
+    assert set(segment.representations) == {BINARY}
+    if batch is not None:
+        assert list(batch.finish_steps()) == []
 
 
 def test_batch_uses_existing_other_surface_when_first_native_cache_is_missing():
