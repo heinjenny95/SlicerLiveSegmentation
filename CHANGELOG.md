@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Coalesce received binary labelmap notifications while native Show 3D is
+  enabled as well. Invalidate stale meshes immediately and refresh each changed
+  surface with Slicer's full-resolution converter at the end of its cohort.
+
 - Coalesce the native display notification for received in-place 2D labelmap
   writes until the current batch finishes. Apply voxels and scalar revisions
   immediately. Keep native surface conversion and ordinary writes unchanged.

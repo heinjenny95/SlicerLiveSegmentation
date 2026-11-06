@@ -26,10 +26,17 @@ class Segment:
         names.extend(self.representations)
 
     def RemoveAllRepresentations(self, except_name):
+        had_derived_representation = any(name != except_name for name in self.representations)
         self.representations = {except_name: self.representations[except_name]}
+        if had_derived_representation:
+            self.Modified()
 
     def AddRepresentation(self, name, value):
+        if self.representations.get(name) is value:
+            return False
         self.representations[name] = value
+        self.Modified()
+        return True
 
     def GetLabelValue(self):
         return 1
@@ -98,15 +105,19 @@ def write_tiles(cls, node, segmentation, **options):
 def test_many_remote_tiles_convert_once_with_native_single_segment_converter():
     batch_type, cls, node, segmentation, single = native_scope()
     batch = batch_type(node)
+    segment = segmentation.GetSegment("A")
     other_surface = segmentation.GetSegment("B").GetRepresentation(SURFACE)
     write_tiles(cls, node, segmentation, surface_updates=batch)
     assert segmentation.global_conversions == 0
     assert not segmentation.ContainsRepresentation(SURFACE)
-    assert segmentation.GetSegment("A").GetRepresentation(SURFACE) is None
+    assert segment.GetRepresentation(SURFACE) is None
+    assert segment.image.GetPointData().GetScalars().Modified.call_count == 12
+    segment.Modified.assert_called_once()  # Removing the stale surface notifies once.
     assert batch.requested and batch.dirty_ids == {"A"}
-    assert list(batch.finish_steps()) == [None]
+    assert list(batch.finish_steps()) == [None, None]
     single.assert_called_once_with(segmentation, "A", SURFACE)
-    assert segmentation.GetSegment("A").GetRepresentation(SURFACE) is not None
+    assert segment.GetRepresentation(SURFACE) is not None
+    assert segment.Modified.call_count == 3  # Invalidation, binary refresh and new surface.
     assert segmentation.GetSegment("B").GetRepresentation(SURFACE) is other_surface
     assert not np.any(segmentation.GetSegment("B").values)
 
@@ -142,6 +153,7 @@ def test_2d_batch_writes_scalars_immediately_and_notifies_once_at_flush():
         segment.RemoveAllRepresentations(BINARY)
     batch = batch_type(node)
     segment = segmentation.GetSegment("A")
+    segment.Modified.reset_mock()
     scalars = segment.image.GetPointData().GetScalars()
     for index in range(3):
         before = segment.values[:2, :2, :2].copy()
@@ -163,6 +175,7 @@ def test_2d_notification_skips_removed_or_replaced_segment(replacement):
     original = segmentation.GetSegment("A")
     for segment in segmentation.segments.values():
         segment.RemoveAllRepresentations(BINARY)
+        segment.Modified.reset_mock()
     batch = batch_type(node)
     write_tiles(cls, node, segmentation, surface_updates=batch)
     del segmentation.segments["A"]
@@ -184,12 +197,13 @@ def test_2d_noncohort_and_representation_fallback_notify_immediately(mode):
         segment.AddRepresentation("Fractional labelmap", object())
     if mode == "unknown-representations":
         segment.GetContainedRepresentationNames = Mock(side_effect=TypeError)
+    segment.Modified.reset_mock()
     batch = None if mode == "local" else batch_type(node)
     before = segment.values[:2, :2, :2].copy()
     assert cls.update_segment_binary_labelmap_crop(
         before, 1-before, [0, 2, 0, 2, 0, 2], node, "A", object(), surface_updates=batch
     )
-    segment.Modified.assert_called_once()
+    assert segment.Modified.call_count == (2 if mode == "other-representation" else 1)
     assert set(segment.representations) == {BINARY}
     if batch is not None:
         assert list(batch.finish_steps()) == []

@@ -63,13 +63,15 @@ class NativeSurfaceUpdateBatch:
             self.dirty_ids.add(str(segment_id))
 
     def defer_binary_notification(self, segment_id, segment, binary_name):
-        """Group display notifications only while no derived data is cached."""
+        """Group display notifications for binary labelmaps and native surfaces."""
         names = []
         try:
             segment.GetContainedRepresentationNames(names)
         except (AttributeError, TypeError):
             return False
-        if names != [binary_name]:
+        if names != [binary_name] and not (
+            self.requested and set(names) == {binary_name, "Closed surface"}
+        ):
             return False
         self.binary_notifications[str(segment_id)] = segment
         return True
@@ -106,7 +108,6 @@ class NativeSurfaceUpdateBatch:
                 if surface is None:
                     raise RuntimeError("Slicer could not regenerate the changed native surface")
                 segment.AddRepresentation("Closed surface", surface)
-                segment.Modified()
                 self.conversion_count += 1
             finished_ids.add(sid)
             yield None
@@ -1284,8 +1285,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
                 # image.Modified() invalidates every label's representation
                 # through vtkSegmentation's global source-image observer.
                 defer_notification = (
-                    surface_updates is not None and not native_surface
-                    and not surface_updates.requested
+                    surface_updates is not None
                     and segmentation.GetSourceRepresentationName() == binary_name
                     and surface_updates.defer_binary_notification(segment_id, segment, binary_name)
                 )
