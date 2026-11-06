@@ -12297,6 +12297,10 @@ class LiveCollaborationController:
                 if same:
                     continue
                 self._ensure_segment(node, group.metadata[segment_id])
+                # A lock or editor notification can run between staging steps.
+                # The placeholder already belongs to the room and must not be
+                # adopted as a locally created label while its mask is prepared.
+                self._known_segment_ids.add(segment_id)
                 prepare = getattr(self.owner, "stage_checkpoint_segment_steps", None)
                 if not callable(prepare):
                     raise LiveCollaborationError("Atomic checkpoint preparation unavailable; local labels retained")
@@ -12315,7 +12319,13 @@ class LiveCollaborationController:
                     self._incoming_surface_operations = 0
             if self._incoming_surface_updates is not None:
                 surface_options["surface_updates"] = self._incoming_surface_updates
-            if not staged or (callable(commit) and commit(node, staged, **surface_options)):
+            applying = self._applying_remote
+            self._applying_remote = True
+            try:
+                committed = not staged or (callable(commit) and commit(node, staged, **surface_options))
+            finally:
+                self._applying_remote = applying
+            if committed:
                 break
             # A local stroke during staging invalidates the private copy, not
             # the stroke. Rebuild cooperatively from the current MRML revision.

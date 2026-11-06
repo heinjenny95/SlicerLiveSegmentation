@@ -262,11 +262,14 @@ class Peer:
             operation["_packed"] = collaboration.PackedOperationMask(operation)
         self.controller._incoming_operations.append(operation)
         for _ in range(1000):
-            if not self.controller._incoming_operations:
+            checkpoint = self.controller._checkpoint_group
+            if not self.controller._incoming_operations and (checkpoint is None or not checkpoint.complete):
                 break
             self.controller._incoming_retry_at = 0
             self.controller._drain_incoming_operations()
         assert not self.controller._incoming_operations, "incoming operation is stuck"
+        checkpoint = self.controller._checkpoint_group
+        assert checkpoint is None or not checkpoint.complete, "complete checkpoint is stuck"
 
 
 class RoomLog:

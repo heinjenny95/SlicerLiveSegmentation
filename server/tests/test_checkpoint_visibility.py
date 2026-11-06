@@ -104,6 +104,56 @@ def test_changed_checkpoint_is_staged_and_preserves_local_edits(monkeypatch):
     assert not peer.errors
 
 
+def test_checkpoint_staging_keeps_remote_ids_during_deferred_native_events(monkeypatch):
+    from checkpoints import CheckpointGroup
+
+    scene, _ = harness.install_fake_slicer(monkeypatch)
+    peer = harness.Peer("receiver", scene)
+    controller = peer.controller
+    controller._observed_node = peer.node
+    segmentation = peer.node.GetSegmentation()
+    controller._observed_segmentation = segmentation
+    c = harness.collaboration
+    target = np.zeros(harness.SHAPE, np.uint8)
+    target[1, 1, 1] = 1
+    operation = {**c.encode_mask_delta(np.zeros_like(target), target, replace=True),
+                 "segment_id": "Segment_1", "segment_name": "Remote organ", "author": "peer",
+                 "sequence": 1, "snapshot_group_id": "stage", "snapshot_group_index": 0,
+                 "snapshot_group_count": 1, "system_snapshot": True}
+    group = CheckpointGroup(operation, harness.SHAPE, c.ChunkedMaskBaseline, c.iter_operation_tiles)
+    list(group.ingest(operation))
+    steps = controller._commit_checkpoint_steps(group)
+    next(steps)
+    assert segmentation.GetSegment("Segment_1") is not None
+    assert not controller._applying_remote
+
+    # A room lock refresh changes tags on the staged row. Another genuine
+    # local event can arrive before the checkpoint resumes.
+    segmentation.AddSegment(harness.FakeSegment(), "Segment_2")
+    controller._on_segmentation_modified(segment_id="Segment_1")
+    controller._on_segmentation_modified(segment_id="Segment_2")
+    controller._flush_segmentation_events(controller._segmentation_event_generation)
+    assert segmentation.GetSegment("Segment_1") is not None, "Deferred events re-keyed a staged remote label"
+    local_id, = set(segmentation.GetSegmentIDs()) - {"Segment_1"}
+    assert local_id.startswith("LiveSeg-")
+    assert (peer.node.GetID(), "Segment_1") not in controller.force_snapshots
+    assert (peer.node.GetID(), local_id) in controller.force_snapshots
+
+    original_commit = controller.owner.commit_checkpoint_segments
+
+    def commit(node, stages):
+        result = original_commit(node, stages)
+        controller._on_segmentation_modified(segment_id="Segment_1")
+        return result
+
+    controller.owner.commit_checkpoint_segments = commit
+    list(steps)
+    assert not controller._pending_segmentation_event_ids
+    assert set(segmentation.GetSegmentIDs()) == {"Segment_1", local_id}
+    np.testing.assert_array_equal(peer.mask("Segment_1"), target)
+    assert controller.last_sequence == 1
+
+
 def test_missing_checkpoint_part_keeps_visible_state_and_cursor(monkeypatch):
     monkeypatch.setattr(harness, "SHAPE", (128, 128, 128))
     scene, _ = harness.install_fake_slicer(monkeypatch)

@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep room label IDs stable while a checkpoint is prepared. Deferred native
+  events cannot reclassify staged remote labels as locally created ones, and
+  the native checkpoint swap does not queue local edit notifications.
+
 - Keep the native editable-area mode during bounded live-room Paint. Slicer
   masks the stroke before regional ownership checks protect locked siblings.
   Restore the normal overwrite mode when leaving the bounded Paint path.
