@@ -170,3 +170,31 @@ def test_protection_also_applies_while_the_target_is_locally_deleted(monkeypatch
                                protected_segment_ids=["A"]), "bob"))
     assert peer.mask("B") is None
     assert peer.mask("A")[5, 5, 5] == 1
+
+
+def test_protected_claim_checks_only_relevant_locked_crops(monkeypatch):
+    scene, _ = install_fake_slicer(monkeypatch)
+    peer, log = Peer("alice", scene), RoomLog()
+    for label, voxel in (("near", (0, 0, 0)), ("far", (5, 5, 5)), ("target", (1, 1, 1))):
+        peer.apply(log.commit(operation(label, label, voxel), "bob"))
+    controller = peer.controller
+    bounds = [0, 2, 0, 2, 0, 2]
+    key = (peer.node.GetID(), "far")
+    controller.baselines[key] = c.ChunkedMaskBaseline.from_crop(
+        SHAPE, peer.mask("far"), [0, SHAPE[0], 0, SHAPE[1], 0, SHAPE[2]], chunk_size=2,
+    )
+    decoded_far = []
+    original_region = controller.baselines[key].region
+    monkeypatch.setattr(controller.baselines[key], "region", lambda box: decoded_far.append(box) or original_region(box))
+    native_reads = []
+    original_read = controller._read_mask_region
+    monkeypatch.setattr(controller, "_read_mask_region",
+                        lambda node, sid, box: native_reads.append(sid) or original_read(node, sid, box))
+    record = {"author": "alice", "segment_id": "target", "sequence": 4, "voxel_bbox": bounds,
+              "protected_segment_ids": ["near", "far"]}
+    changed = np.ones((2, 2, 2), dtype=bool)
+    values, blocked = controller._protect_incoming_claims(peer.node, record, changed, changed.astype(np.uint8))
+    assert blocked.sum() == 1 and blocked[0, 0, 0]
+    assert values.sum() == 7
+    assert decoded_far == []
+    assert native_reads == ["near"]

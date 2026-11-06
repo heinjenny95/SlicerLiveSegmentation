@@ -13384,6 +13384,8 @@ class LiveCollaborationController:
             baseline = self.baselines.get((node.GetID(), segment_id))
             if baseline is None:
                 baseline = self._deleted_baselines().get(segment_id)
+            if isinstance(baseline, ChunkedMaskBaseline) and not baseline.has_stored_region(bounds):
+                return None
             return None if baseline is None else _baseline_region(baseline, bounds)
 
         values, blocked = protect_voxel_claims(operation, changed, values, read_region)
@@ -13402,9 +13404,11 @@ class LiveCollaborationController:
                 shared = read_region(segment_id, bounds)
                 if shared is None:
                     continue
+                restore = blocked & (shared != 0)
+                if not np.any(restore):
+                    continue
                 current = self._read_mask_region(node, segment_id, bounds)
                 restored = current.copy()
-                restore = blocked & (shared != 0)
                 restored[restore] = shared[restore]
                 if np.any(restored != current):
                     update = getattr(self.owner, "update_segment_binary_labelmap_crop", None)

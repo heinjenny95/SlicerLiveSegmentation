@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Check locked sibling voxels only where a received edit can touch them.
+  Distant sparse labels skip crop allocation, and restoring an own echo
+  reads the native labelmap only when blocked voxels intersect that label.
+
 - Keep room label IDs stable while a checkpoint is prepared. Deferred native
   events cannot reclassify staged remote labels as locally created ones, and
   the native checkpoint swap does not queue local edit notifications.
