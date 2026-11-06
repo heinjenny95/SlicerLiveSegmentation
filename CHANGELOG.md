@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Keep the native editable-area mode during bounded live-room Paint. Slicer
+  masks the stroke before regional ownership checks protect locked siblings.
+  Restore the normal overwrite mode when leaving the bounded Paint path.
+
 - Keep a locally committed label name and color when a peer's edit arrives
   before the deferred native event can queue the rename. Use the current local
   metadata when completing a tiled incoming edit so a rename made between

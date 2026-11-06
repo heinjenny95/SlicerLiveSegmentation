@@ -93,6 +93,8 @@ def test_native_guard_is_scoped_and_restores_modes_and_observer(room):
     (peer, _), _ = room
     node = peer.node
     node.EditAllowedEverywhere = 0
+    node.EditAllowedOutsideAllSegments = 3
+    node.EditAllowedInsideSingleSegment = 5
     node.GetSegmentation().GetNumberOfSegments = lambda: 200
     state = {"mode": 0, "effect": "Paint", "mask": 0, "intensity": False}
     parameter = Mock(OverwriteNone=2, OverwriteAllSegments=0)
@@ -127,9 +129,17 @@ def test_native_guard_is_scoped_and_restores_modes_and_observer(room):
         state[key] = previous
         guard.refresh()
         assert guard.active
-    state.update(mask=3, mode=2)
+    state.update(mask=5, mode=0)
     guard.refresh()
-    assert not guard.active and state["mode"] == 2, "Overrode the IR lock guard"
+    assert guard.active and state["mode"] == 2 and state["mask"] == 5
+    second_view.mrmlSegmentEditorNode.return_value = parameter
+    assert guard.protects_editor(second_view, node, 5)
+    state.update(mask=3, effect="Erase")
+    guard.refresh()
+    assert not guard.active and state["mode"] == 0 and state["mask"] == 3
+    state.update(effect="Paint", mask=99)
+    guard.refresh()
+    assert not guard.active and state["mode"] == 0
     state.update(mask=0, mode=0)
     guard.refresh()
     owner._reference_ijk_to_segmentation_ras_matrix = lambda *args: None

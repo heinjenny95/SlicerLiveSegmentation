@@ -7,12 +7,22 @@ changed here: ordinary ordered operations still decide shared ownership.
 """
 import numpy as np
 
+NATIVE_PAINT_MASK_MODES = (
+    "EditAllowedEverywhere",
+    "EditAllowedInsideAllSegments",
+    "EditAllowedInsideVisibleSegments",
+    "EditAllowedOutsideAllSegments",
+    "EditAllowedOutsideVisibleSegments",
+    "EditAllowedInsideSingleSegment",
+)
+
 
 class NativePaintGuard:
-    """Scope the workaround to large live-room Paint/Everywhere editing only.
+    """Keep native editable-area masking in the bounded live-room Paint path.
 
-    Other effects, source-intensity masks, custom editable-area geometries and
-    standalone Segment Editor keep Slicer's original implementation.
+    Slicer clips the stroke to the chosen area before bounded claim handling.
+    Other effects, source-intensity masks and standalone Segment Editor keep
+    Slicer's original implementation.
     """
     def __init__(self, owner, editor):
         self.owner, self.editor = owner, editor
@@ -34,7 +44,8 @@ class NativePaintGuard:
             and node is not None and node.GetSegmentation().GetNumberOfSegments() >= 8
             and image is not None and image.GetNumberOfPoints() >= 8_000_000
             and self.parameter.GetActiveEffectName() == "Paint"
-            and linear and mask_mode == node.EditAllowedEverywhere
+            and linear and mask_mode is not None
+            and any(mask_mode == getattr(node, name, None) for name in NATIVE_PAINT_MASK_MODES)
             and not self.parameter.GetSourceVolumeIntensityMask())
 
     def refresh(self, *unused):
@@ -52,13 +63,10 @@ class NativePaintGuard:
                     self.previous = self.parameter.OverwriteAllSegments
                 if self.parameter.GetOverwriteMode() != self.parameter.OverwriteNone:
                     self.parameter.SetOverwriteMode(self.parameter.OverwriteNone)
-            elif was_active:
-                node = self.editor.segmentationNode()
-                # IR's lock guard may have just taken ownership by selecting
-                # OutsideAll/OverwriteNone. Never overwrite another safeguard.
-                outside = getattr(node, "EditAllowedOutsideAllSegments", 3)
-                if self.parameter.GetMaskMode() != outside:
-                    self.parameter.SetOverwriteMode(self.previous)
+            elif was_active and self.parameter.GetOverwriteMode() == self.parameter.OverwriteNone:
+                # OutsideAll can be a genuine user choice, so it does not
+                # imply ownership by IR's fallback protection.
+                self.parameter.SetOverwriteMode(self.previous)
         finally:
             self.updating = False
 
