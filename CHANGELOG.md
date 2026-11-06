@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Refill the initial catch-up buffer in pages after enough operations and
+  memory have been freed. Replaying a long tail no longer sends an SSH
+  request for each slot freed by the GUI. Live polling keeps its smaller
+  latency-oriented batches.
+
 - Skip immutable history archives whose valid filename sequence range lies
   wholly outside the advisory conflict window before opening the ZIP directory.
   Intersecting archives and legacy, malformed or reversed range names retain

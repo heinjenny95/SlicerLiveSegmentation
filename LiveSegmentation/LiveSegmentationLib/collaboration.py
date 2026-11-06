@@ -10915,7 +10915,14 @@ class LiveCollaborationController:
         budget = MAX_INCOMING_PACKED_BYTES - sum(incoming_operation_bytes(item) for item in self._incoming_operations)
         if slots <= 0 or budget < 4096:
             return
-        limit = min(slots, LIVE_SYNC_OPERATION_BATCH if self.initial_sync_complete else INITIAL_SYNC_OPERATION_BATCH)
+        batch = LIVE_SYNC_OPERATION_BATCH if self.initial_sync_complete else INITIAL_SYNC_OPERATION_BATCH
+        if not self.initial_sync_complete and self._incoming_operations:
+            # Let the consumer drain part of the buffered work before refilling.
+            # Otherwise a full catch-up queue turns every freed slot into a
+            # separate network round trip, even though the reader can page.
+            if slots < min(cap, batch) or budget < MAX_INCOMING_PACKED_BYTES // 2:
+                return
+        limit = min(slots, batch)
         self._last_sync_poll = now
         self._edit_pull_pending = True
         try:

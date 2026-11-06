@@ -72,10 +72,43 @@ def test_old_session_result_cannot_release_current_request(monkeypatch):
     assert c._edit_pull_pending
 
 
-def test_catchup_page_uses_available_queue_slots(monkeypatch):
+def test_catchup_waits_for_a_page_instead_of_refilling_a_few_slots(monkeypatch):
     c = peer(monkeypatch)
     c.client.operations.return_value = []
     cap = h.collaboration.MAX_PENDING_INITIAL_OPERATIONS
+    page = h.collaboration.INITIAL_SYNC_OPERATION_BATCH
+    c._incoming_operations.extend(operation(n) for n in range(1, cap - 2))
+    monkeypatch.setattr(h.collaboration.threading, "Thread", FinishedThread)
+    c._start_edit_pull_worker(100.0, True)
+    c.client.operations.assert_not_called()
+
+    while len(c._incoming_operations) > cap - page:
+        c._incoming_operations.popleft()
+    c._start_edit_pull_worker(101.0, True)
+    assert c.client.operations.call_args.kwargs["limit"] == page
+
+
+def test_catchup_waits_for_memory_headroom_when_work_is_buffered(monkeypatch):
+    c = peer(monkeypatch)
+    c.client.operations.return_value = []
+    monkeypatch.setattr(h.collaboration.threading, "Thread", FinishedThread)
+    monkeypatch.setattr(h.collaboration, "MAX_INCOMING_PACKED_BYTES", 64 * 1024)
+    monkeypatch.setattr(h.collaboration, "incoming_operation_bytes", lambda _op: 20 * 1024)
+    c._incoming_operations.extend([operation(1), operation(2)])
+    c._start_edit_pull_worker(100.0, True)
+    c.client.operations.assert_not_called()
+
+    c._incoming_operations.popleft()
+    c._start_edit_pull_worker(101.0, True)
+    assert c.client.operations.call_count == 1
+    assert c._edit_pull_worker.args[-1] == 44 * 1024
+
+
+def test_live_pull_still_uses_small_available_queue_slots(monkeypatch):
+    c = peer(monkeypatch)
+    c.initial_sync_complete = True
+    c.client.operations.return_value = []
+    cap = h.collaboration.MAX_PENDING_REMOTE_OPERATIONS
     c._incoming_operations.extend(operation(n) for n in range(1, cap - 2))
     monkeypatch.setattr(h.collaboration.threading, "Thread", FinishedThread)
     c._start_edit_pull_worker(100.0, True)
