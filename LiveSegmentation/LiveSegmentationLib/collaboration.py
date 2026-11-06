@@ -9384,7 +9384,7 @@ class LiveCollaborationController:
             return
         self._queue_segment_order(node, current)
 
-    def _apply_segment_order_to_node(self, node):
+    def _apply_segment_order_to_node(self, node, defer_editors=False):
         import slicer
 
         segmentation = node.GetSegmentation()
@@ -9395,6 +9395,8 @@ class LiveCollaborationController:
         desired.extend(sid for sid in current if sid not in ordered)
         if desired == current:
             self._observed_segment_order = tuple(current)
+            return
+        if defer_editors and self._defer_segment_order_while_editing(node):
             return
         get_nodes = getattr(slicer.util, "getNodesByClass", None)
         editors = ([(editor, editor.GetSelectedSegmentID())
@@ -9417,6 +9419,36 @@ class LiveCollaborationController:
             self._observed_segment_order = tuple(segmentation.GetSegmentIDs())
             self._applying_remote = applying
 
+    def _defer_segment_order_while_editing(self, node):
+        import slicer
+        try:
+            from .view_preferences import defer_segment_table_action
+        except ImportError:
+            from view_preferences import defer_segment_table_action
+
+        main_window = getattr(slicer.util, "mainWindow", None)
+        window = main_window() if callable(main_window) else None
+        if window is None:
+            return False
+        session_token = self._session_token
+        for view in window.findChildren("qMRMLSegmentsTableView"):
+            if view.segmentationNode() != node:
+                continue
+            table = view.findChild("QTableView", "SegmentsTable")
+            if table is None:
+                continue
+
+            def resume(current_view=view):
+                if (session_token == self._session_token and self.connected
+                        and self._segmentation_node() == node and current_view.segmentationNode() == node):
+                    # The room may have confirmed more moves while the editor
+                    # was open. Read its latest order instead of replaying one.
+                    self._apply_segment_order_to_node(node, defer_editors=True)
+
+            if defer_segment_table_action(table, resume, "LiveSegmentationOrderApplyPending"):
+                return True
+        return False
+
     @staticmethod
     def _refresh_segment_order_views(node):
         """Native table index widgets must follow REMOTE moves as well as drags.
@@ -9426,28 +9458,17 @@ class LiveCollaborationController:
         instantiate another module or replace a segmentation/labelmap.
         """
         import slicer
+        try:
+            from .view_preferences import refresh_segment_table_view
+        except ImportError:
+            from view_preferences import refresh_segment_table_view
 
         main_window = getattr(slicer.util, "mainWindow", None)
         window = main_window() if callable(main_window) else None
         if window is None:
             return
         for view in window.findChildren("qMRMLSegmentsTableView"):
-            if view.segmentationNode() != node:
-                continue
-            table = view.findChild("QTableView", "SegmentsTable")
-            if table is None:
-                continue
-            selected = view.selectedSegmentIDs
-            selected = selected() if callable(selected) else selected
-            scroll = table.verticalScrollBar().value
-            blocked = view.blockSignals(True)
-            try:
-                view.setSegmentationNode(None)
-                view.setSegmentationNode(node)
-                view.setSelectedSegmentIDs(selected)
-                table.verticalScrollBar().setValue(scroll)
-            finally:
-                view.blockSignals(blocked)
+            refresh_segment_table_view(view, node)
 
     def _accept_segment_order(self, node, operation):
         requested = list(operation["segment_order"])
@@ -9457,7 +9478,7 @@ class LiveCollaborationController:
         self._confirmed_segment_order = requested + [sid for sid in self._confirmed_segment_order
                                                       if sid not in requested_set]
         self._has_shared_segment_order = True
-        self._apply_segment_order_to_node(node)
+        self._apply_segment_order_to_node(node, defer_editors=True)
         self._diagnostic_event("labels.order.applied", sequence=int(operation.get("sequence", 0)),
                                author=str(operation.get("author") or ""), segment_order=requested)
 
@@ -12360,7 +12381,7 @@ class LiveCollaborationController:
             if group.order is not None:
                 self._accept_segment_order(node, group.order)
             else:
-                self._apply_segment_order_to_node(node)
+                self._apply_segment_order_to_node(node, defer_editors=True)
             self.dirty_segments.update(dirty)
             self.last_sequence = group.last_sequence
             self._last_snapshot_sequence = max(self._last_snapshot_sequence, group.last_sequence)
@@ -13672,7 +13693,7 @@ class LiveCollaborationController:
                 if segment_id not in self._confirmed_segment_order:
                     self._confirmed_segment_order.append(segment_id)
                 self._ensure_segment(node, operation)
-                self._apply_segment_order_to_node(node)
+                self._apply_segment_order_to_node(node, defer_editors=True)
                 self._ensure_independent_segment_labelmap(node, segment_id)
                 metadata_after = self._current_segment_metadata(node, segment_id)
                 operation_bounds = [

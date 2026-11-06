@@ -9,6 +9,63 @@ import logging
 from pathlib import Path
 
 
+def defer_segment_table_action(table, action, pending_property):
+    """Run one pending table action after the native cell editor closes."""
+    import qt
+
+    viewport = table.viewport()
+    active_editor = next(
+        (line for line in table.findChildren("QLineEdit")
+         if line.parentWidget() == viewport and not line.isHidden()),
+        None,
+    )
+    if active_editor is not None:
+        if not table.property(pending_property):
+            table.setProperty(pending_property, True)
+
+            def retry():
+                try:
+                    if table.property(pending_property):
+                        table.setProperty(pending_property, False)
+                        action()
+                except (RuntimeError, ValueError):
+                    return  # The editor, table or scene may already be gone.
+
+            active_editor.destroyed.connect(lambda *unused: qt.QTimer.singleShot(0, retry))
+        return True
+
+    table.setProperty(pending_property, False)
+    return False
+
+
+def refresh_segment_table_view(view, node, editor=None):
+    """Repair native row controls after the user closes an active cell editor."""
+    if view.segmentationNode() != node:
+        return False
+    table = view.findChild("QTableView", "SegmentsTable")
+    if table is None or defer_segment_table_action(
+        table, lambda: refresh_segment_table_view(view, node, editor),
+        "LiveSegmentationOrderRebindPending",
+    ):
+        return False
+
+    selected = view.selectedSegmentIDs
+    selected = selected() if callable(selected) else selected
+    active_segment = editor.currentSegmentID() if editor is not None else None
+    scroll = table.verticalScrollBar().value
+    blocked = view.blockSignals(True)
+    try:
+        view.setSegmentationNode(None)
+        view.setSegmentationNode(node)
+        view.setSelectedSegmentIDs(selected)
+        table.verticalScrollBar().setValue(scroll)
+    finally:
+        view.blockSignals(blocked)
+    if active_segment and node.GetSegmentation().GetSegment(active_segment) is not None:
+        editor.setCurrentSegmentID(active_segment)
+    return True
+
+
 def personal_view_settings():
     import qt
 

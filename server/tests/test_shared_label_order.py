@@ -106,6 +106,7 @@ def test_remote_order_rebuilds_native_row_controls_without_changing_selection(ro
     scroll = Mock(value=37)
     table = Mock()
     table.verticalScrollBar.return_value = scroll
+    table.findChildren.return_value = []
     view = Mock(selectedSegmentIDs=["B"])
     view.segmentationNode.return_value = peer.node
     view.findChild.return_value = table
@@ -119,6 +120,47 @@ def test_remote_order_rebuilds_native_row_controls_without_changing_selection(ro
     view.setSelectedSegmentIDs.assert_called_once_with(["B"])
     scroll.setValue.assert_called_once_with(37)
     assert not peer.errors
+
+
+@pytest.mark.parametrize("same_session", [False, True])
+def test_remote_order_waits_for_native_rename_and_uses_latest_confirmed_order(room_peers, monkeypatch, same_session):
+    import qt
+    import slicer
+
+    peers, log, _ = room_peers
+    peer = peers[1]
+    controller = peer.controller
+    table, name_editor, view = Mock(), Mock(), Mock(selectedSegmentIDs=["B"])
+    properties, timers = {}, []
+    table.property.side_effect = properties.get
+    table.setProperty.side_effect = properties.__setitem__
+    table.findChildren.return_value = [name_editor]
+    table.verticalScrollBar.return_value = Mock(value=37)
+    name_editor.parentWidget.return_value = table.viewport()
+    name_editor.isHidden.return_value = False
+    view.findChild.return_value = table
+    view.segmentationNode.return_value = peer.node
+    window = Mock()
+    window.findChildren.return_value = [view]
+    monkeypatch.setattr(slicer.util, "mainWindow", lambda: window, raising=False)
+    monkeypatch.setattr(qt.QTimer, "singleShot", lambda delay, action: timers.append(action))
+
+    peer.apply(log.commit(order_operation(["C", "A", "B"]), "Jenny"))
+    latest = log.commit(order_operation(["B", "C", "A"]), "Jenny")
+    peer.apply(latest)
+    assert peer.node.GetSegmentation().GetSegmentIDs() == ["A", "B", "C"]
+    assert controller.last_sequence == latest["sequence"]
+    assert controller._confirmed_segment_order == ["B", "C", "A"]
+    name_editor.destroyed.connect.assert_called_once()
+
+    name_editor.isHidden.return_value = True
+    if not same_session:
+        controller._session_token = object()
+    name_editor.destroyed.connect.call_args.args[0]()
+    timers[-1]()
+    expected_order = ["B", "C", "A"] if same_session else ["A", "B", "C"]
+    assert peer.node.GetSegmentation().GetSegmentIDs() == expected_order
+    assert not controller.outgoing and not peer.errors
 
 
 def test_compaction_rejoin_and_history_preserve_order_and_masks(tmp_path, room_peers):

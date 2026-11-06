@@ -8,6 +8,10 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Accept the shared label order while a native name editor is open and apply
+  its latest visible order after Enter or Escape. Defer row-control repairs
+  until then, preserving the selected label and scroll position.
+
 - Check locked sibling voxels only where a received edit can touch them.
   Distant sparse labels skip crop allocation, and restoring an own echo
   reads the native labelmap only when blocked voxels intersect that label.
