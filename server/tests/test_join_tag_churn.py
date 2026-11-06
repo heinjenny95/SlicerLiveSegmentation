@@ -90,6 +90,51 @@ def test_initial_native_batch_is_balanced_and_does_not_own_foreign_batches(monke
     assert scene.EndState.call_count == 1
 
 
+def test_initial_replay_refreshes_label_list_at_readiness(monkeypatch):
+    scene, status_messages = h.install_fake_slicer(monkeypatch)
+    peer = h.Peer("Jenny", scene)
+    controller = peer.controller
+    controller.initial_sync_complete = False
+    controller.initial_sequence = 2
+    controller._refresh_label_combo = Mock()
+    room = h.RoomLog()
+    for label in ("A", "B", "C"):
+        operation = room.commit({
+            "segment_id": label,
+            "segment_name": label,
+            **h.collaboration.encode_mask_crop_snapshot(None, None, h.SHAPE),
+        }, "Pauline")
+        peer.apply(operation)
+        if label == "A":
+            controller._refresh_label_combo.assert_not_called()
+            assert not status_messages
+        elif label == "B":
+            controller._refresh_label_combo.assert_called_once()
+            assert not status_messages
+        else:
+            assert controller._refresh_label_combo.call_count == 2
+            assert status_messages == ["Live: Pauline updated C"]
+    assert controller.initial_sync_complete
+    assert peer.node.GetSegmentation().GetSegmentIDs() == ["A", "B", "C"]
+
+
+@pytest.mark.parametrize("initial", [True, False])
+def test_incoming_continuation_yields_without_sleep_only_during_join(monkeypatch, initial):
+    import sys
+
+    scene, _ = h.install_fake_slicer(monkeypatch)
+    controller = h.Peer("Jenny", scene).controller
+    controller.initial_sync_complete = not initial
+    controller.initial_sequence = 200
+    controller._incoming_operations.append({"sequence": 1})
+    monkeypatch.setattr(h.collaboration, "GUI_WORK_BUDGET_SECONDS", 0)
+    schedule = Mock()
+    monkeypatch.setattr(sys.modules["qt"].QTimer, "singleShot", schedule)
+    controller._drain_incoming_operations()
+    assert schedule.call_args.args[0] == (0 if initial else h.collaboration.GUI_CONTINUATION_MILLISECONDS)
+    assert len(controller._incoming_operations) == 1
+
+
 def test_folder_push_does_not_compete_with_its_own_sequence_lock(monkeypatch):
     scene, _ = h.install_fake_slicer(monkeypatch)
     controller = h.Peer("Jenny", scene).controller

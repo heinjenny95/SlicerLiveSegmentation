@@ -11956,7 +11956,8 @@ class LiveCollaborationController:
                 self._append_chat_messages(result["messages"])
             if result.get("locks") is not None:
                 self._update_segment_locks(result["locks"])
-                self._refresh_label_combo()
+                if self.initial_sync_complete:
+                    self._refresh_label_combo()
             if result.get("advanced") is not None:
                 self._update_advanced_state(result["advanced"])
             self._handle_action_results(result.get("action_results") or [])
@@ -12001,10 +12002,7 @@ class LiveCollaborationController:
                 message = "; ".join(result["command_errors"])
                 self._record_diagnostic_error(message, lane=self._diagnostic_lane)
                 slicer.util.showStatusMessage(f"Live collaboration: {message}", 5000)
-            if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
-                self.initial_sync_complete = True
-                self._initialize_baselines_and_seed(seed=False)
-                self._end_initial_scene_batch()
+            self._finish_initial_sync_if_ready()
             backup_ok = True
             if result.get("backup"):
                 backup_ok = self._create_project_backup(result["backup"])
@@ -12162,7 +12160,8 @@ class LiveCollaborationController:
                     self._incoming_operations.popleft()
                     self._incoming_iterator = None
                     self._incoming_surface_operations += 1
-                    self._refresh_label_combo()
+                    if self.initial_sync_complete:
+                        self._refresh_label_combo()
                     continue
                 piece = self._incoming_piece
                 no_op = piece.get("_capacity_step") or (piece.get("_partial_operation") and not np.any(piece["_decoded"][0]))
@@ -12173,10 +12172,7 @@ class LiveCollaborationController:
                     self._incoming_retry_at = time.monotonic() + 1.0
                     return
                 self._incoming_piece = None
-            if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
-                self.initial_sync_complete = True
-                self._initialize_baselines_and_seed(seed=False)
-                self._end_initial_scene_batch()
+            self._finish_initial_sync_if_ready()
             if (self._incoming_operations or getattr(self, "_incoming_surface_updates", None) is not None
                     or (self._checkpoint_group is not None and self._checkpoint_group.complete)) and not self._incoming_continuation_scheduled:
                 import qt
@@ -12190,7 +12186,10 @@ class LiveCollaborationController:
                     self._incoming_continuation_scheduled = False
                     self._drain_incoming_operations()
 
-                qt.QTimer.singleShot(GUI_CONTINUATION_MILLISECONDS, continue_incoming)
+                # Initial scene batching already defers model redraws. Give
+                # Qt a turn between slices without sleeping on a full backlog.
+                delay = GUI_CONTINUATION_MILLISECONDS if self.initial_sync_complete else 0
+                qt.QTimer.singleShot(delay, continue_incoming)
         except Exception as exc:
             self._checkpoint_ingest_iterator = None
             self._checkpoint_commit_iterator = None
@@ -12268,6 +12267,13 @@ class LiveCollaborationController:
         self._initial_scene_batch = None
         if scene is not None:
             scene.EndState(scene.BatchProcessState)
+
+    def _finish_initial_sync_if_ready(self):
+        if not self.initial_sync_complete and self.last_sequence >= self.initial_sequence:
+            self.initial_sync_complete = True
+            self._initialize_baselines_and_seed(seed=False)
+            self._end_initial_scene_batch()
+            self._refresh_label_combo()
 
     def _commit_checkpoint_steps(self, group):
         """No visible mutation until a complete, privately staged group exists."""
@@ -12352,7 +12358,8 @@ class LiveCollaborationController:
                 if operation.get("author") == self.user_name:
                     self._acknowledge_local_operation(operation)
             self._append_history_operations([group.records[0]])
-            self._refresh_label_combo()
+            if self.initial_sync_complete:
+                self._refresh_label_combo()
             self.session_metrics.increment("checkpoint_groups_applied")
             self.session_metrics.increment("checkpoint_voxel_replacements", native_replacements)
             self._incoming_surface_operations += len(group.records)
@@ -13587,13 +13594,13 @@ class LiveCollaborationController:
                         f"{actor} deleted label "
                         f"{operation.get('segment_name') or segment_id}"
                     )
-                    if operation.get("author") != self.user_name:
+                    if operation.get("author") != self.user_name and self.initial_sync_complete:
                         slicer.util.showStatusMessage(
                             f"Live: {operation.get('author')} deleted label "
                             f"{operation.get('segment_name') or segment_id}",
                             2500,
                         )
-                    else:
+                    elif operation.get("author") == self.user_name:
                         self._acknowledge_local_operation(operation)
                     self.last_sequence = sequence
                     applied_count += 1
@@ -13858,7 +13865,10 @@ class LiveCollaborationController:
                 self._diagnostic_event("operation.applied", sequence=sequence, segment_id=str(segment_id),
                                        author=operation.get("author"), voxel_effect=bool(voxel_effect),
                                        metadata_effect=bool(metadata_effect))
-                if operation.get("author") != self.user_name:
+                if operation.get("author") == self.user_name:
+                    self._acknowledge_local_operation(operation)
+                    self._schedule_segment_verification(key, duration=0.8)
+                elif self.initial_sync_complete:
                     highlight_changed = changed
                     if (
                         operation.get("operation_kind") == "snapshot"
@@ -13894,9 +13904,6 @@ class LiveCollaborationController:
                         f"{operation.get('segment_name') or segment_id}",
                         1800,
                     )
-                else:
-                    self._acknowledge_local_operation(operation)
-                    self._schedule_segment_verification(key, duration=0.8)
                 self.last_sequence = sequence
                 applied_count += 1
                 self._diagnostic_event("operation.applied", sequence=sequence, segment_id=str(segment_id),

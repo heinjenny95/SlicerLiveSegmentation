@@ -8,6 +8,12 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Refresh the label picker once when the initial room state is ready instead
+  of rescanning every label after each historical edit. Historical edit
+  notices stay in activity and diagnostics without interrupting the join
+  status. Initial replay yields to Qt between bounded work slices without a
+  fixed sleep; live scheduling and edit notifications keep their cadence.
+
 - Refill the initial catch-up buffer in pages after enough operations and
   memory have been freed. Replaying a long tail no longer sends an SSH
   request for each slot freed by the GUI. Live polling keeps its smaller
