@@ -161,6 +161,9 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         self._source_range_preprocessing = None
         self._previous_editor_read_only = None
         self.navigation_toolbar = None
+        self._global_navigation_enabled = True
+        self._navigation_toolbar_attached = False
+        self._remove_personal_visibility_listener = None
         self.navigation_action = None
         self.ir_navigation_action = None
         self.diagnostics_action = None
@@ -236,6 +239,7 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         # Explicit non-loading bridge for optional modules. The ScriptedModule
         # wrapper does not expose an already-created Python widget globally.
         slicer.modules.LiveSegmentationWidget = self
+        self._setup_convenience_settings()
         self._setup_navigation_toolbar()
         self.layout.addStretch(1)
 
@@ -265,13 +269,17 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         if getattr(self, "_module_selector", None) is not None:
             self._module_selector.disconnect("moduleSelected(QString)", self._on_module_selected)
             self._module_selector = None
+        if self._remove_personal_visibility_listener is not None:
+            self._remove_personal_visibility_listener()
+            self._remove_personal_visibility_listener = None
         if self.navigation_toolbar is not None:
-            slicer.util.mainWindow().removeToolBar(self.navigation_toolbar)
+            self._set_global_navigation_enabled(False)
             self.navigation_toolbar.setObjectName("")
             self.navigation_toolbar.deleteLater()
             self.navigation_toolbar = None
             self.navigation_action = None
             self.ir_navigation_action = None
+            self.diagnostics_action = None
         if self.live_collaboration is not None:
             self.live_collaboration.cleanup()
         if self._recovery_editor is not None:
@@ -310,6 +318,88 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         if segmentation is not None and volume is not None and editor is not None:
             self._configure_standard_segment_editor(editor, segmentation, volume)
 
+    def _setup_convenience_settings(self):
+        import ctk
+        from LiveSegmentationLib.view_preferences import (
+            observe_personal_visibility_enabled,
+            personal_view_settings,
+            personal_visibility_enabled,
+            set_personal_visibility_enabled,
+        )
+
+        group = ctk.ctkCollapsibleButton()
+        group.setObjectName("LiveSegmentationPreferences")
+        group.text = "Preferences"
+        group.collapsed = True
+        layout = qt.QVBoxLayout(group)
+        settings = personal_view_settings()
+
+        def add_option(name, text, apply):
+            key = "LiveSegmentation/preferences/" + name
+            checkbox = qt.QCheckBox(text)
+            checkbox.setObjectName("LiveSegmentation" + name)
+            enabled = str(settings.value(key, True)).lower() in ("true", "1")
+            checkbox.setChecked(enabled)
+            apply(enabled)
+
+            def changed(value):
+                settings.setValue(key, bool(value))
+                settings.sync()
+                apply(bool(value))
+
+            checkbox.toggled.connect(changed)
+            layout.addWidget(checkbox)
+
+        add_option("GlobalToolbar", "Show global toolbar and shortcuts", self._set_global_navigation_enabled)
+        self.personal_visibility_checkbox = qt.QCheckBox("Remember label visibility between sessions")
+        self.personal_visibility_checkbox.setObjectName("LiveSegmentationPersonalVisibility")
+        self.personal_visibility_checkbox.setChecked(personal_visibility_enabled())
+        self.personal_visibility_checkbox.toggled.connect(set_personal_visibility_enabled)
+        self._remove_personal_visibility_listener = observe_personal_visibility_enabled(
+            self._on_personal_visibility_changed
+        )
+        layout.addWidget(self.personal_visibility_checkbox)
+        add_option("ViewNavigation", "Follow and jump to shared locations",
+                   self.live_collaboration.set_view_navigation_enabled)
+        add_option("RemoteHighlight", "Highlight collaborators' edits",
+                   self.live_collaboration.set_remote_highlights_enabled)
+
+        diagnostics = qt.QPushButton("Open error history")
+        diagnostics.setObjectName("LiveSegmentationModuleErrors")
+        diagnostics.clicked.connect(self.live_collaboration.show_diagnostic_history)
+        layout.addWidget(diagnostics)
+        self._module_work_time_layout = qt.QHBoxLayout()
+        layout.addLayout(self._module_work_time_layout)
+        self.layout.addWidget(group)
+
+    def _on_personal_visibility_changed(self, enabled):
+        checkbox = self.personal_visibility_checkbox
+        previous = checkbox.blockSignals(True)
+        try:
+            checkbox.setChecked(enabled)
+        finally:
+            checkbox.blockSignals(previous)
+        if enabled:
+            self.live_collaboration.refresh_personal_visibility()
+
+    def _set_global_navigation_enabled(self, enabled):
+        self._global_navigation_enabled = bool(enabled)
+        toolbar = self.navigation_toolbar
+        if toolbar is None:
+            return
+        self.navigation_action.setEnabled(self._global_navigation_enabled)
+        self._refresh_optional_navigation()
+        main_window = slicer.util.mainWindow()
+        if not self._global_navigation_enabled:
+            if self._navigation_toolbar_attached:
+                main_window.removeToolBar(toolbar)
+                self._navigation_toolbar_attached = False
+            toolbar.hide()
+        elif not self._navigation_toolbar_attached:
+            main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
+            self._navigation_toolbar_attached = True
+            toolbar.show()
+
     def _setup_navigation_toolbar(self):
         """Return to collaboration without changing sessions or editor targets."""
         if self.navigation_toolbar is not None:
@@ -346,21 +436,20 @@ class LiveSegmentationWidget(ScriptedLoadableModuleWidget):
         diagnostics.setToolTip("Persistent errors and local diagnostic logs; available in every module")
         diagnostics.triggered.connect(self.live_collaboration.show_diagnostic_history)
         self.diagnostics_action = diagnostics
-        main_window.addToolBar(qt.Qt.TopToolBarArea, toolbar)
         self.navigation_toolbar = toolbar
         self.navigation_action = action
         self.ir_navigation_action = ir_action
         from LiveSegmentationLib.active_work import WorkTimeUI
 
-        self.live_collaboration.work_time = WorkTimeUI(self.live_collaboration, toolbar)
-        self._refresh_optional_navigation()
+        self.live_collaboration.work_time = WorkTimeUI(self.live_collaboration, toolbar, self._module_work_time_layout)
+        self._set_global_navigation_enabled(self._global_navigation_enabled)
 
     def _refresh_optional_navigation(self):
         if self.ir_navigation_action is None:
             return
         available = getattr(slicer.modules, "slicernninteractiveir", None) is not None
         self.ir_navigation_action.setVisible(available)
-        self.ir_navigation_action.setEnabled(available)
+        self.ir_navigation_action.setEnabled(available and getattr(self, "_global_navigation_enabled", True))
 
     def _open_nninteractive_ir(self):
         """Navigate only; never initialize inference or replace editor targets."""

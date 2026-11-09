@@ -8,6 +8,11 @@ Identifiers such as `L-19` refer to findings of the September 2026 code review.
 
 ## Unreleased
 
+- Add local Preferences to switch the global toolbar and shortcuts, personal
+  label visibility, collaborator location navigation and remote edit highlights
+  on or off during a session. Keep room activity and study time recording
+  running and expose time controls and error history in the module panel.
+
 - Respect native Show 3D being switched off while incoming changes temporarily
   invalidate every cached mesh. Keep the pending binary display update and
   cancel the pending surface regeneration.

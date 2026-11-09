@@ -2,6 +2,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+from LiveSegmentationLib import view_preferences
 from LiveSegmentationLib.view_preferences import PersonalVisibility, personal_view_settings
 
 
@@ -81,3 +82,59 @@ def test_late_join_labels_restore_before_the_next_save_and_new_labels_stay_visib
     assert states["new"] == [True]*4
     rejoined.close()
     assert json.loads(next(iter(settings.values.values())))["old"] == [False]*4
+
+
+def test_disabling_visibility_detaches_pending_saves_and_blocks_later_binds(monkeypatch):
+    settings, pending = Settings(), []
+    modules = SimpleNamespace()
+    scene = SimpleNamespace(NodeAboutToBeRemovedEvent=1, StartCloseEvent=2, AddObserver=lambda *a: 1)
+    slicer = SimpleNamespace(modules=modules, mrmlScene=scene,
+                             app=SimpleNamespace(aboutToQuit=SimpleNamespace(connect=lambda callback: None)))
+    monkeypatch.setitem(sys.modules, "slicer", slicer)
+    monkeypatch.setitem(sys.modules, "vtk", SimpleNamespace(calldata_type=lambda _: lambda f: f, VTK_OBJECT=1))
+    monkeypatch.setitem(sys.modules, "qt", SimpleNamespace(QTimer=SimpleNamespace(singleShot=lambda ms, f: pending.append(f))))
+    monkeypatch.setattr(view_preferences, "personal_view_settings", lambda: settings)
+
+    def scene_node(states, identifier):
+        result = node(states)
+        attrs = {}
+        result.GetScene = lambda: scene
+        result.GetID = lambda: identifier
+        result.SetAttribute = attrs.__setitem__
+        result.GetAttribute = attrs.get
+        return result
+
+    assert view_preferences.personal_visibility_enabled()
+    hidden = {"old": [False]*4}
+    first = scene_node(hidden, "first")
+    manager = view_preferences.bind_personal_visibility(first, scope="room:alice")
+    manager.flush()
+    stored = dict(settings.values)
+    key, = stored
+    hidden["old"] = [True]*4
+    manager.changed()
+
+    notifications = []
+    unobserve = view_preferences.observe_personal_visibility_enabled(
+        lambda enabled: notifications.append((enabled, dict(modules._personal_segment_views))))
+    view_preferences.set_personal_visibility_enabled(False)
+    assert notifications == [(False, {})]
+    assert manager.node is None
+    pending.pop()()
+    assert hidden["old"] == [True]*4
+    assert settings.values[key] == stored[key]
+
+    new_states = {"old": [True]*4}
+    rejoined = scene_node(new_states, "second")
+    assert view_preferences.bind_personal_visibility(rejoined, scope="room:alice") is None
+    assert view_preferences.bind_personal_visibility(rejoined) is None
+    assert new_states["old"] == [True]*4
+
+    unobserve()
+    slicer.modules = SimpleNamespace()  # Next application instance reads the dedicated setting.
+    assert not view_preferences.personal_visibility_enabled()
+    view_preferences.set_personal_visibility_enabled(True)
+    assert notifications == [(False, {})]
+    resumed = view_preferences.bind_personal_visibility(rejoined)
+    assert resumed.scope == "room:alice"
+    assert new_states["old"] == [False]*4

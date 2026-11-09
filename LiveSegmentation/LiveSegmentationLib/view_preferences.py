@@ -8,6 +8,8 @@ import json
 import logging
 from pathlib import Path
 
+PERSONAL_VISIBILITY_ENABLED = "SegmentationPersonalView/Enabled"
+
 
 def defer_segment_table_action(table, action, pending_property):
     """Run one pending table action after the native cell editor closes."""
@@ -75,6 +77,51 @@ def personal_view_settings():
     directory = directory / "SlicerLiveSegmentation"
     directory.mkdir(parents=True, exist_ok=True)
     return qt.QSettings(str(directory / "personal-label-view.ini"), qt.QSettings.IniFormat)
+
+
+def personal_visibility_enabled():
+    import slicer
+
+    enabled = getattr(slicer.modules, "_personal_segment_visibility_enabled", None)
+    if type(enabled) is not bool:
+        value = personal_view_settings().value(PERSONAL_VISIBILITY_ENABLED, True)
+        enabled = str(value).strip().lower() not in {"false", "0"}
+        slicer.modules._personal_segment_visibility_enabled = enabled
+    return enabled
+
+
+def observe_personal_visibility_enabled(callback):
+    """Subscribe an existing module UI to the shared setting until its cleanup."""
+    import slicer
+
+    observers = getattr(slicer.modules, "_personal_segment_visibility_observers", None)
+    if observers is None:
+        observers = set()
+        slicer.modules._personal_segment_visibility_observers = observers
+    observers.add(callback)
+    return lambda: observers.discard(callback)
+
+
+def set_personal_visibility_enabled(enabled):
+    import slicer
+
+    enabled = bool(enabled)
+    if personal_visibility_enabled() == enabled:
+        return
+    settings = personal_view_settings()
+    settings.setValue(PERSONAL_VISIBILITY_ENABLED, enabled)
+    settings.sync()
+    slicer.modules._personal_segment_visibility_enabled = enabled
+    if not enabled:
+        registry = getattr(slicer.modules, "_personal_segment_views", {})
+        for manager in tuple(registry.values()):
+            manager.close(save=False)
+        registry.clear()
+    for callback in tuple(getattr(slicer.modules, "_personal_segment_visibility_observers", ())):
+        try:
+            callback(enabled)
+        except Exception:
+            logging.exception("Personal label visibility option could not update a module")
 
 
 class PersonalVisibility:
@@ -152,13 +199,15 @@ class PersonalVisibility:
             self.settings.setValue(self.key, json.dumps(self.states, sort_keys=True))
             self.settings.sync()
 
-    def close(self):
+    def close(self, *, save=True):
         if self.node is None:
             return
-        self.flush()
-        self.display.RemoveObserver(self.display_tag)
-        self.segmentation.RemoveObserver(self.segment_tag)
+        if save:
+            self.flush()
+        display, segmentation = self.display, self.segmentation
         self.node = self.display = self.segmentation = None
+        display.RemoveObserver(self.display_tag)
+        segmentation.RemoveObserver(self.segment_tag)
 
 
 def bind_personal_visibility(node, source=None, scope=None):
@@ -174,6 +223,10 @@ def bind_personal_visibility(node, source=None, scope=None):
         node.SetAttribute(attribute, scope)
     else:
         scope = node.GetAttribute(attribute)
+    # Keep the room scope authoritative when either extension re-enables the
+    # preference. Disabling the setting never touches the native display state.
+    if not personal_visibility_enabled():
+        return None
     if not scope:
         storage = node.GetStorageNode()
         filename = storage.GetFileName() if storage is not None else None

@@ -5777,6 +5777,9 @@ class LiveCollaborationController:
         self._local_encode_pending = False
         self._local_encode_worker = None
         self._local_continuation_scheduled = False
+        self.view_navigation_enabled = True
+        self.remote_highlights_enabled = True
+        self._personal_visibility_scope = None
         self._pending_remote_highlight = None
         self._remote_highlight_scheduled = False
         self._last_presence_send = 0.0
@@ -7733,8 +7736,16 @@ class LiveCollaborationController:
             pass
         return details
 
+    def set_view_navigation_enabled(self, enabled):
+        self.view_navigation_enabled = bool(enabled)
+        if not self.view_navigation_enabled:
+            self.follow_checkbox.setChecked(False)
+        for widget in (self.follow_checkbox, self.jump_to_user_button,
+                       self.jump_to_chat_button, self.jump_to_comment_button):
+            widget.setVisible(self.view_navigation_enabled)
+
     def _apply_location(self, details):
-        if not isinstance(details, dict):
+        if not self.view_navigation_enabled or not isinstance(details, dict):
             return
         try:
             import slicer
@@ -8751,15 +8762,11 @@ class LiveCollaborationController:
             self._diagnostic_event("room.join.online", user_name=self.user_name,
                                    initial_sequence=self.initial_sequence)
             self._observe_segmentation(segmentation_node)
-            try:
-                from .view_preferences import safe_bind_personal_visibility
-            except ImportError:
-                from view_preferences import safe_bind_personal_visibility
-            view_scope = "room:" + hashlib.sha256(json.dumps([
+            self._personal_visibility_scope = "room:" + hashlib.sha256(json.dumps([
                 context.get("connection_identity", ""), self.room_id, self.user_name,
                 self.source_volume_signature,
             ]).encode("utf-8")).hexdigest()
-            safe_bind_personal_visibility(segmentation_node, scope=view_scope)
+            self.refresh_personal_visibility(segmentation_node)
             self._known_segment_ids = set(segmentation_node.GetSegmentation().GetSegmentIDs())
             for segment_id in self._known_segment_ids:
                 self._remember_segment_metadata(segmentation_node, segment_id)
@@ -8975,6 +8982,7 @@ class LiveCollaborationController:
         self._local_encode_pending = False
         self._local_encode_worker = None
         self._local_continuation_scheduled = False
+        self._personal_visibility_scope = None
         self._pending_remote_highlight = None
         self._remote_highlight_scheduled = False
         self.baseline_bounds.clear()
@@ -13855,7 +13863,8 @@ class LiveCollaborationController:
                     # The sequence and acknowledgement belong to the original
                     # operation, not its rendering tiles. Qt may process local
                     # input between pieces without skipping or reordering edits.
-                    if operation.get("author") != self.user_name and self.initial_sync_complete:
+                    if (self.remote_highlights_enabled and self.initial_sync_complete
+                            and operation.get("author") != self.user_name):
                         highlight = np.logical_and(changed, values != 0) if operation.get("_snapshot_tile") else changed
                         if np.any(highlight):
                             self._queue_remote_highlight(highlight, operation_bounds, operation.get("author"))
@@ -13913,36 +13922,19 @@ class LiveCollaborationController:
                     self._acknowledge_local_operation(operation)
                     self._schedule_segment_verification(key, duration=0.8)
                 elif self.initial_sync_complete:
-                    highlight_changed = changed
                     if (
-                        operation.get("operation_kind") == "snapshot"
-                        and not np.any(values)
-                    ):
-                        highlight_changed = None
-                    if (
-                        not operation.get("_completion_only")
-                        and highlight_changed is not None
-                        and highlight_changed.size <= INCOMING_TILE_SIZE ** 3
-                        and np.any(highlight_changed)
+                        self.remote_highlights_enabled
+                        and not operation.get("_completion_only")
+                        and changed.size <= INCOMING_TILE_SIZE ** 3
+                        and np.any(changed)
+                        and (operation.get("operation_kind") != "snapshot" or np.any(values))
                     ):
                         try:
-                            import qt
-
-                            highlight_crop = highlight_changed.astype(np.uint8).copy()
-                            highlight_bounds = list(operation_bounds)
-                            highlight_author = str(
-                                operation.get("author") or "Collaborator"
-                            )
-                            qt.QTimer.singleShot(
-                                100,
-                                lambda crop=highlight_crop, bounds=highlight_bounds, author=highlight_author: (
-                                    self.owner.show_remote_change_highlight_crop(
-                                        crop, bounds, author
-                                    )
-                                ),
+                            self._queue_remote_highlight(
+                                changed, operation_bounds, operation.get("author"), delay_ms=100
                             )
                         except Exception:
-                            pass
+                            logging.debug("Could not queue the optional remote edit highlight", exc_info=True)
                     slicer.util.showStatusMessage(
                         f"Live: {operation.get('author')} updated "
                         f"{operation.get('segment_name') or segment_id}",
@@ -13963,8 +13955,28 @@ class LiveCollaborationController:
             self.session_metrics.increment("operations_applied", applied_count)
         return True
 
-    def _queue_remote_highlight(self, changed, bounds, author):
-        """Display at most one small recent edit overlay per 250 ms."""
+    def refresh_personal_visibility(self, node=None):
+        if not self.connected or self._personal_visibility_scope is None:
+            return
+        if node is None:
+            node = self._segmentation_node()
+        if node is not None:
+            try:
+                from .view_preferences import safe_bind_personal_visibility
+            except ImportError:
+                from view_preferences import safe_bind_personal_visibility
+            safe_bind_personal_visibility(node, scope=self._personal_visibility_scope)
+
+    def set_remote_highlights_enabled(self, enabled):
+        self.remote_highlights_enabled = bool(enabled)
+        if not self.remote_highlights_enabled:
+            self._pending_remote_highlight = None
+            self.owner.clear_remote_highlights()
+
+    def _queue_remote_highlight(self, changed, bounds, author, *, delay_ms=250):
+        """Keep one pending overlay for recent peer edits."""
+        if not self.remote_highlights_enabled:
+            return
         self._pending_remote_highlight = (np.asarray(changed, dtype=np.uint8).copy(), list(bounds), str(author or "Collaborator"))
         if self._remote_highlight_scheduled:
             return
@@ -13979,13 +13991,13 @@ class LiveCollaborationController:
             self._remote_highlight_scheduled = False
             latest = self._pending_remote_highlight
             self._pending_remote_highlight = None
-            if self.connected and latest is not None:
+            if self.connected and self.remote_highlights_enabled and latest is not None:
                 try:
                     self.owner.show_remote_change_highlight_crop(*latest)
                 except Exception:
                     logging.debug("Could not show the optional remote edit highlight", exc_info=True)
 
-        qt.QTimer.singleShot(250, show_latest)
+        qt.QTimer.singleShot(delay_ms, show_latest)
 
     def _update_presence(self, users, departed_sessions=()):
         now = time.monotonic()
@@ -14070,6 +14082,6 @@ class LiveCollaborationController:
         follow = self.follow_checkbox.checked
         follow = follow() if callable(follow) else follow
         target = self._combo_current_text(self.collaborator_combo)
-        if follow and target in self.presence_by_user:
+        if self.view_navigation_enabled and follow and target in self.presence_by_user:
             self._apply_location(self.presence_by_user[target])
         self._update_lock_controls()

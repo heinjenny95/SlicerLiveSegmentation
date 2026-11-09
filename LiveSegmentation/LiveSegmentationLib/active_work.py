@@ -215,9 +215,9 @@ def module_matches_project(modules, module_name, segmentation_id):
 
 
 class WorkTimeUI:
-    """Compact global controls + input observer. All GUI access stays here."""
+    """One work clock and input observer with global and module controls."""
 
-    def __init__(self, controller, toolbar):
+    def __init__(self, controller, toolbar, module_layout):
         import qt
         import slicer
 
@@ -262,6 +262,16 @@ class WorkTimeUI:
         self.review_action.setCheckable(True)
         self.review_action.setToolTip("Visual review counts as work even without input. Turn off or Pause when taking a break.")
         self.review_action.triggered.connect(lambda checked=False: self.set_review(checked))
+        self.module_button = qt.QToolButton()
+        self.module_button.setObjectName("LiveSegmentationModuleWorkTime")
+        self.module_button.setPopupMode(qt.QToolButton.InstantPopup)
+        self.module_button.setMenu(self.menu)
+        module_layout.addWidget(self.module_button)
+        for action in (self.pause_action, self.review_action):
+            button = qt.QToolButton()
+            button.setDefaultAction(action)
+            module_layout.addWidget(button)
+        module_layout.addStretch(1)
         adapter = self
         input_types = frozenset((qt.QEvent.MouseButtonPress, qt.QEvent.MouseButtonRelease,
                                  qt.QEvent.Wheel, qt.QEvent.KeyPress, qt.QEvent.MouseMove))
@@ -445,7 +455,7 @@ class WorkTimeUI:
         labels = {"work": "Work", "review": "Review", "manual_pause": "Paused",
                   "idle": "Auto-paused", "technical_wait": "Wait", "away": "Away",
                   "other_context": "Other", "communication": "Chat", "offline": "Work"}
-        self.button.setText(f"{labels.get(state, state)} {seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}")
+        text = f"{labels.get(state, state)} {seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
         self.pause_action.setEnabled(running)
         self.review_action.setEnabled(running)
         self.wait_action.setEnabled(running)
@@ -459,11 +469,13 @@ class WorkTimeUI:
             action.setChecked(bool(checked))
             action.blockSignals(False)
         color = "#188038" if state in {"work", "review"} else "#b26a00" if running else "#666666"
-        self.button.setStyleSheet(f"QToolButton {{ color: {color}; }}")
         tooltip = ("Local work + visual review. Auto-pause is an estimate; Review explicitly counts silent inspection.\n"
                    "Pause for breaks. Menu: idle threshold, manual technical wait, local timing backup.")
         if self.local_log:
             tooltip += f"\nLocal backup: {self.local_log.room_path}\nPending transfer: {len(self.pending)} interval(s)."
         if self.error:
             tooltip += "\n" + self.error
-        self.button.setToolTip(tooltip)
+        for button in (self.button, self.module_button):
+            button.setText(text)
+            button.setStyleSheet(f"QToolButton {{ color: {color}; }}")
+            button.setToolTip(tooltip)
